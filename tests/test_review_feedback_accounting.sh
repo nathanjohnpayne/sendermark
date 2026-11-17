@@ -1,0 +1,3810 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/scripts/review-feedback-accounting.sh"
+RENDER_ARCHIVE="$ROOT/scripts/render-feedback-archive.sh"
+SURFACE_FINGERPRINT="$ROOT/scripts/review-feedback-surface-fingerprint.sh"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+PASS=0
+FAIL=0
+
+pass() {
+  PASS=$((PASS + 1))
+  printf 'ok %s - %s\n' "$PASS" "$1"
+}
+
+fail() {
+  FAIL=$((FAIL + 1))
+  printf 'not ok - %s\n' "$1" >&2
+}
+
+assert_eq() {
+  local expected="$1" actual="$2" label="$3"
+  if [ "$expected" = "$actual" ]; then
+    pass "$label"
+  else
+    fail "$label (expected '$expected', got '$actual')"
+  fi
+}
+
+assert_match() {
+  local pattern="$1" actual="$2" label="$3"
+  if printf '%s' "$actual" | grep -Eq "$pattern"; then
+    pass "$label"
+  else
+    fail "$label (value '$actual' did not match '$pattern')"
+  fi
+}
+
+mkdir -p "$TMP/bin" "$TMP/fixtures"
+
+cat >"$TMP/bin/gh" <<'GH'
+#!/usr/bin/env bash
+if [ "${1:-}" = api ] && [ "${2:-}" = --help ]; then
+  # This integration fixture models a successfully detected legacy CLI.
+  printf 'Usage: gh api <endpoint> [flags]\n'
+  exit 0
+fi
+set -euo pipefail
+
+printf '%s\n' "$*" >>"$GH_CALL_LOG"
+
+endpoint=""
+jq_expr=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--jq" ]; then
+    jq_expr="$arg"
+  fi
+  case "$arg" in
+    repos/*) endpoint="$arg" ;;
+  esac
+  prev="$arg"
+done
+
+if [ -n "${GH_FAIL_ENDPOINT:-}" ] && [ "$endpoint" = "$GH_FAIL_ENDPOINT" ]; then
+  echo "synthetic API failure for $endpoint" >&2
+  exit 1
+fi
+
+# GitHub's edit history of one inline comment (#2598): the paginated, slurped
+# page array the gate reads, keyed by the node id the query is given.
+if [ "${1:-}" = api ] && [ "${2:-}" = graphql ]; then
+  [ "${GH_FAIL_ENDPOINT:-}" != graphql ] || { echo 'synthetic GraphQL failure' >&2; exit 1; }
+  node=""
+  for arg in "$@"; do case "$arg" in id=*) node="${arg#id=}" ;; esac; done
+  fixture="$GH_FIXTURE_DIR/edits-$node.json"
+  [ -f "$fixture" ] || { echo "unexpected graphql node: $node" >&2; exit 2; }
+  cat "$fixture"
+  exit 0
+fi
+
+# Alert-number GET (#1113): mimics real gh's client-side --jq filtering,
+# which none of the other fixture endpoints below need (they're consumed
+# by fetch_api_array, whose callers apply their own jq on the captured
+# JSON). A missing fixture file is a genuine 404 — gh_alert_severity's
+# rc=3 contract, exercised by the "fetch itself fails" test cases.
+case "$endpoint" in
+  repos/acme/widget/code-scanning/alerts/[0-9]*)
+    number="${endpoint##*/}"
+    fixture="$GH_FIXTURE_DIR/code-scanning-alert-$number.json"
+    if [ ! -f "$fixture" ]; then
+      echo "gh: Not Found (HTTP 404)" >&2
+      exit 1
+    fi
+    if [ -n "$jq_expr" ]; then
+      jq -r "$jq_expr" "$fixture"
+    else
+      cat "$fixture"
+    fi
+    exit 0
+    ;;
+esac
+
+# Only the production-cleanup regression opts into these offline mutations.
+# Ordinary accounting remains read-only; an unexpected write is refused.
+if [[ " $* " == *" --method POST "* ]]; then
+  [ -n "${GH_CAPTURE_FAILURE_MARKER:-}" ] || { echo 'unexpected mutation' >&2; exit 99; }
+  case "$endpoint" in
+    repos/acme/widget/issues/7/comments)
+      cat >"$GH_CAPTURE_FAILURE_MARKER"
+      jq '.+{id:3,user:{login:"github-actions[bot]"},created_at:"2026-08-18T19:00:00Z"}' "$GH_CAPTURE_FAILURE_MARKER"; exit 0 ;;
+    repos/acme/widget/check-runs) printf '{"id":900}\n'; exit 0 ;;
+    *) echo 'unexpected cleanup mutation' >&2; exit 99 ;;
+  esac
+fi
+
+case "$endpoint" in
+  repos/acme/widget)
+    printf '{"default_branch":"main"}\n' ;;
+  repos/acme/widget/actions/runs/12345)
+    printf '{"created_at":"2026-08-18T19:00:00Z","updated_at":"2026-08-18T19:01:00Z"}\n' ;;
+  repos/acme/widget/actions/workflows/codex-feedback-archive-relay.yml)
+    printf '{"id":444,"path":".github/workflows/codex-feedback-archive-relay.yml"}\n' ;;
+  repos/acme/widget/actions/workflows/codex-feedback-archive-relay.yml/runs\?*)
+    printf '[{"workflow_runs":[{"id":9876,"conclusion":"success","created_at":"2026-08-18T19:01:00Z","workflow_id":444,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"acme/widget"}}]}]\n' ;;
+  repos/acme/widget/actions/runs/9876)
+    printf '{"id":9876,"workflow_id":444,"event":"workflow_run","path":".github/workflows/codex-feedback-archive-relay.yml","head_branch":"main","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository":{"full_name":"acme/widget"}}\n' ;;
+  repos/acme/widget/actions/runs/9876/jobs\?*)
+    printf '[{"jobs":[{"id":9877,"run_id":9876,"steps":[{"name":"Persist archive and publish the exact-head gate","conclusion":"success"}]}]}]\n' ;;
+  repos/acme/widget/actions/jobs/9877/logs)
+    printf '##[group]Run set -euo pipefail\n  env:\n    PR_NUMBER: 7\n    SOURCE_RUN_ID: 12345\n    HANDOFF_FILE: /tmp/handoff/codex-p1-read-only-handoff.json\n##[endgroup]\n' ;;
+  repos/acme/widget*/pulls/7)
+    cat "$GH_FIXTURE_DIR/pull.json"
+    ;;
+  repos/acme/widget*/contents/.github/review-policy.yml\?ref=*)
+    cat "$GH_FIXTURE_DIR/base-review-policy.yml"
+    ;;
+  repos/acme/widget*/pulls/7/comments)
+    cat "$GH_FIXTURE_DIR/inline.json"
+    ;;
+  repos/acme/widget*/pulls/7/reviews)
+    cat "$GH_FIXTURE_DIR/reviews.json"
+    ;;
+  repos/acme/widget*/issues/7/comments)
+    cat "$GH_FIXTURE_DIR/issues.json"
+    ;;
+  repos/acme/widget/pulls/comments/*/reactions)
+    id="${endpoint#repos/acme/widget/pulls/comments/}"
+    id="${id%/reactions}"
+    if [ -f "$GH_FIXTURE_DIR/reactions-$id.json" ]; then
+      cat "$GH_FIXTURE_DIR/reactions-$id.json"
+    else
+      printf '[]\n'
+    fi
+    ;;
+  *)
+    echo "unexpected gh invocation: $*" >&2
+    exit 2
+    ;;
+esac
+GH
+chmod +x "$TMP/bin/gh"
+
+cat >"$TMP/review-policy.yml" <<'YAML'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-cursor
+  - nathanpayne-codex
+coderabbit:
+  bot_login: "coderabbitai[bot]"
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+code_scanning:
+  bot_login: "github-advanced-security[bot]"
+feedback_archive:
+  identities:
+    - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
+    - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
+    - {login: "github-advanced-security[bot]", provider: ghas, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: active}
+    - {login: nathanpayne-cursor, provider: reviewer, status: active}
+    - {login: nathanpayne-codex, provider: reviewer, status: active}
+    - {login: nathanpayne-release, provider: reviewer, status: retired}
+YAML
+cp "$TMP/review-policy.yml" "$TMP/dedup-initial-policy.yml"
+
+reset_fixtures() {
+  printf '[]\n' >"$TMP/fixtures/inline.json"
+  printf '[]\n' >"$TMP/fixtures/reviews.json"
+  printf '[]\n' >"$TMP/fixtures/issues.json"
+  rm -f "$TMP/fixtures"/code-scanning-alert-*.json
+  cat >"$TMP/fixtures/pull.json" <<'JSON'
+{
+  "base": {
+    "ref": "release",
+    "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "repo": {"id": 4242, "full_name": "acme/widget", "default_branch": "main"}
+  },
+  "head": {
+    "sha": "cccccccccccccccccccccccccccccccccccccccc",
+    "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}
+  }
+}
+JSON
+  cat >"$TMP/fixtures/base-review-policy.yml" <<'YAML'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-release
+coderabbit:
+  bot_login: "coderabbitai[bot]"
+codex:
+  bot_login: "chatgpt-codex-connector[bot]"
+code_scanning:
+  bot_login: "github-advanced-security[bot]"
+feedback_archive:
+  identities:
+    - {login: "chatgpt-codex-connector[bot]", provider: codex, status: active}
+    - {login: "coderabbitai[bot]", provider: coderabbit, status: active}
+    - {login: "github-advanced-security[bot]", provider: ghas, status: active}
+    - {login: nathanpayne-claude, provider: reviewer, status: retired}
+    - {login: nathanpayne-cursor, provider: reviewer, status: retired}
+    - {login: nathanpayne-codex, provider: reviewer, status: retired}
+    - {login: nathanpayne-release, provider: reviewer, status: active}
+YAML
+  rm -f "$TMP/fixtures"/reactions-*.json "$TMP/fixtures"/edits-*.json
+  : >"$TMP/gh-calls.log"
+}
+
+RUN_RC=0
+RUN_JSON=""
+RUN_ERR=""
+run_gate() {
+  local token_mode="${1:-ambient}" config_mode="${2:-override}" gate_script="${3:-$SCRIPT}" repo_arg="${4:-acme/widget}" out="$TMP/out.json" err="$TMP/err.log"
+  local -a gate_env=(
+    "PATH=$TMP/bin:$PATH"
+    "GH_FIXTURE_DIR=$TMP/fixtures"
+    "GH_CALL_LOG=$TMP/gh-calls.log"
+    "CODEX_FEEDBACK_LEDGER=${CODEX_FEEDBACK_LEDGER:-$TMP/no-codex-ledger}"
+    "CODERABBIT_FEEDBACK_LEDGER=${CODERABBIT_FEEDBACK_LEDGER:-$TMP/no-coderabbit-ledger}"
+    "GH_FAIL_ENDPOINT=${GH_FAIL_ENDPOINT:-}"
+  )
+  if [ "$config_mode" = override ]; then
+    gate_env+=("REVIEW_FEEDBACK_ACCOUNTING_CONFIG=$TMP/review-policy.yml")
+  fi
+  set +e
+  if [ "$token_mode" = preflight ]; then
+    env -u GH_TOKEN \
+      "${gate_env[@]}" \
+      OP_PREFLIGHT_REVIEWER_PAT=test-token \
+      OP_PREFLIGHT_CACHE_DIR="$TMP/no-cache" \
+      "$gate_script" 7 "$repo_arg" >"$out" 2>"$err"
+  else
+    env "${gate_env[@]}" GH_TOKEN=test-token \
+      "$gate_script" 7 "$repo_arg" >"$out" 2>"$err"
+  fi
+  RUN_RC=$?
+  set -e
+  RUN_JSON="$(cat "$out")"
+  RUN_ERR="$(cat "$err")"
+}
+
+if [ ! -x "$SCRIPT" ]; then
+  echo "review-feedback-accounting: RED (implementation missing: $SCRIPT)" >&2
+  exit 1
+fi
+
+reset_fixtures
+run_gate
+assert_eq 0 "$RUN_RC" "empty review history clears"
+assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "empty history emits clear status"
+
+# Unknown complete legacy bodies are refused before source attribution. The
+# actual relay cleanup then supplies existing non-review durable failure
+# evidence; the real marker verifier and accounting retain it on later sweeps.
+python3 - "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" "$TMP/legacy-failure-cleanup.sh" <<'PYTHON'
+import sys,textwrap
+s=open(sys.argv[1]).read().split('      - name: Close an abandoned read-only relay lease',1)[1]
+s=s.split('        run: |\n',1)[1].split('\n      - name:',1)[0]
+open(sys.argv[2],'w').write(textwrap.dedent(s))
+PYTHON
+(cd "$ROOT" && env PATH="$TMP/bin:$PATH" GH_TOKEN=fake-offline GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  GH_CAPTURE_FAILURE_MARKER="$TMP/legacy-failed-marker.json" REPO=acme/widget PR_NUMBER=7 SOURCE_RUN_ID=12345 \
+  CHECK_ID='' BOUND_HEAD_SHA=cccccccccccccccccccccccccccccccccccccccc CHECK_NAME='Codex P1 unresolved threads' \
+  bash "$TMP/legacy-failure-cleanup.sh") >"$TMP/legacy-cleanup.log" 2>&1
+jq '.+{id:3,user:{login:"github-actions[bot]"},created_at:"2026-08-18T19:00:00Z"} | [.]' \
+  "$TMP/legacy-failed-marker.json" >"$TMP/fixtures/issues.json"
+assert_eq '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->' "$(jq -r '.[0].body' "$TMP/fixtures/issues.json")" \
+  "production cleanup records failure for the newly refused legacy source with no prior completion"
+for sweep in first repeated; do
+  run_gate
+  assert_eq 2 "$RUN_RC" "$sweep real verified-marker accounting sweep retains the legacy source failure"
+  assert_match 'read-only feedback archive relay failed for source run 12345' "$RUN_ERR" "$sweep sweep names the durable non-review failure record"
+done
+reset_fixtures
+
+# The entrypoint must refuse an unavailable Python runtime before API reads.
+cat >"$TMP/bin/python3" <<'PYTHON'
+#!/usr/bin/env bash
+exit 127
+PYTHON
+chmod +x "$TMP/bin/python3"
+: >"$TMP/gh-calls.log"
+run_gate
+assert_eq 2 "$RUN_RC" "missing Python runtime is a dependency error"
+assert_match 'Python 3 is required' "$RUN_ERR" "runtime error names the required interpreter"
+assert_eq '' "$(cat "$TMP/gh-calls.log")" "missing interpreter performs no GitHub reads"
+rm "$TMP/bin/python3"
+reset_fixtures
+run_gate
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "empty history reports zero posted findings"
+
+cat >"$TMP/fixtures/issues.json" <<'JSON'
+[
+  {
+    "id": 2,
+    "created_at": "2026-08-18T19:00:00Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": "<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->"
+  }
+]
+JSON
+run_gate
+assert_eq 2 "$RUN_RC" "failed fork archive relay is a persistent infrastructure block"
+assert_match 'read-only feedback archive relay.*12345' "$RUN_ERR" "relay failure names the unrecoverable source run"
+assert_match 'rerun that exact historical source run' "$RUN_ERR" "relay failure names the safe historical recovery"
+assert_match 'repos/acme/widget/actions/runs/12345/rerun' "$RUN_ERR" "relay recovery command targets the failed source run"
+assert_match 'new PR head or a different workflow run cannot' "$RUN_ERR" "relay recovery rejects unsafe substitutes"
+assert_match 'runs are rerunnable for 30 days' "$RUN_ERR" "relay recovery states the historical rerun limit"
+assert_match 'PR remains blocked and requires owner intervention' "$RUN_ERR" "unavailable relay recovery preserves the block"
+run_gate ambient override "$SCRIPT" 'acme/widget; touch /tmp/relay-command-injection'
+assert_eq 2 "$RUN_RC" "shell-sensitive repository name still blocks the relay"
+assert_match 'valid repository and PR required' "$RUN_ERR" "relay provenance rejects shell-sensitive repository selectors before lookup"
+jq '. + [{
+  "id": 3,
+  "created_at": "2026-08-18T19:01:00Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": "<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->"
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "a successful rerun supersedes the same source run failure marker"
+# A completion is durable in EITHER posting order. Recency cannot decide this:
+# restoring an edited or deleted terminal marker reposts the exact prior body
+# under a new comment id and created_at, so the restored copy always sorts last.
+# Under a latest-wins rule, restoring a stale completion would mask a real
+# failure — the fail-OPEN direction. Presence of a completion is the durable
+# fact (the archive it records cannot be un-persisted by a later rerun that no
+# longer finds its artifact), and presence is immune to that reordering.
+jq '. + [{
+  "id": 4,
+  "created_at": "2026-08-18T19:02:00Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": "<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->"
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "a completion marker survives a later spurious rerun failure for the same source run"
+
+# ...and a restored completion cannot launder a DIFFERENT source run that only
+# ever failed, so the presence rule is scoped per run rather than per PR.
+jq '. + [{
+  "id": 5,
+  "created_at": "2026-08-18T19:03:00Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": "<!-- mergepath-feedback-archive-relay:v1 run=67890 status=failed -->"
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a failure-only source run still blocks alongside a completed one"
+assert_match 'read-only feedback archive relay.*67890' "$RUN_ERR" "the block names the run that never completed"
+
+# The documented direct invocation runs after op-preflight, which exports the
+# scoped PAT but deliberately leaves GH_TOKEN unset. The helper must bridge the
+# reviewer token itself rather than rejecting that normal environment.
+reset_fixtures
+run_gate preflight
+assert_eq 0 "$RUN_RC" "reviewer PAT from preflight is accepted without ambient GH_TOKEN"
+
+cat >"$TMP/bin/yq" <<'SH'
+#!/bin/sh
+if [ "${1:-}" = --version ]; then
+  echo "yq 2.0.0 (unrelated implementation)"
+  exit 0
+fi
+echo "unsupported yq interface" >&2
+exit 64
+SH
+chmod +x "$TMP/bin/yq"
+reset_fixtures
+run_gate
+assert_eq 0 "$RUN_RC" "unrelated yq executable falls through to a supported YAML parser"
+cat >"$TMP/bin/yq" <<'SH'
+#!/bin/sh
+if [ "${1:-}" = --version ]; then
+  echo "yq (https://github.com/mikefarah/yq/) version v4.47.2"
+  exit 0
+fi
+echo "synthetic mikefarah parse failure" >&2
+exit 1
+SH
+chmod +x "$TMP/bin/yq"
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "validated mikefarah yq parse failure remains an infrastructure error"
+rm -f "$TMP/bin/yq"
+
+cp "$TMP/review-policy.yml" "$TMP/review-policy.valid.yml"
+printf 'available_reviewers: [unterminated\n' >"$TMP/review-policy.yml"
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "malformed governing review policy is an infrastructure error"
+assert_match 'governing review policy.*(parse|valid)' "$RUN_ERR" "malformed policy failure names the policy contract"
+mv "$TMP/review-policy.valid.yml" "$TMP/review-policy.yml"
+mv "$TMP/review-policy.yml" "$TMP/review-policy.unreadable.yml"
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "unreadable governing review policy is an infrastructure error"
+assert_match 'governing review policy is unreadable' "$RUN_ERR" "unreadable policy failure names the missing surface"
+mv "$TMP/review-policy.unreadable.yml" "$TMP/review-policy.yml"
+cp "$TMP/review-policy.yml" "$TMP/review-policy.valid-enums.yml"
+cat >"$TMP/review-policy.yml" <<'JSON'
+{"feedback_policy":{"mode":"typo"}}
+JSON
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "invalid feedback policy mode fails before an empty history can clear"
+cat >"$TMP/review-policy.yml" <<'JSON'
+{"feedback_policy":{"mode":"by-priority","priorities":{"p1":"typo"}}}
+JSON
+reset_fixtures
+run_gate
+assert_eq 2 "$RUN_RC" "invalid feedback priority disposition fails before an empty history can clear"
+mv "$TMP/review-policy.valid-enums.yml" "$TMP/review-policy.yml"
+
+cp "$TMP/review-policy.yml" "$TMP/review-policy.block-style.yml"
+cat >"$TMP/review-policy.yml" <<'JSON'
+{"author_identity": "nathanjohnpayne", "available_reviewers": ["nathanpayne-release"], "coderabbit": {"bot_login": "coderabbitai[bot]"}, "codex": {"bot_login": "chatgpt-codex-connector[bot]"}, "feedback_policy": {"mode": "by-priority", "priorities": {"p1": "required"}}, "feedback_archive": {"identities": [{"login": "nathanpayne-release", "provider": "reviewer", "status": "active"}]}}
+JSON
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 8,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T19:40:00Z",
+    "user": {"login": "nathanpayne-release"},
+    "path": "src/flow-policy.sh",
+    "line": 2,
+    "body": "**P1** Flow-style reviewer policy must be enforced."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "schema-valid flow-style policy preserves registered reviewer findings"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "flow-style reviewer identity is inventoried"
+assert_eq required "$(printf '%s' "$RUN_JSON" | jq -r '.feedback_policy.priorities.p1')" "accounting exposes its parsed flow-style policy for acknowledgment decisions"
+mv "$TMP/review-policy.block-style.yml" "$TMP/review-policy.yml"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 9,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T19:50:00Z",
+    "user": {"login": "nathanpayne-release"},
+    "path": "src/release.sh",
+    "line": 3,
+    "body": "**P1** Release-branch reviewer requires this guard."
+  }
+]
+JSON
+run_gate ambient base
+assert_eq 1 "$RUN_RC" "non-default pull request uses its base-branch reviewer policy"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "base-only reviewer finding is inventoried"
+jq '.base.ref = "main"' "$TMP/fixtures/pull.json" >"$TMP/fixtures/pull.next"
+mv "$TMP/fixtures/pull.next" "$TMP/fixtures/pull.json"
+run_gate ambient base
+assert_eq 1 "$RUN_RC" "cross-repository default-base pull request uses the target repository policy"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "target-repository reviewer remains inventoried on its default base"
+
+AUTHOR_CHECKOUT="$TMP/author-checkout"
+mkdir -p "$AUTHOR_CHECKOUT/scripts/workflow" "$AUTHOR_CHECKOUT/.github"
+cp "$SCRIPT" "$AUTHOR_CHECKOUT/scripts/review-feedback-accounting.sh"
+cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$AUTHOR_CHECKOUT/scripts/workflow/resolve_base_policy.sh"
+cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$AUTHOR_CHECKOUT/scripts/workflow/verified-relay-markers.py"
+cp -R "$ROOT/scripts/lib" "$AUTHOR_CHECKOUT/scripts/lib"
+cp "$TMP/review-policy.yml" "$AUTHOR_CHECKOUT/.github/review-policy.yml"
+git -C "$AUTHOR_CHECKOUT" init -q -b feature
+git -C "$AUTHOR_CHECKOUT" remote add origin https://github.com/acme/widget.git
+git -C "$AUTHOR_CHECKOUT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+run_gate ambient base "$AUTHOR_CHECKOUT/scripts/review-feedback-accounting.sh"
+assert_eq 1 "$RUN_RC" "same-repository author worktree does not trust its head policy as the PR base"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "author worktree still inventories the base-only reviewer"
+
+TRUSTED_CHECKOUT="$TMP/trusted-default-checkout"
+mkdir -p "$TRUSTED_CHECKOUT/scripts/workflow" "$TRUSTED_CHECKOUT/.github"
+cp "$SCRIPT" "$TRUSTED_CHECKOUT/scripts/review-feedback-accounting.sh"
+cp "$ROOT/scripts/workflow/resolve_base_policy.sh" "$TRUSTED_CHECKOUT/scripts/workflow/resolve_base_policy.sh"
+cp "$ROOT/scripts/workflow/verified-relay-markers.py" "$TRUSTED_CHECKOUT/scripts/workflow/verified-relay-markers.py"
+cp -R "$ROOT/scripts/lib" "$TRUSTED_CHECKOUT/scripts/lib"
+cp "$TMP/review-policy.yml" "$TRUSTED_CHECKOUT/.github/review-policy.yml"
+git -C "$TRUSTED_CHECKOUT" init -q -b main
+git -C "$TRUSTED_CHECKOUT" remote add origin https://github.com/acme/widget.git
+git -C "$TRUSTED_CHECKOUT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+cat >>"$TMP/fixtures/base-review-policy.yml" <<'YAML'
+feedback_policy: {mode: by-priority, priorities: {p2: required}}
+YAML
+run_gate ambient base "$TRUSTED_CHECKOUT/scripts/review-feedback-accounting.sh"
+assert_eq 1 "$RUN_RC" "default-branch checkout materializes the exact PR-base policy"
+assert_eq nathanpayne-release "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "stale or dirty default checkout cannot omit a base reviewer"
+assert_eq required "$(printf '%s' "$RUN_JSON" | jq -r '.feedback_policy.priorities.p2')" "accounting emits the exact base policy, not stale local policy"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 10,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:00:00Z",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "![P1 Badge] Missing guard\n\nUseful? React with 👍 / 👎."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "undispositioned inline finding blocks"
+assert_eq unaccounted "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "inline miss emits unaccounted status"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "inline finding contributes to posted count"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "inline miss contributes no accounted finding"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "inline miss is identified by shape"
+
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 10,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:00:00Z",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "![P1 Badge] Missing guard\n\nUseful? React with 👍 / 👎."
+  },
+  {
+    "id": 11,
+    "in_reply_to_id": 10,
+    "created_at": "2026-08-18T20:02:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "Confirmed and fixed in abc1234."
+  }
+]
+JSON
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-with-substantive-reply.json"
+jq '.[1].body = "."' "$TMP/fixtures/inline-with-substantive-reply.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "punctuation-only reply is not substantive disposition evidence"
+jq '.[1].body = "👍"' "$TMP/fixtures/inline-with-substantive-reply.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "emoji-only reply is not substantive disposition evidence"
+mv "$TMP/fixtures/inline-with-substantive-reply.json" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "agent reply after inline finding accounts for it"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "agent reply increments accounted count"
+assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "reply evidence is visible"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 13,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:10:00Z",
+    "user": {"login": "nathanpayne-claude"},
+    "path": "src/reviewer.sh",
+    "line": 7,
+    "body": "**P1** Reject the unsafe reviewer path before merge."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "registered reviewer root finding cannot account for itself as a reply"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "reviewer root finding has no reply evidence"
+
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 13,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:10:00Z",
+    "user": {"login": "nathanpayne-claude"},
+    "path": "src/reviewer.sh",
+    "line": 7,
+    "body": "**P1** Reject the unsafe reviewer path before merge."
+  },
+  {
+    "id": 14,
+    "in_reply_to_id": 13,
+    "created_at": "2026-08-18T20:12:00Z",
+    "user": {"login": "nathanpayne-claude"},
+    "path": "src/reviewer.sh",
+    "line": 7,
+    "body": "**P1** The unsafe reviewer path remains reachable."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "registered reviewer re-raise cannot account for itself as a reply"
+assert_eq 14 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].finding_id')" "latest registered reviewer re-raise remains unaccounted"
+jq '. + [{
+  "id": 15,
+  "in_reply_to_id": 13,
+  "created_at": "2026-08-18T20:14:00Z",
+  "user": {"login": "nathanjohnpayne"},
+  "path": "src/reviewer.sh",
+  "line": 7,
+  "body": "Fixed the re-raised path in commit abc1234."
+}]' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "distinct later reply accounts for a registered reviewer re-raise"
+
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 10,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:00:00Z",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "![P1 Badge] Missing guard\n\nUseful? React with 👍 / 👎."
+  },
+  {
+    "id": 11,
+    "in_reply_to_id": 10,
+    "created_at": "2026-08-18T20:02:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "[mergepath-resolve: addressed-elsewhere]"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "generated resolve marker is not disposition evidence"
+jq '.[1].body = "[mergepath-resolve: addressed-elsewhere] Fixed by the validated guard change."' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline-with-resolve-rationale.json"
+mv "$TMP/fixtures/inline-with-resolve-rationale.json" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "substantive rationale beside a resolve marker remains disposition evidence"
+jq '.[1].body = "[mergepath-resolve: addressed-elsewhere]"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline-marker-only.json"
+mv "$TMP/fixtures/inline-marker-only.json" "$TMP/fixtures/inline.json"
+
+cat >"$TMP/codex-ledger.jsonl" <<'JSON'
+{"repo":"acme/widget","comment_id":10,"verdict":"fixed","recorded_at":"2026-08-18T20:03:00Z"}
+JSON
+CODEX_FEEDBACK_LEDGER="$TMP/codex-ledger.jsonl"
+run_gate
+assert_eq 1 "$RUN_RC" "worktree-local ledger alone is not cross-checkout disposition evidence"
+unset CODEX_FEEDBACK_LEDGER
+
+printf '[{"user":{"login":"nathanpayne-codex"},"content":"+1","created_at":"2026-08-18T20:04:00Z"}]\n' >"$TMP/fixtures/reactions-10.json"
+run_gate
+assert_eq 1 "$RUN_RC" "reviewer reaction alone is not durable disposition evidence"
+assert_eq null "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "reaction-only finding remains unaccounted"
+
+printf '[{"user":{"login":"nathanpayne-codex"},"content":"eyes"}]\n' >"$TMP/fixtures/reactions-10.json"
+run_gate
+assert_eq 1 "$RUN_RC" "non-verdict reaction does not account for a Codex finding"
+
+GH_FAIL_ENDPOINT="repos/acme/widget/pulls/comments/10/reactions"
+run_gate
+assert_eq 1 "$RUN_RC" "accounting does not depend on the deletable reaction surface"
+if grep -F 'pulls/comments/10/reactions' "$TMP/gh-calls.log" >/dev/null; then
+  fail "reaction endpoint must not be consulted for durable accounting"
+else
+  pass "reaction endpoint is not consulted for durable accounting"
+fi
+unset GH_FAIL_ENDPOINT
+
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 10,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:00:00Z",
+    "updated_at": "2026-08-18T20:05:00Z",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "![P1 Badge] Edited guard requirement\n\nUseful? React with 👍 / 👎."
+  },
+  {
+    "id": 11,
+    "in_reply_to_id": 10,
+    "created_at": "2026-08-18T20:02:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "Fixed the earlier wording in abc1234."
+  },
+  {
+    "id": 12,
+    "in_reply_to_id": 10,
+    "created_at": "2026-08-18T20:04:00Z",
+    "updated_at": "2026-08-18T20:04:00Z",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "path": "src/a.sh",
+    "line": 12,
+    "body": "![P1 Badge] Re-raised guard requirement"
+  }
+]
+JSON
+printf '[{"user":{"login":"nathanpayne-codex"},"content":"+1","created_at":"2026-08-18T20:03:00Z"}]\n' >"$TMP/fixtures/reactions-10.json"
+CODEX_FEEDBACK_LEDGER="$TMP/codex-ledger.jsonl"
+run_gate
+assert_eq 1 "$RUN_RC" "editing an inline finding invalidates earlier reply, ledger, and reaction evidence"
+assert_eq 10 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].finding_id')" "latest bot event selection honors an older comment edited after a newer re-raise"
+unset CODEX_FEEDBACK_LEDGER
+
+printf '[{"user":{"login":"nathanpayne-codex"},"content":"+1","created_at":"2026-08-18T20:06:00Z"}]\n' >"$TMP/fixtures/reactions-10.json"
+run_gate
+assert_eq 1 "$RUN_RC" "post-edit reaction alone does not durably account for the edited finding"
+
+jq '. + [{
+  "id": 13,
+  "in_reply_to_id": 10,
+  "created_at": "2026-08-18T20:05:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "path": "src/a.sh",
+  "line": 12,
+  "body": "This reply cannot be ordered after the same-second edit."
+}]' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "same-second reply cannot prove it followed the finding edit"
+jq '.[-1].created_at = "2026-08-18T20:05:01Z"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "strictly later reply accounts for the edited finding"
+
+reset_fixtures
+LARGE_INLINE_BODY="$TMP/large-inline-body.txt"
+{
+  printf '**P1** Large escaped inline finding. '
+  awk 'BEGIN { for (i = 0; i < 65500; i++) printf "%c", 92 }'
+} >"$LARGE_INLINE_BODY"
+jq -n --rawfile body "$LARGE_INLINE_BODY" '[{
+  "id": 14,
+  "in_reply_to_id": null,
+  "created_at": "2026-08-18T20:06:00Z",
+  "updated_at": "2026-08-18T20:06:00Z",
+  "user": {"login": "chatgpt-codex-connector[bot]"},
+  "path": "src/large.sh",
+  "line": 14,
+  "body": $body
+}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "near-limit escaped inline finding is streamed without argv overflow"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "large inline finding remains inventoried"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 19,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T20:50:00Z",
+    "updated_at": "2026-08-18T20:50:01Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/provider-status.sh",
+    "line": 4,
+    "body": "<!-- This is an auto-generated reply by CodeRabbit -->\n<!-- CodeRabbit review command invocation: v2:40695c92071a7774b4a6b4f0e9eb06deacb14b457ca3ec1044886bf8782b8cc7 -->\n<details>\n<summary>⚠️ Action not completed</summary>\n\nReview rate limited.\n\n</details>"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "inline CodeRabbit command-invocation status is not inventoried"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "inline status-only reply creates no disposition obligation"
+jq '.[0].body += "\n\n_📐 Maintainability & Code Quality_ | _🟡 Minor_\n\n**Keep the retry counter bounded.**"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "inline mixed status plus real finding remains inventoried"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "inline mixed response keeps the inline finding shape"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "inline mixed response preserves the real finding tier"
+
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-with-reply.json"
+jq '.[0:1]' "$TMP/fixtures/inline-with-reply.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "undispositioned CodeRabbit finding blocks"
+assert_match 'post a substantive disposition reply on the thread' "$RUN_ERR" "CodeRabbit remediation names the only cross-checkout evidence path"
+if printf '%s' "$RUN_ERR" | grep -Eq 'record|react'; then
+  fail "CodeRabbit remediation must not suggest a ledger or reaction"
+else
+  pass "CodeRabbit remediation does not suggest unsupported ledger/reaction evidence"
+fi
+mv "$TMP/fixtures/inline-with-reply.json" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "CodeRabbit finding and author reply reconcile"
+jq '.[0].updated_at = "2026-08-18T21:02:00Z"
+  | .[0].body += "\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "CodeRabbit addressed confirmation preserves the substantive reply it confirms"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-confirmed.json"
+jq '.[1].user.login = "nathanpayne-codex"
+  | .[1].created_at = "2026-08-18T21:03:00Z"' \
+  "$TMP/fixtures/inline-confirmed.json" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "strictly later configured-identity reply remains valid beside a CodeRabbit confirmation"
+mv "$TMP/fixtures/inline-confirmed.json" "$TMP/fixtures/inline.json"
+jq '.[0].body |= sub("✅ Confirmed as addressed by @nathanjohnpayne"; "Address confirmation removed")' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "ordinary CodeRabbit edit after a reply invalidates the earlier evidence"
+jq '.[0].body += "\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\nordinary trailing content"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "CodeRabbit confirmation pair before trailing content is not a trusted suffix"
+jq '.[0].body += "\n\n```text\n✅ Confirmed as addressed by @nathanjohnpayne\n<!-- This is an auto-generated reply by CodeRabbit -->\n```"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "quoted CodeRabbit confirmation pair is not a trusted suffix"
+jq '.[0].body += "\n\n```text\n✅ Confirmed as addressed by @nathanjohnpayne\n<!-- This is an auto-generated reply by CodeRabbit -->"' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "unclosed fenced CodeRabbit confirmation pair is not a trusted suffix"
+
+# #1167: CodeRabbit acknowledges a disposition by editing its finding, in the
+# shapes the vendor actually emits: the finding's own footer rewritten to the
+# reply marker plus a confirmation line; reply marker, line, reply marker;
+# reply marker, line, comment footer; and any of them stacked. No shape may
+# raise the evidence floor, recognition is anchored on the footer markers
+# rather than the wording, and the revision the relay archives at that edit
+# is not a second finding.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n<!-- cr-comment:v1:0123456789abcdef -->\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-before-ack.json"
+run_gate
+assert_eq 0 "$RUN_RC" "author reply reconciles the CodeRabbit finding before any acknowledgement"
+
+# ack_edit <jq body filter> <updated_at> — apply one acknowledgement edit to the root finding.
+ack_edit() {
+  jq --arg at "$2" ".[0].updated_at = \$at | .[0].body |= ($1)" \
+    "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+  mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+}
+# Shape 1: the comment footer is rewritten to the reply marker and a line is appended.
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "footer-swap acknowledgement with the commit-naming line does not raise the evidence floor (#1167)"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-once.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:03:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a second acknowledgement stacked on the first keeps the finding accounted"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-twice.json"
+# Shape 2: reply marker, line, reply marker, appended whole.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "bracketed acknowledgement (marker, line, marker) does not raise the evidence floor"
+# Shape 3: reply marker, login-naming line, comment footer.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated comment by CodeRabbit -->")' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "login-naming line between the reply marker and the comment footer is an acknowledgement"
+# The wording is not load-bearing.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Verified in a later commit"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "acknowledgement recognition is anchored on the footer marker, not the confirmation wording"
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅️  Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a confirmation line with a variation selector and a double space is still recognised"
+# CRLF bodies.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body |= gsub("\n"; "\r\n")' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-before-ack-crlf.json"
+ack_edit '. + "\r\n\r\n<!-- This is an auto-generated reply by CodeRabbit -->\r\n\r\n✅ Addressed in commit def5678\r\n\r\n<!-- This is an auto-generated reply by CodeRabbit -->"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 0 "$RUN_RC" "a CRLF acknowledgement does not raise the evidence floor"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-acked-crlf.json"
+# Negatives: the run must end the body, and a line alone is not an acknowledgement.
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\nordinary trailing content"' "2026-08-18T21:04:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "visible content after the acknowledgement run is an ordinary edit"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n```text\nappended after the acknowledgement\n```"' "2026-08-18T21:04:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a code fence after the acknowledgement run is an ordinary edit"
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body = "_🟡 Minor_ Clarify the error"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+ack_edit '. + "\n\n✅ Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a confirmation line with no CodeRabbit footer anywhere is an ordinary edit"
+
+# The relay archives the pre-acknowledgement revision when CodeRabbit edits
+# the finding. That revision is the finding the reply already dispositioned,
+# so it must not demand an acknowledgement token of its own.
+# archive_of <body file> <comment id> — one relay record as the issues fixture.
+archive_of() {
+  local rendered
+  rendered=$("$RENDER_ARCHIVE" inline 20 'coderabbitai[bot]' '2026-08-18T21:02:00Z' "$1")
+  jq -n --arg archive "$rendered" --argjson id "$2" '[{
+    "id": $id,
+    "created_at": "2026-08-18T21:02:01Z",
+    "updated_at": "2026-08-18T21:02:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }]' >"$TMP/fixtures/issues.json"
+}
+PRE_ACK_BODY="$TMP/pre-ack-body.txt"
+jq -r '.[0].body' "$TMP/fixtures/inline-before-ack.json" >"$PRE_ACK_BODY"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8700
+run_gate
+assert_eq 0 "$RUN_RC" "an archived revision that differs from the live finding only by the footer swap and line is not a second finding (#1167)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "acknowledgement-only archive demands no inline acknowledgement token"
+cp "$TMP/fixtures/inline-acked-twice.json" "$TMP/fixtures/inline.json"
+jq -r '.[0].body' "$TMP/fixtures/inline-acked-once.json" >"$TMP/acked-once-body.txt"
+archive_of "$TMP/acked-once-body.txt" 8701
+run_gate
+assert_eq 0 "$RUN_RC" "an archived first-acknowledgement revision collapses with the twice-acknowledged live finding"
+
+# #2568: CodeRabbit's acknowledgement edit can also prepend the invisible
+# `<!-- coderabbit-ai-generated:v1 -->` header to a finding created without
+# it (observed on nathanpaynedotcom#1445). That header is framing, not
+# content: the reply before the edit still accounts for the live finding, and
+# the archived pre-edit revision demands no acknowledgement token.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '"<!-- coderabbit-ai-generated:v1 -->\n\n" + sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8702
+run_gate
+assert_eq 0 "$RUN_RC" "an acknowledgement edit that also prepends the generated header keeps the finding accounted (#2568)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "the header-only difference demands no inline acknowledgement token (#2568)"
+# Negative control: the header is stripped only as the first line, so a real
+# content change that comes with it is still an ordinary edit.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit '"<!-- coderabbit-ai-generated:v1 -->\n\nAlso rename the flag.\n\n" + sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8703
+run_gate
+assert_eq 1 "$RUN_RC" "a content change delivered with the generated header still raises the floor (#2568)"
+cp "$TMP/fixtures/inline-acked-crlf.json" "$TMP/fixtures/inline.json"
+jq -r '.[0].body' "$TMP/fixtures/inline-before-ack-crlf.json" >"$TMP/pre-ack-body-crlf.txt"
+archive_of "$TMP/pre-ack-body-crlf.txt" 8702
+run_gate
+assert_eq 0 "$RUN_RC" "a CRLF archived revision collapses with its CRLF acknowledged live finding"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+printf '%s\n\nAlso bound the retry counter.\n' "$(cat "$PRE_ACK_BODY")" >"$TMP/pre-ack-body-edited.txt"
+archive_of "$TMP/pre-ack-body-edited.txt" 8703
+run_gate
+assert_eq 1 "$RUN_RC" "an archived revision with different visible content still needs its own acknowledgement"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "content-changed archive keeps the inline-archive shape"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the record shows the acknowledged edit changed content, so the live finding is unaccounted too"
+# A ✅ line with no CodeRabbit footer anywhere is content, in the archive
+# comparison as in the live finding: nothing collapses and the record does
+# not lower the live floor.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+jq '.[0].body = "_🟡 Minor_ Clarify the error"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+printf '%s\n' "_🟡 Minor_ Clarify the error" >"$TMP/no-footer-body.txt"
+ack_edit '. + "\n\n✅ Addressed in commit def5678"' "2026-08-18T21:02:00Z"
+archive_of "$TMP/no-footer-body.txt" 8713
+run_gate
+assert_eq 1 "$RUN_RC" "a markerless confirmation line is content in the archive comparison too"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "neither the live finding nor its archived predecessor is cleared by a markerless line"
+# archive_version 1 records: without a body the record is inventoried as before, never a crash;
+# with a body it compares like a v2 record, and only when the body matches the record's fingerprint.
+fingerprint_of_body_file() {  # the gate's fingerprint of a body: sha256 of its JSON string, first 12 hex
+  local json
+  json=$(jq -nc --rawfile body "$1" '$body | rtrimstr("\n")')
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$json" | sha256sum | awk '{print substr($1, 1, 12)}'
+  else
+    printf '%s' "$json" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+  fi
+}
+v1_record() {  # v1_record <comment id> [body file] [fingerprint override]
+  local payload fp
+  if [ -n "${2:-}" ]; then
+    fp="${3:-$(fingerprint_of_body_file "$2")}"
+    payload=$(jq -n --rawfile body "$2" --arg fp "$fp" '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:$fp,codex_tiers:[],coderabbit_tiers:["p2"],body:($body | rtrimstr("\n"))}')
+  else
+    payload=$(jq -n '{archive_version:1,source_kind:"inline",source_comment_id:20,source_login:"coderabbitai[bot]",archived_at:"2026-08-18T21:02:00Z",body_fingerprint:"0123456789ab",codex_tiers:[],coderabbit_tiers:["p2"]}')
+  fi
+  jq -n --arg marker "<!-- mergepath-feedback-archive:v1 $(printf '%s' "$payload" | base64 | tr -d '\n') -->" --argjson id "$1" '[{
+    "id": $id,
+    "created_at": "2026-08-18T21:02:01Z",
+    "updated_at": "2026-08-18T21:02:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $marker
+  }]' >"$TMP/fixtures/issues.json"
+}
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+v1_record 8704
+run_gate
+assert_eq 1 "$RUN_RC" "a body-less archive_version 1 record is inventoried, not a crash"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "body-less v1 record keeps the inline-archive shape"
+v1_record 8705 "$PRE_ACK_BODY"
+run_gate
+assert_eq 0 "$RUN_RC" "an archive_version 1 record carrying the pre-acknowledgement body collapses with the acknowledged live finding"
+v1_record 8705 "$PRE_ACK_BODY" "0123456789ab"
+run_gate
+assert_eq 1 "$RUN_RC" "a v1 body that does not match the record's fingerprint is ignored, so the record is inventoried"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the mismatched v1 record keeps the inline-archive shape"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "an ignored v1 body leaves the marker-based decision on the live finding in place"
+assert_eq "(archived reviewer inline version)" "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")][0].body')" "a rejected v1 body is not reported as the archived finding text"
+
+# archive_entry <body file> <comment id> <archived_at> — one relay record as a JSON object on stdout.
+archive_entry() {
+  local rendered
+  rendered=$("$RENDER_ARCHIVE" inline 20 'coderabbitai[bot]' "$3" "$1")
+  jq -n --arg archive "$rendered" --argjson id "$2" --arg at "$3" '{
+    "id": $id, "created_at": $at, "updated_at": $at,
+    "user": {"login": "github-actions[bot]"}, "body": $archive
+  }'
+}
+# Shape 5: the footer rewritten to the reply marker with no confirmation line,
+# CodeRabbit's edit after a reply it does not confirm. With the relay's record
+# the edit is provably content-free; without it, GitHub's edit history decides
+# (#2598, below), and a finding with no node id to read it by is an ordinary edit.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->")' "2026-08-18T21:02:00Z"
+printf '[]\n' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "a footer rewrite with no confirmation line, no archived record and no node id is an ordinary edit"
+assert_match 'carries no node id' "$RUN_ERR" "the missing node id is named as the cause"
+archive_of "$PRE_ACK_BODY" 8706
+run_gate
+assert_eq 0 "$RUN_RC" "a footer rewrite with no confirmation line keeps the floor when the archived revision has the same content (#1167)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "the archived pre-rewrite revision collapses with the rewritten live finding"
+# #1210: on a fork pull request the relay's record is fork-supplied, so it never
+# lowers a floor. The same fixture with a fork head keeps the ordinary-edit floor;
+# a head repository that is gone reads as a fork; the fetch failing exits 2.
+set_head() {  # set_head <jq expression for .head>
+  jq ".head = ($1)" "$TMP/fixtures/pull.json" >"$TMP/fixtures/pull.next"
+  mv "$TMP/fixtures/pull.next" "$TMP/fixtures/pull.json"
+}
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
+run_gate
+assert_eq 1 "$RUN_RC" "on a fork pull request an archived revision never lowers the floor (#1210)"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the fork-supplied record leaves the rewritten live finding at its ordinary-edit floor"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": null}'
+run_gate
+assert_eq 1 "$RUN_RC" "a pull request whose head repository is gone is read as a fork"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
+run_gate
+assert_eq 0 "$RUN_RC" "the same fixture with a same-repository head keeps the record-informed floor"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": true}}'
+run_gate
+assert_eq 0 "$RUN_RC" "a same-repository head on a repository that is itself a fork is not a fork pull request"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"full_name": "Someone/Widget", "fork": false}}'
+run_gate
+assert_eq 1 "$RUN_RC" "without repository ids the head is a fork when its full name differs from the base"
+cp "$TMP/fixtures/inline-acked-once.json" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8715
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
+run_gate
+assert_eq 0 "$RUN_RC" "on a fork pull request the marker-based decision still stands and an acknowledgement-only archive still collapses"
+GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7" run_gate
+assert_eq 2 "$RUN_RC" "a failed pull request fetch fails the gate closed"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
+
+# #2598: the no-line shape with no record applying is decided from GitHub's own
+# edit history. The fixture is nathanjohnpayne/mergepath#2585's finding
+# 4331100484: created 22:41:12Z, rebutted 22:58:55Z, footer rewritten 22:58:59Z
+# with no confirmation line, withdrawn by CodeRabbit 22:59:20Z, no archive record.
+# edit_history <node id> <editedAt>=<body file>[@deleted]... — GitHub's record of one
+# comment as the graphql fixture, newest first; an empty file name is withheld text.
+edit_history() {
+  local node="$1" nodes='[]' rev at file deleted
+  shift
+  for rev in "$@"; do
+    at="${rev%%=*}"
+    file="${rev#*=}"
+    deleted=null
+    case "$file" in *@deleted) file="${file%@deleted}"; deleted='"2026-10-21T01:00:00Z"' ;; esac
+    if [ -n "$file" ]; then
+      nodes=$(printf '%s' "$nodes" | jq -c --arg at "$at" --argjson deleted "$deleted" --rawfile body "$file" \
+        '. + [{editedAt: $at, deletedAt: $deleted, diff: ($body | rtrimstr("\n"))}]')
+    else
+      nodes=$(printf '%s' "$nodes" | jq -c --arg at "$at" '. + [{editedAt: $at, deletedAt: null, diff: null}]')
+    fi
+  done
+  printf '%s' "$nodes" | jq '[{data: {node: {userContentEdits: {pageInfo: {hasNextPage: false, endCursor: null}, nodes: .}}}}]' \
+    >"$TMP/fixtures/edits-$node.json"
+}
+graphql_calls() { grep -c -- '^api graphql ' "$TMP/gh-calls.log" || true; }
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {"id": 4331100484, "node_id": "PRRC_fixture4331100484", "in_reply_to_id": null, "created_at": "2026-10-20T22:41:12Z", "updated_at": "2026-10-20T22:58:59Z", "user": {"login": "coderabbitai[bot]"}, "path": "REVIEW_POLICY.md", "line": 580,
+   "body": "<!-- coderabbit-ai-generated:v1 -->\n\n**🩺 Stability & Availability** | **🟡 Minor** | **⚡ Quick win**\n\n**Bound the API poll, not only the loop.**\n\nThe deadline check runs only after `gh api ... | grep` returns false. A stalled `gh api` can block past `end`.\n\n<!-- cr-comment:v1:606865b508ac692e6731b1aa -->\n\n<!-- This is an auto-generated reply by CodeRabbit -->"},
+  {"id": 4331223186, "in_reply_to_id": 4331100484, "created_at": "2026-10-20T22:58:55Z", "user": {"login": "nathanjohnpayne"}, "path": "REVIEW_POLICY.md", "line": 580,
+   "body": "Rebuttal: the documented command already bounds every poll with the SECONDS deadline and a per-request timeout.\n\n[mergepath-resolve: rebuttal-recorded]"},
+  {"id": 4331226967, "in_reply_to_id": 4331100484, "created_at": "2026-10-20T22:59:20Z", "user": {"login": "coderabbitai[bot]"}, "path": "REVIEW_POLICY.md", "line": 580,
+   "body": "@nathanjohnpayne I withdraw this finding; the deadline already bounds the poll.\n\n<!-- This is an auto-generated reply by CodeRabbit -->"}
+]
+JSON
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/inline-2585.json"
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/live-2585.txt"
+sed 's/auto-generated reply by CodeRabbit/auto-generated comment by CodeRabbit/' "$TMP/live-2585.txt" >"$TMP/created-2585.txt"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+run_gate
+assert_eq 0 "$RUN_RC" "a footer-only rewrite with no record applying keeps the floor at the creation GitHub's history reaches, so the reply four seconds before it counts (#2598)"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "the rewritten finding is the one posted finding"
+assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "the pre-edit reply is its evidence"
+assert_eq 1 "$(graphql_calls)" "GitHub's edit history is read once for the finding"
+# The twin: one body character changed at the same edit.
+sed 's/Bound the API poll/Bound the API polls/' "$TMP/created-2585.txt" >"$TMP/created-2585-twin.txt"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585-twin.txt"
+run_gate
+assert_eq 1 "$RUN_RC" "a rewrite that also changed one body character raises the floor to that edit, so the earlier reply does not count"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "the content-changed live finding is what is missing"
+jq '. + [{"id": 4331843596, "in_reply_to_id": 4331100484, "created_at": "2026-10-21T00:41:35Z", "user": {"login": "nathanjohnpayne"}, "path": "REVIEW_POLICY.md", "line": 580, "body": "Restating the disposition after the edit: rebutted, see above."}]' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 0 "$RUN_RC" "a reply after the content-changing rewrite is evidence for it"
+assert_eq 0 "$(graphql_calls)" "a finding the marker rule already accounts never reads the history"
+# Fail closed: an unreadable history, withheld or deleted text, or a newest revision that is not the live body.
+cp "$TMP/fixtures/inline-2585.json" "$TMP/fixtures/inline.json"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+GH_FAIL_ENDPOINT=graphql run_gate
+assert_eq 1 "$RUN_RC" "an unreadable edit history leaves the rewrite an ordinary edit"
+assert_match 'could not read GitHub.s edit history for inline finding 4331100484' "$RUN_ERR" "the unreadable history is named as the cause"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z="
+run_gate
+assert_eq 1 "$RUN_RC" "a revision whose text GitHub withholds ends the content-free run at the newer edit"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt@deleted"
+run_gate
+assert_eq 1 "$RUN_RC" "a deleted revision cannot prove the rewrite content-free, even with its text present"
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/created-2585-twin.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+run_gate
+assert_eq 1 "$RUN_RC" "a history whose newest revision is not the live body decides nothing"
+assert_match 'does not show the live body' "$RUN_ERR" "the mismatch is named as the cause"
+# Scope: the relay's record decides when one applies; a confirmed acknowledgement
+# and an edit that kept the comment footer never read the history.
+edit_history PRRC_fixture4331100484 "2026-10-20T22:58:59Z=$TMP/live-2585.txt" "2026-10-20T22:41:12Z=$TMP/created-2585.txt"
+rendered=$("$RENDER_ARCHIVE" inline 4331100484 'coderabbitai[bot]' '2026-10-20T22:58:59Z' "$TMP/created-2585-twin.txt")
+jq -n --arg archive "$rendered" '[{"id": 8720, "created_at": "2026-10-20T22:59:00Z", "updated_at": "2026-10-20T22:59:00Z", "user": {"login": "github-actions[bot]"}, "body": $archive}]' >"$TMP/fixtures/issues.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 1 "$RUN_RC" "a record that applies decides, and one showing a content change is not overruled by the history"
+assert_eq 0 "$(graphql_calls)" "the history is not read when a record applies"
+printf '[]\n' >"$TMP/fixtures/issues.json"
+jq '.[0].body |= sub("<!-- This is an auto-generated reply by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit 65a7aec")' \
+  "$TMP/fixtures/inline-2585.json" >"$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 0 "$RUN_RC" "a confirmed acknowledgement is decided by the marker rule"
+assert_eq 0 "$(graphql_calls)" "and never reads the history"
+jq 'del(.[1])' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 1 "$RUN_RC" "a confirmed acknowledgement with no reply is unaccounted at its creation floor"
+assert_eq 0 "$(graphql_calls)" "and the history is not read for it either"
+jq '.[0].body |= sub("<!-- This is an auto-generated reply by CodeRabbit -->$"; "\n<!-- This is an auto-generated comment by CodeRabbit -->")' \
+  "$TMP/fixtures/inline-2585.json" >"$TMP/fixtures/inline.json"
+: >"$TMP/gh-calls.log"; run_gate
+assert_eq 1 "$RUN_RC" "an edit that kept the comment footer is an ordinary edit, whatever it changed"
+assert_eq 0 "$(graphql_calls)" "only the reply-marker rewrite reads the history"
+# A fork cannot write GitHub's record, so it decides the shape on a fork pull request too.
+cp "$TMP/fixtures/inline-2585.json" "$TMP/fixtures/inline.json"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 9999, "full_name": "someone/widget", "fork": true}}'
+run_gate
+assert_eq 0 "$RUN_RC" "on a fork pull request GitHub's record still decides the footer-only rewrite (#1210 bars only the relay's record)"
+set_head '{"sha": "cccccccccccccccccccccccccccccccccccccccc", "repo": {"id": 4242, "full_name": "acme/widget", "fork": false}}'
+reset_fixtures
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+# A content change delivered with an acknowledgement is still an edit, and its archive still needs a token.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("Clarify the error"; "Clarify the error and its exit code") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$PRE_ACK_BODY" 8707
+run_gate
+assert_eq 1 "$RUN_RC" "a content change delivered with an acknowledgement is still an edit"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the archived pre-change revision still needs its own token"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "a reply to the old text does not stand for the rewritten live finding"
+# The same-second allowance for a confirmed reply holds only at creation: a reply
+# sharing the second of a content-changing confirmed edit may precede the rewrite.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+ack_edit 'sub("Clarify the error"; "Clarify the error and its exit code") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne")' "2026-08-18T21:02:00Z"
+jq '. + [{"id": 22, "in_reply_to_id": 20, "created_at": "2026-08-18T21:02:00Z", "user": {"login": "nathanjohnpayne"}, "path": "scripts/a.sh", "line": 4, "body": "Fixed in def5678 with the exit code named."}]' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+archive_of "$PRE_ACK_BODY" 8714
+run_gate
+assert_eq 1 "$RUN_RC" "a same-second reply beside a content-changing confirmed edit is not evidence for the rewritten finding"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "the same-second allowance holds only at the creation floor"
+# The record-informed floor is the newest content-changing edit, not the latest edit.
+cp "$TMP/fixtures/inline-before-ack.json" "$TMP/fixtures/inline.json"
+CONTENT_A="$PRE_ACK_BODY"
+jq -r '.[0].body | sub("Clarify the error"; "Clarify the error and its exit code")' "$TMP/fixtures/inline-before-ack.json" >"$TMP/content-b.txt"
+jq '.[0].body |= sub("Clarify the error"; "Clarify the error and its exit code")
+  | .[0].body |= sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->")
+  | .[0].updated_at = "2026-08-18T21:02:00Z"
+  | .[1].created_at = "2026-08-18T21:01:00Z"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+jq -n --argjson a "$(archive_entry "$CONTENT_A" 8708 "2026-08-18T21:00:30Z")" \
+  --argjson b "$(archive_entry "$TMP/content-b.txt" 8709 "2026-08-18T21:02:00Z")" '[$a, $b]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq true "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "inline")] | .[0].accounted')" "a reply after the last content change and before a content-free rewrite is evidence for the live finding"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing | length')" "only the superseded content revision still needs a token"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "the superseded content revision keeps the inline-archive shape"
+jq '.[1].created_at = "2026-08-18T21:00:10Z"' "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline")] | length')" "a reply from before the last content change is not evidence, whatever the later rewrite did"
+# A content line that starts with ✅ before the finding's own footer is content, not acknowledgement.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n✅ Also bound the retry counter to 3\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/check-content-body.txt"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$TMP/check-content-body.txt" 8710
+run_gate
+assert_eq 0 "$RUN_RC" "a content line starting with ✅ before the footer is content and the acknowledgement-only archive still collapses"
+ack_edit 'sub("retry counter to 3"; "retry counter to 30 and add jitter")' "2026-08-18T21:03:00Z"
+run_gate
+assert_eq 1 "$RUN_RC" "a change to a content line starting with ✅ is a content change"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.missing[] | select(.kind == "inline-archive")] | length')" "the archive of the unchanged ✅ content line still needs its token"
+# A scan-suppressed region between the content and the run does not untrust the run.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n✅ Passed checks\n<!-- pre_merge_checks_walkthrough_start -->\nwalkthrough\n<!-- pre_merge_checks_walkthrough_end -->\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/suppressed-body.txt"
+ack_edit 'sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$TMP/suppressed-body.txt" 8711
+run_gate
+assert_eq 0 "$RUN_RC" "a scan-suppressed region before the run leaves the acknowledgement trusted and the archive collapsed"
+# Trailing spaces are content: a Markdown hard break removed is a content change.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error  \nsecond sentence\n\n<!-- This is an auto-generated comment by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:01:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+jq -r '.[0].body' "$TMP/fixtures/inline.json" >"$TMP/hard-break-body.txt"
+ack_edit 'sub("error  \n"; "error\n") | sub("<!-- This is an auto-generated comment by CodeRabbit -->$"; "<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678")' "2026-08-18T21:02:00Z"
+archive_of "$TMP/hard-break-body.txt" 8712
+run_gate
+assert_eq 1 "$RUN_RC" "removing a Markdown hard break is a content change, not acknowledgement noise"
+# Stacked login-naming lines: the configured identity keeps its same-second allowance whatever the line order.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-18T21:00:00Z",
+    "updated_at": "2026-08-18T21:03:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "_🟡 Minor_ Clarify the error\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @nathanjohnpayne\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Confirmed as addressed by @outside-collaborator\n\n<!-- This is an auto-generated reply by CodeRabbit -->"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-18T21:00:00Z",
+    "user": {"login": "nathanjohnpayne"},
+    "path": "scripts/a.sh",
+    "line": 4,
+    "body": "Fixed in def5678."
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "a configured identity named by an earlier stacked confirmation keeps its same-second allowance"
+
+# #2927: CodeRabbit's icon-label severity row, from verbatim bodies. Before the
+# fix overridebroadway#277 accounted these reviews as posted 0 / clear: the
+# outside-diff Major sat in a blockquoted CAUTION block whose only severity was
+# `<picture>...</picture> Major`, which no marker matched.
+SERIALIZATION_FIXTURE="$ROOT/tests/fixtures/coderabbit_review_serialization_2927.json"
+serialization_review() {
+  jq -c --argjson id "$1" '
+    [.reviews[] | select(.id == $id)
+     | {id, commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", submitted_at, state,
+        user: {login: "coderabbitai[bot]"}, body}]' "$SERIALIZATION_FIXTURE"
+}
+reset_fixtures
+serialization_review 5747953237 >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "#2927: icon-label outside-diff Major review body blocks"
+assert_eq review-body "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "#2927: icon-label Major is a review-body finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: icon-label Major grades p1"
+
+reset_fixtures
+serialization_review 5747953237 | jq -c 'map(.body |= gsub("</picture> Major"; "</picture> Severe"))' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "#2927: unknown icon label in a review body fails closed"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: unclassified severity row grades at the top CodeRabbit tier"
+
+reset_fixtures
+jq -c '[.inline_comments[] | select(.id == 4451423418)
+        | {id, created_at: "2026-08-18T22:00:00Z", user: {login: "coderabbitai[bot]"},
+           path, line, body}]' "$SERIALIZATION_FIXTURE" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "#2927: unanswered icon-label inline Major blocks"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: icon-label inline Major grades p1"
+
+reset_fixtures
+jq -c '[.inline_comments[] | select(.id == 4451315353)
+        | {id, created_at: "2026-08-18T22:00:00Z", user: {login: "coderabbitai[bot]"},
+           path, line: (.line // 1), body}]' "$SERIALIZATION_FIXTURE" >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: icon-label inline Minor grades p2"
+jq -c 'map(.body += "\n\n**<picture><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-comment-icons-v1/major-16.svg\" alt=\"\"></picture> Severe** · **Security & Privacy** · **Quick win**")' \
+  "$TMP/fixtures/inline.json" >"$TMP/fixtures/inline.next"
+mv "$TMP/fixtures/inline.next" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "#2927: an unknown row beside a recognised Minor row still grades p1"
+
+reset_fixtures
+jq -cn '[{id: 902, commit_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", submitted_at: "2026-08-18T22:00:00Z",
+          state: "COMMENTED", user: {login: "coderabbitai[bot]"},
+          body: "<!-- coderabbit-ai-generated:v1 -->\n\n<details>\n<summary>🔇 Additional comments: 1</summary><blockquote>\n\n`3-3`: LGTM!\n\n<!-- cr-comment:v1:1d0917d279ece1649e83f86d -->\n\n</blockquote></details>"}]' \
+  >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 0 "$RUN_RC" "#2927: an untiered LGTM additional comment is not an unclassified finding"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 900,
+    "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "submitted_at": "2026-08-18T22:00:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "body": "### Codex Review\n\n![P2 Badge] Synchronize theme tokens with the app"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "unacknowledged review-body finding blocks"
+assert_eq review-body "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "review-body miss is identified by shape"
+ACK_TOKEN="$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')"
+assert_match '^\[mergepath-review-ack: 900 [0-9a-f]{12}\]$' "$ACK_TOKEN" "review-body remediation token is review and content pinned"
+
+cat >"$TMP/fixtures/issues.json" <<JSON
+[
+  {
+    "id": 901,
+    "created_at": "2026-08-18T22:10:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": "$ACK_TOKEN\nFixed in commit abc1234."
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "review-body acknowledgement with rationale reconciles"
+assert_eq review-ack "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "review acknowledgement evidence is visible"
+
+cat >"$TMP/fixtures/issues.json" <<JSON
+[
+  {
+    "id": 901,
+    "created_at": "2026-08-18T22:10:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": "$ACK_TOKEN"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "bare acknowledgement token without rationale does not reconcile"
+
+cat >"$TMP/fixtures/issues.json" <<JSON
+[
+  {
+    "id": 901,
+    "created_at": "2026-08-18T22:10:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": "$ACK_TOKEN\n."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "punctuation-only acknowledgement rationale does not reconcile"
+
+cat >"$TMP/fixtures/issues.json" <<JSON
+[
+  {
+    "id": 901,
+    "created_at": "2026-08-18T22:10:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": "$ACK_TOKEN\n👍"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "emoji-only acknowledgement rationale does not reconcile"
+
+cat >"$TMP/fixtures/issues.json" <<JSON
+[
+  {
+    "id": 901,
+    "created_at": "2026-08-18T22:10:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": "$ACK_TOKEN\nFixed in commit abc1234."
+  }
+]
+JSON
+jq '.[0].body += " (edited)"' "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "editing a review body invalidates its prior acknowledgement"
+
+PREVIOUS_REVIEW="$TMP/previous-review.txt"
+cat >"$PREVIOUS_REVIEW" <<'EOF'
+### Codex Review
+
+![P1 Badge] Review-body finding removed by a later edit.
+EOF
+set +e
+REVIEW_ARCHIVE=$("$RENDER_ARCHIVE" review-body 900 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:12:00Z' "$PREVIOUS_REVIEW")
+REVIEW_ARCHIVE_RC=$?
+set -e
+assert_eq 0 "$REVIEW_ARCHIVE_RC" "review-body archive renderer accepts an edited review source"
+REVIEW_ARCHIVE_DATA=$(printf '%s' "$REVIEW_ARCHIVE" \
+  | sed -E 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+  | jq -Rr '@base64d | fromjson')
+assert_eq review-body "$(printf '%s' "$REVIEW_ARCHIVE_DATA" | jq -r '.source_kind')" "review archive preserves its source surface"
+REVIEW_ARCHIVE_FINGERPRINT=$(printf '%s' "$REVIEW_ARCHIVE_DATA" | jq -r '.body_fingerprint')
+EXPECTED_REVIEW_ARCHIVE_ACK="[mergepath-review-ack: 900 $REVIEW_ARCHIVE_FINGERPRINT]"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 900,
+    "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "submitted_at": "2026-08-18T22:00:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "body": "### Codex Review\n\nNo findings remain."
+  }
+]
+JSON
+jq -n --arg archive "$REVIEW_ARCHIVE" --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '[
+  {
+    "id": 902,
+    "created_at": "2026-08-18T22:11:00Z",
+    "updated_at": "2026-08-18T22:11:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": ($token + "\nDisposition posted before the review-body edit.")
+  },
+  {
+    "id": 903,
+    "created_at": "2026-08-18T22:12:01Z",
+    "updated_at": "2026-08-18T22:12:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "edited review-body finding remains in the accounting inventory"
+assert_eq review-body-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "edited review body is identified as archived feedback"
+assert_eq "$EXPECTED_REVIEW_ARCHIVE_ACK" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "archived review body retains the review acknowledgement channel"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "pre-edit acknowledgement cannot clear an archived review-body finding"
+jq --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '. + [{
+  "id": 904,
+  "created_at": "2026-08-18T22:13:00Z",
+  "updated_at": "2026-08-18T22:13:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the archived review-body finding after its edit.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-edit acknowledgement reconciles archived review-body feedback"
+
+# A top-level review keeps its immutable submitted_at across body edits. When
+# the body later returns to an archived finding version, the matching archive's
+# edit timestamp must become the live finding's evidence floor; otherwise the
+# original acknowledgement token is accepted again after the re-raise.
+reset_fixtures
+jq -n --rawfile body "$PREVIOUS_REVIEW" '[{
+  "id": 900,
+  "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "submitted_at": "2026-08-18T22:00:00Z",
+  "state": "COMMENTED",
+  "user": {"login": "chatgpt-codex-connector[bot]"},
+  "body": $body
+}]' >"$TMP/fixtures/reviews.json"
+jq -n --arg archive "$REVIEW_ARCHIVE" --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '[
+  {
+    "id": 905,
+    "created_at": "2026-08-18T22:11:00Z",
+    "updated_at": "2026-08-18T22:11:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": ($token + "\nDisposition posted before the review-body finding was removed.")
+  },
+  {
+    "id": 906,
+    "created_at": "2026-08-18T22:12:01Z",
+    "updated_at": "2026-08-18T22:12:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "review-body reversion rejects acknowledgement from before the archived edit"
+assert_eq "$EXPECTED_REVIEW_ARCHIVE_ACK" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "reverted review body keeps its content-pinned acknowledgement channel"
+jq --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" '. + [{
+  "id": 907,
+  "created_at": "2026-08-18T22:13:00Z",
+  "updated_at": "2026-08-18T22:13:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the review-body finding after its latest archived edit.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-edit acknowledgement reconciles a reverted review-body finding"
+
+# A second edit can archive an intermediate body after the acknowledgement
+# above. The live body has returned to the same A fingerprint, but the latest
+# edit of this review source is now the B -> A transition. The A acknowledgement
+# must not clear that later re-raise merely because the intermediate B archive
+# has a different fingerprint.
+INTERMEDIATE_REVIEW="$TMP/intermediate-review.txt"
+printf '%s\n' '### Codex Review' '' \
+  '![P2 Badge] Different finding while the original A finding is removed.' \
+  >"$INTERMEDIATE_REVIEW"
+INTERMEDIATE_REVIEW_ARCHIVE=$("$RENDER_ARCHIVE" review-body 900 \
+  'chatgpt-codex-connector[bot]' '2026-08-18T22:14:00Z' "$INTERMEDIATE_REVIEW")
+INTERMEDIATE_REVIEW_ARCHIVE_DATA=$(printf '%s' "$INTERMEDIATE_REVIEW_ARCHIVE" \
+  | sed -E 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+  | jq -Rr '@base64d | fromjson')
+INTERMEDIATE_REVIEW_ACK="[mergepath-review-ack: 900 $(printf '%s' \
+  "$INTERMEDIATE_REVIEW_ARCHIVE_DATA" | jq -r '.body_fingerprint')]"
+jq --arg archive "$INTERMEDIATE_REVIEW_ARCHIVE" '. + [{
+  "id": 908,
+  "created_at": "2026-08-18T22:14:01Z",
+  "updated_at": "2026-08-18T22:14:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "A to B to A review re-raise rejects acknowledgement before the latest source edit"
+assert_eq "2026-08-18T22:14:00Z" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].updated_at')" \
+  "re-raised review body uses the latest archive timestamp for the review source"
+jq --arg token "$EXPECTED_REVIEW_ARCHIVE_ACK" \
+  --arg intermediate_token "$INTERMEDIATE_REVIEW_ACK" '. + [{
+  "id": 909,
+  "created_at": "2026-08-18T22:15:00Z",
+  "updated_at": "2026-08-18T22:15:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the re-raised review after its latest source edit.")
+}, {
+  "id": 910,
+  "created_at": "2026-08-18T22:15:00Z",
+  "updated_at": "2026-08-18T22:15:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($intermediate_token + "\nDispositioned the archived intermediate review finding too.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "strictly later acknowledgement reconciles an A to B to A review re-raise"
+
+reset_fixtures
+cat >"$TMP/fixtures/issues.json" <<'JSON'
+[
+  {
+    "id": 7990,
+    "created_at": "2026-08-18T22:19:00Z",
+    "updated_at": "2026-08-18T22:19:01Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "<!-- This is an auto-generated reply by CodeRabbit -->\n<!-- CodeRabbit review command invocation: 209adf6e-339a-46b4-8277-9f715b45ab63 -->\n<details>\n<summary>⚠️ Action not completed</summary>\n\nReview rate limited.\n\n</details>"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "CodeRabbit command-invocation rate-limit status is not inventoried (#1050)"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "status-only CodeRabbit reply creates no disposition obligation"
+
+jq '.[0].body = "<!-- This is an auto-generated reply by CodeRabbit -->\n<details>\n<summary>⚠️ Action not completed</summary>\nReview rate limited.\n</details>"' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "status summary without the command-invocation marker fails toward classification"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "one-sided status near miss retains its warning tier"
+
+jq '.[0].body = "<!-- CodeRabbit review command invocation: live-id -->\n<details>\n<summary>⚠️ Action not completed</summary>\nReview rate limited.\n</details>\n\n_📐 Maintainability & Code Quality_ | _🟡 Minor_\n\n**Keep the retry counter bounded.**"' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "mixed CodeRabbit status plus real finding remains inventoried"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed status preserves the real finding tier instead of the status warning"
+
+STATUS_ARCHIVE_BODY="$TMP/status-archive-body.txt"
+cat >"$STATUS_ARCHIVE_BODY" <<'EOF'
+<!-- This is an auto-generated reply by CodeRabbit -->
+<!-- CodeRabbit review command invocation: v2:40695c92071a7774b4a6b4f0e9eb06deacb14b457ca3ec1044886bf8782b8cc7 -->
+<details>
+<summary>⚠️ Action not completed</summary>
+
+Review rate limited.
+
+</details>
+EOF
+STATUS_ARCHIVE_MARKER=$("$RENDER_ARCHIVE" issue-comment 7990 'coderabbitai[bot]' \
+  '2026-08-18T22:19:02Z' "$STATUS_ARCHIVE_BODY")
+assert_eq "" "$STATUS_ARCHIVE_MARKER" "archived CodeRabbit command status emits no invented finding record"
+
+reset_fixtures
+cat >"$TMP/fixtures/issues.json" <<'JSON'
+[
+  {
+    "id": 8000,
+    "created_at": "2026-08-18T22:20:00Z",
+    "updated_at": "2026-08-18T22:20:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n_⚠️ Potential issue_ carried only by this PR-level summary.\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "unacknowledged PR-level bot finding blocks"
+assert_eq issue-comment "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "PR-level bot miss is identified by shape"
+COMMENT_ACK_TOKEN="$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')"
+assert_match '^\[mergepath-comment-ack: 8000 [0-9a-f]{12}\]$' "$COMMENT_ACK_TOKEN" "PR-level remediation token is comment and content pinned"
+jq --arg token "$COMMENT_ACK_TOKEN" '. + [{
+  "id": 8001,
+  "created_at": "2026-08-18T22:20:00Z",
+  "updated_at": "2026-08-18T22:20:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nFixed the summary-only finding in abc1234.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "same-second PR-level acknowledgement cannot prove it followed the latest raise"
+jq 'map(if .id == 8001 then .created_at = "2026-08-18T22:21:00Z" | .updated_at = "2026-08-18T22:21:00Z" else . end)' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "PR-level bot acknowledgement with rationale reconciles"
+assert_eq comment-ack "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "PR-level acknowledgement evidence is visible"
+jq '.[0].body += " (edited)" | .[0].updated_at = "2026-08-18T22:22:00Z"' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "editing a PR-level bot finding invalidates its prior acknowledgement"
+
+PREVIOUS_SUMMARY="$TMP/previous-summary.txt"
+cat >"$PREVIOUS_SUMMARY" <<'EOF'
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+_🟠 Major_ prior-head summary finding that must survive a rewrite.
+EOF
+ARCHIVE_MARKER=""
+if [ -x "$RENDER_ARCHIVE" ]; then
+  ARCHIVE_MARKER=$("$RENDER_ARCHIVE" issue-comment 8000 'coderabbitai[bot]' \
+    '2026-08-18T22:23:00Z' "$PREVIOUS_SUMMARY") || true
+fi
+if printf '%s' "$ARCHIVE_MARKER" | grep -Eq '^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+/=]+ -->$'; then
+  pass "edited-summary archive renderer emits a hidden version record"
+else
+  fail "edited-summary archive renderer emits a hidden version record"
+  ARCHIVE_PAYLOAD=$(jq -nc \
+    --argjson source_comment_id 8000 \
+    --arg source_login 'coderabbitai[bot]' \
+    --arg archived_at '2026-08-18T22:23:00Z' \
+    --arg body_fingerprint '0123456789ab' \
+    '{source_comment_id:$source_comment_id,source_login:$source_login,archived_at:$archived_at,body_fingerprint:$body_fingerprint,codex_tiers:[],coderabbit_tiers:["p1"]}')
+  ARCHIVE_MARKER="<!-- mergepath-feedback-archive:v1 $(printf '%s' "$ARCHIVE_PAYLOAD" | jq -Rr '@base64') -->"
+fi
+ARCHIVE_DATA=$(printf '%s' "$ARCHIVE_MARKER" \
+  | sed -E 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+  | jq -Rr '@base64d | fromjson')
+assert_eq 8000 "$(printf '%s' "$ARCHIVE_DATA" | jq -r '.source_comment_id')" "archive record stays bound to the rewritten source comment"
+assert_eq "$(cat "$PREVIOUS_SUMMARY")" "$(printf '%s' "$ARCHIVE_DATA" | jq -r '.body')" "archive record preserves the complete reviewer finding body"
+assert_eq "$(wc -c <"$PREVIOUS_SUMMARY" | tr -d ' ')" \
+  "$(printf '%s' "$ARCHIVE_DATA" | jq -j '.body' | wc -c | tr -d ' ')" \
+  "archive record preserves the exact reviewer finding byte length"
+ARCHIVE_FINGERPRINT=$(printf '%s' "$ARCHIVE_DATA" | jq -r '.body_fingerprint')
+EXPECTED_ARCHIVE_ACK="[mergepath-comment-ack: 8000 $ARCHIVE_FINGERPRINT]"
+
+PREVIOUS_ARCHIVE="$TMP/previous-archive-marker.txt"
+printf '%s\n' "$ARCHIVE_MARKER" >"$PREVIOUS_ARCHIVE"
+RESTORED_ARCHIVE=$("$RENDER_ARCHIVE" issue-comment 8002 'github-actions[bot]' \
+  '2026-08-18T22:23:02Z' "$PREVIOUS_ARCHIVE")
+assert_eq "$ARCHIVE_MARKER" "$RESTORED_ARCHIVE" "archive-marker mutation re-emits the immutable history record"
+
+# Relay terminal markers are themselves the durable safety record for a
+# read-only source run. Deleting either status must restore the exact marker;
+# otherwise the relay can evaluate while the failed/pending state is absent.
+for relay_status in failed complete; do
+  RELAY_MARKER="<!-- mergepath-feedback-archive-relay:v1 run=12345 status=$relay_status -->"
+  printf '%s\n' "$RELAY_MARKER" >"$PREVIOUS_ARCHIVE"
+  RESTORED_RELAY_MARKER=$("$RENDER_ARCHIVE" issue-comment 8002 'github-actions[bot]' \
+    '2026-08-18T22:23:03Z' "$PREVIOUS_ARCHIVE")
+  assert_eq "$RELAY_MARKER" "$RESTORED_RELAY_MARKER" "relay $relay_status marker mutation re-emits the terminal record"
+done
+printf '%s\n' "$RELAY_MARKER" >"$PREVIOUS_ARCHIVE"
+SPOOFED_RELAY_RESTORE=$("$RENDER_ARCHIVE" issue-comment 8002 nathanjohnpayne \
+  '2026-08-18T22:23:03Z' "$PREVIOUS_ARCHIVE")
+assert_eq "" "$SPOOFED_RELAY_RESTORE" "non-Actions relay marker cannot be promoted into a trusted record"
+
+jq -n --arg archive "$ARCHIVE_MARKER" --arg token "$EXPECTED_ARCHIVE_ACK" '[
+  {
+    "id": 8000,
+    "created_at": "2026-08-18T22:20:00Z",
+    "updated_at": "2026-08-18T22:23:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n**Actionable comments posted: 0**"
+  },
+  {
+    "id": 8001,
+    "created_at": "2026-08-18T22:22:00Z",
+    "updated_at": "2026-08-18T22:22:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "body": ($token + "\nDisposition posted before the summary rewrite.")
+  },
+  {
+    "id": 8002,
+    "created_at": "2026-08-18T22:23:01Z",
+    "updated_at": "2026-08-18T22:23:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "rewritten summary keeps its latest archived finding in inventory"
+assert_eq issue-comment-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "rewritten summary is identified as archived issue-comment feedback"
+assert_eq "$EXPECTED_ARCHIVE_ACK" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "archived summary retains a content-pinned acknowledgement path"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "pre-rewrite acknowledgement cannot clear an archived summary finding"
+ARCHIVE_ACK=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+jq --arg token "$ARCHIVE_ACK" '. + [{
+  "id": 8003,
+  "created_at": "2026-08-18T22:24:00Z",
+  "updated_at": "2026-08-18T22:24:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the archived summary finding after its rewrite.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-rewrite acknowledgement reconciles the archived summary finding"
+
+# Reposting the exact archive marker repairs storage, not the finding itself.
+# The payload's original archived_at remains the evidence floor, so a durable
+# acknowledgement does not become stale merely because the archive comment was
+# restored under a new GitHub comment id and created_at.
+jq --arg archive "$ARCHIVE_MARKER" '
+  map(select(.id != 8002)) + [{
+    "id": 8005,
+    "created_at": "2026-08-18T22:30:00Z",
+    "updated_at": "2026-08-18T22:30:00Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }]
+' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "restored archive retains its original evidence floor"
+
+cat >"$PREVIOUS_SUMMARY" <<'EOF'
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+_🟡 Minor_ a second distinct summary finding removed by a later rewrite.
+EOF
+ARCHIVE_MARKER_TWO=$("$RENDER_ARCHIVE" issue-comment 8000 'coderabbitai[bot]' \
+  '2026-08-18T22:25:00Z' "$PREVIOUS_SUMMARY")
+jq --arg archive "$ARCHIVE_MARKER_TWO" '. + [{
+  "id": 8004,
+  "created_at": "2026-08-18T22:25:01Z",
+  "updated_at": "2026-08-18T22:25:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "distinct removed summary versions remain separate findings"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing_count')" "acknowledging one archived version cannot erase another"
+
+# #1741 BEGIN: exact UTF-8 serialization and verified duplicate recovery.
+archive_test_sha() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi \
+    | awk '{print $1}'
+}
+archive_test_data() {
+  printf '%s\n' "$1" | sed -E \
+    -e 's/^<!-- mergepath-feedback-archive:v1 ([A-Za-z0-9+\/=]+) -->$/\1/' \
+    -e 's/^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]+ part=[0-9]+\/[0-9]+ data=([A-Za-z0-9+\/=]+) -->$/\1/' \
+    | tr -d '\n' | jq -Rc '@base64d | fromjson'
+}
+archive_test_marker() {
+  printf '<!-- mergepath-feedback-archive:v1 %s -->' "$(printf '%s' "$1" | base64 | tr -d '\n')"
+}
+archive_test_chunks() {
+  local encoded id total part offset=0
+  encoded=$(printf '%s' "$1" | base64 | tr -d '\n')
+  id=$(printf '%s' "$1" | archive_test_sha)
+  total=$(( (${#encoded} + 59999) / 60000 ))
+  for ((part=1; part<=total; part++)); do
+    printf '<!-- mergepath-feedback-archive:v2 id=%s part=%s/%s data=%s -->\n' \
+      "$id" "$part" "$total" "${encoded:$offset:60000}"
+    offset=$((offset + 60000))
+  done
+}
+archive_test_comments() {
+  printf '%s\n' "$1" | jq -Rsc --argjson id "$2" '
+    split("\n") | map(select(length > 0)) | to_entries | map({
+      id: ($id + .key), created_at: "2026-08-19T00:00:00Z",
+      user: {login: "github-actions[bot]"}, body: .value
+    })'
+}
+
+UTF8_BODY="$TMP/utf8-body.txt"
+printf '**P1** ' >"$UTF8_BODY"
+UTF8_CONTROL=$(archive_test_data "$("$RENDER_ARCHIVE" review-body 8800 \
+  nathanpayne-claude '2026-08-18T22:40:00Z' "$UTF8_BODY")")
+UTF8_HEADER=$(printf '%s' "$UTF8_CONTROL" | sed -E 's/"body":.*/"body":"/')
+UTF8_HEADER_BYTES=$(printf '%s' "$UTF8_HEADER" | wc -c | tr -d ' ')
+for seam in body payload; do
+  for char in é — 🚀; do
+    for offset in 4091 4092 4093 4094 4095 4096 4097; do
+      prefix=$offset
+      [ "$seam" != payload ] || prefix=$((offset - UTF8_HEADER_BYTES))
+      {
+        printf '**P1** '
+        awk -v n="$((prefix - 7))" 'BEGIN { for (i=0; i<n; i++) printf "x" }'
+        printf '%s exact bytes.\n\n' "$char"
+      } >"$UTF8_BODY"
+      UTF8_DATA=$(archive_test_data "$("$RENDER_ARCHIVE" review-body 8800 \
+        nathanpayne-claude '2026-08-18T22:40:00Z' "$UTF8_BODY")")
+      printf '%s' "$UTF8_DATA" | jq -j '.body' >"$TMP/utf8-decoded.txt"
+      if cmp -s "$UTF8_BODY" "$TMP/utf8-decoded.txt"; then
+        pass "UTF-8 $seam seam preserves $char at byte $offset and trailing newlines"
+      else
+        fail "UTF-8 $seam seam preserves $char at byte $offset and trailing newlines"
+      fi
+      UTF8_JSON=$(jq -nc --rawfile body "$UTF8_BODY" '$body')
+      UTF8_EXPECTED_FP=$(printf '%s' "$UTF8_JSON" | archive_test_sha | cut -c1-12)
+      assert_eq "$UTF8_EXPECTED_FP" "$(printf '%s' "$UTF8_DATA" | jq -r '.body_fingerprint')" \
+        "UTF-8 $seam seam fingerprint binds $char at byte $offset"
+    done
+  done
+done
+
+printf '**P2** Archived é — 🚀 finding.\nOriginal token and timing.\n\n' >"$UTF8_BODY"
+RECOVERY_GOOD=$(archive_test_data "$("$RENDER_ARCHIVE" review-body 8800 \
+  nathanpayne-claude '2026-08-18T22:40:00Z' "$UTF8_BODY")")
+RECOVERY_BAD=$(printf '%s' "$RECOVERY_GOOD" | jq -c '.body |= gsub("—"; "���")')
+RECOVERY_TOKEN="[mergepath-review-ack: 8800 $(printf '%s' "$RECOVERY_GOOD" | jq -r '.body_fingerprint')]"
+RECOVERY_COMMENTS=$(jq -n \
+  --argjson bad "$(archive_test_comments "$(archive_test_marker "$RECOVERY_BAD")" 88001)" \
+  --argjson good "$(archive_test_comments "$(archive_test_marker "$RECOVERY_GOOD")" 88002)" '$bad + $good')
+reset_fixtures
+RECOVERY_RESULT=""
+for order in original reversed; do
+  printf '%s' "$RECOVERY_COMMENTS" | jq --arg order "$order" \
+    'if $order == "reversed" then reverse else . end' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "verified duplicate recovers corruption in $order order without clearing the finding"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "recovered duplicate inventory contains one original finding ($order)"
+  assert_eq "$RECOVERY_TOKEN" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')" "recovery preserves the original acknowledgement token ($order)"
+  assert_eq '2026-08-18T22:40:00Z' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].updated_at')" "recovery preserves the original archive floor ($order)"
+  if [ -n "$RECOVERY_RESULT" ]; then
+    assert_eq "$RECOVERY_RESULT" "$RUN_JSON" "duplicate recovery is independent of comment order"
+  fi
+  RECOVERY_RESULT="$RUN_JSON"
+done
+for ack_at in '2026-08-18T22:39:59Z' '2026-08-18T22:40:00Z' '2026-08-18T22:40:01Z'; do
+  printf '%s' "$RECOVERY_COMMENTS" | jq --arg token "$RECOVERY_TOKEN" --arg at "$ack_at" '. + [{
+    id:88003, created_at:$at, user:{login:"nathanpayne-codex"},
+    body:($token + "\nDispositioned the original archived finding after inspection.")
+  }]' >"$TMP/fixtures/issues.json"
+  run_gate
+  EXPECTED_RECOVERY_RC=1
+  [ "$ack_at" != '2026-08-18T22:40:01Z' ] || EXPECTED_RECOVERY_RC=0
+  assert_eq "$EXPECTED_RECOVERY_RC" "$RUN_RC" "recovery requires a strictly post-archive acknowledgement ($ack_at)"
+done
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "acknowledgement before duplicate delivery still accounts the original finding"
+printf '%s' "$RUN_JSON" | jq -j '.findings[0].body' >"$TMP/recovered-body.txt"
+if cmp -s "$UTF8_BODY" "$TMP/recovered-body.txt"; then
+  pass "recovery retains the complete original body including trailing newlines"
+else
+  fail "recovery retains the complete original body including trailing newlines"
+fi
+cp "$TMP/fixtures/issues.json" "$TMP/recovery-acknowledged.json"
+
+jq -n '[{id:8800, submitted_at:"2026-08-18T22:35:00Z", state:"DISMISSED",
+  user:{login:"nathanpayne-claude"}, body:"**P1** Distinct live replacement finding."}]' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "recovered history remains accountable after a live rewrite"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "recovery preserves both distinct archived and live finding versions"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.accounted')" "original acknowledgement cannot account a distinct live body"
+printf '[]\n' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 0 "$RUN_RC" "verified duplicate recovery remains durable after source deletion"
+
+for mutation in archive_version source_kind source_comment_id source_login archived_at body_fingerprint codex_tiers coderabbit_tiers ghas_tiers absent_ghas extra_metadata; do
+  case "$mutation" in
+    archive_version) filter='.archive_version = 1' ;;
+    source_kind) filter='.source_kind = "inline"' ;;
+    source_comment_id) filter='.source_comment_id += 1' ;;
+    source_login) filter='.source_login = "nathanpayne-cursor"' ;;
+    archived_at) filter='.archived_at = "2026-08-18T22:40:01Z"' ;;
+    body_fingerprint) filter='.body_fingerprint = "0123456789ab"' ;;
+    codex_tiers) filter='.codex_tiers = ["p1"]' ;;
+    coderabbit_tiers) filter='.coderabbit_tiers = ["p1"]' ;;
+    ghas_tiers) filter='.ghas_tiers = ["p0"]' ;;
+    absent_ghas) filter='del(.ghas_tiers)' ;;
+    extra_metadata) filter='.extra_metadata = "different provenance"' ;;
+  esac
+  RECOVERY_VARIANT=$(printf '%s' "$RECOVERY_GOOD" | jq -c "$filter")
+  jq -n --argjson bad "$(archive_test_comments "$(archive_test_marker "$RECOVERY_BAD")" 88001)" \
+    --argjson variant "$(archive_test_comments "$(archive_test_marker "$RECOVERY_VARIANT")" 88002)" \
+    '$bad + $variant' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 2 "$RUN_RC" "duplicate recovery refuses mismatched $mutation"
+done
+for malformed in original duplicate; do
+  RECOVERY_MALFORMED=$(printf '%s' "$RECOVERY_GOOD" | jq -c '.codex_tiers = "p2"')
+  if [ "$malformed" = original ]; then RECOVERY_OTHER="$RECOVERY_GOOD"; else RECOVERY_OTHER="$RECOVERY_BAD"; fi
+  jq -n --argjson bad "$(archive_test_comments "$(archive_test_marker "$RECOVERY_MALFORMED")" 88001)" \
+    --argjson good "$(archive_test_comments "$(archive_test_marker "$RECOVERY_OTHER")" 88002)" \
+    '$bad + $good' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 2 "$RUN_RC" "duplicate recovery cannot mask a malformed $malformed schema"
+done
+# Version-2 provenance is explicit in both transport formats. The legacy v1
+# source-kind default must never normalize malformed v2 metadata before exact
+# duplicate matching (#1741 independent review).
+KIND_GOOD=$(printf '%s' "$RECOVERY_GOOD" | jq -c '
+  .source_kind = "issue-comment" | .source_login = "chatgpt-codex-connector[bot]"')
+for kind_value in missing null false; do
+  case "$kind_value" in
+    missing) kind_filter='del(.source_kind)' ;;
+    null) kind_filter='.source_kind = null' ;;
+    false) kind_filter='.source_kind = false' ;;
+  esac
+  KIND_MALFORMED=$(printf '%s' "$KIND_GOOD" | jq -c "$kind_filter")
+  KIND_CORRUPT=$(printf '%s' "$KIND_MALFORMED" | jq -c '.body |= gsub("—"; "���")')
+  for transport in v1 v2; do
+    if [ "$transport" = v1 ]; then
+      KIND_RECORD=$(archive_test_marker "$KIND_MALFORMED")
+      KIND_CORRUPT_RECORD=$(archive_test_marker "$KIND_CORRUPT")
+    else
+      KIND_RECORD=$(archive_test_chunks "$KIND_MALFORMED")
+      KIND_CORRUPT_RECORD=$(archive_test_chunks "$KIND_CORRUPT")
+    fi
+    archive_test_comments "$KIND_RECORD" 88005 >"$TMP/fixtures/issues.json"
+    run_gate
+    assert_eq 2 "$RUN_RC" "version-2 $kind_value source_kind fails schema validation through $transport transport"
+    jq -n --argjson bad "$(archive_test_comments "$KIND_CORRUPT_RECORD" 88005)" \
+      --argjson good "$(archive_test_comments "$(archive_test_marker "$KIND_GOOD")" 88006)" \
+      '$bad + $good' >"$TMP/fixtures/issues.json"
+    run_gate
+    assert_eq 2 "$RUN_RC" "version-2 $kind_value source_kind cannot recover from an explicit duplicate through $transport transport"
+  done
+done
+LEGACY_KIND_DEFAULT=$(printf '%s' "$KIND_GOOD" | jq -c '.archive_version = 1 | del(.source_kind)')
+archive_test_comments "$(archive_test_marker "$LEGACY_KIND_DEFAULT")" 88005 >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "legacy version-1 absent source_kind still defaults to issue-comment"
+assert_eq issue-comment-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" \
+  "legacy source-kind default retains its original finding obligation"
+printf '%s' "$RECOVERY_COMMENTS" | jq '.[1].user.login = "nathanjohnpayne"' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a non-Actions valid lookalike cannot recover trusted corruption"
+printf '%s' "$RECOVERY_COMMENTS" | jq '.[0:1]' >"$TMP/fixtures/issues.json"
+jq -n --rawfile body "$UTF8_BODY" '[{id:8800, submitted_at:"2026-08-18T22:35:00Z",
+  user:{login:"nathanpayne-claude"}, body:$body}]' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 2 "$RUN_RC" "an intact live source alone cannot recover unmatched archive corruption"
+printf '%s' "$RECOVERY_COMMENTS" >"$TMP/fixtures/issues.json"
+jq '.[0].user.login = "nathanpayne-cursor"' "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 2 "$RUN_RC" "duplicate recovery does not bypass surviving source identity binding"
+printf '[]\n' >"$TMP/fixtures/reviews.json"
+# The payloads still agree exactly, but the claimed source is not configured.
+jq -n --argjson bad "$(archive_test_comments "$(archive_test_marker "$(printf '%s' "$RECOVERY_BAD" | jq -c '.source_login = "stranger"')")" 88001)" \
+  --argjson good "$(archive_test_comments "$(archive_test_marker "$(printf '%s' "$RECOVERY_GOOD" | jq -c '.source_login = "stranger"')")" 88002)" \
+  '$bad + $good' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "unconfigured source identities cannot supply duplicate recovery evidence"
+
+# A synthetic short-hash collision exercises the distinct-valid-body fence.
+if REAL_RECOVERY_HASH=$(command -v sha256sum); then
+  REAL_RECOVERY_HASH_IS_SHASUM=false
+else
+  REAL_RECOVERY_HASH=$(command -v shasum)
+  REAL_RECOVERY_HASH_IS_SHASUM=true
+fi
+export REAL_RECOVERY_HASH REAL_RECOVERY_HASH_IS_SHASUM
+export RECOVERY_COLLISION_JSON='"**P2** Different complete body with a colliding short hash."'
+RECOVERY_COLLISION_FP="$(printf '%s' "$RECOVERY_GOOD" | jq -r '.body_fingerprint')"
+export RECOVERY_COLLISION_FP
+cat >"$TMP/bin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+input=$(cat)
+if [ "$input" = "$RECOVERY_COLLISION_JSON" ]; then
+  printf '%s%052d  -\n' "$RECOVERY_COLLISION_FP" 0
+elif [ "$REAL_RECOVERY_HASH_IS_SHASUM" = true ]; then
+  printf '%s' "$input" | "$REAL_RECOVERY_HASH" -a 256
+else
+  printf '%s' "$input" | "$REAL_RECOVERY_HASH"
+fi
+SH
+chmod +x "$TMP/bin/sha256sum"
+RECOVERY_COLLISION=$(printf '%s' "$RECOVERY_GOOD" | jq -c --argjson body "$RECOVERY_COLLISION_JSON" '.body = $body')
+jq -n --argjson originals "$RECOVERY_COMMENTS" \
+  --argjson collision "$(archive_test_comments "$(archive_test_marker "$RECOVERY_COLLISION")" 88004)" \
+  '$originals + $collision' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "conflicting verified bodies cannot recover a short-fingerprint collision"
+rm "$TMP/bin/sha256sum"
+unset REAL_RECOVERY_HASH REAL_RECOVERY_HASH_IS_SHASUM RECOVERY_COLLISION_JSON RECOVERY_COLLISION_FP
+
+{
+  cat "$UTF8_BODY"
+  awk 'BEGIN { for (i=0; i<61000; i++) printf "\\" }'
+  printf 'é — 🚀\n\n'
+} >"$TMP/utf8-chunked-body.txt"
+UTF8_CHUNKS=$("$RENDER_ARCHIVE" review-body 8800 nathanpayne-claude \
+  '2026-08-18T22:40:00Z' "$TMP/utf8-chunked-body.txt")
+assert_match '^<!-- mergepath-feedback-archive:v2 ' "${UTF8_CHUNKS:0:80}" "near-limit UTF-8 body uses chunked records"
+UTF8_CHUNK_DATA=$(archive_test_data "$UTF8_CHUNKS")
+printf '%s' "$UTF8_CHUNK_DATA" | jq -j '.body' >"$TMP/utf8-chunked-decoded.txt"
+if cmp -s "$TMP/utf8-chunked-body.txt" "$TMP/utf8-chunked-decoded.txt"; then
+  pass "chunked records preserve complete UTF-8 body bytes and trailing newlines"
+else
+  fail "chunked records preserve complete UTF-8 body bytes and trailing newlines"
+fi
+UTF8_CHUNK_JSON=$(jq -nc --rawfile body "$TMP/utf8-chunked-body.txt" '$body')
+assert_eq "$(printf '%s' "$UTF8_CHUNK_JSON" | archive_test_sha | cut -c1-12)" \
+  "$(printf '%s' "$UTF8_CHUNK_DATA" | jq -r '.body_fingerprint')" "chunked UTF-8 body retains its exact fingerprint"
+BAD_CHUNK_DATA=$(printf '%s' "$UTF8_CHUNK_DATA" | jq -c '.body |= gsub("—"; "���")')
+BAD_CHUNKS=$(archive_test_chunks "$BAD_CHUNK_DATA")
+archive_test_comments "$UTF8_CHUNKS" 88100 >"$TMP/good-chunk-comments.json"
+archive_test_comments "$BAD_CHUNKS" 88200 >"$TMP/bad-chunk-comments.json"
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" \
+  '$bad[0] + $good[0]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "complete chunk sets support verified duplicate recovery"
+printf '%s' "$RUN_JSON" | jq -j '.missing[0].body' >"$TMP/utf8-chunked-recovered.txt"
+if cmp -s "$TMP/utf8-chunked-body.txt" "$TMP/utf8-chunked-recovered.txt"; then
+  pass "recovery retains the full chunked body"
+else
+  fail "recovery retains the full chunked body"
+fi
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" \
+  '$bad[0][:-1] + $good[0]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a complete duplicate cannot hide a missing corrupt chunk"
+jq -n --slurpfile good "$TMP/good-chunk-comments.json" --slurpfile bad "$TMP/bad-chunk-comments.json" '
+  $bad[0] + $good[0] + [($bad[0][0] | .id = 88300 | .body |= sub("data=."; "data=A"))]
+' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "a complete duplicate cannot hide conflicting corrupt chunks"
+# #1741 END.
+
+reset_fixtures
+LARGE_ARCHIVE_BODY="$TMP/large-archive-body.txt"
+{
+  printf '**P1** Large archived finding. '
+  awk 'BEGIN { for (i = 0; i < 65500; i++) printf "%c", 92 }'
+} >"$LARGE_ARCHIVE_BODY"
+LARGE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8600 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:25:30Z' "$LARGE_ARCHIVE_BODY")
+assert_match '^<!-- mergepath-feedback-archive:v2 ' "$(printf '%s\n' "$LARGE_ARCHIVE" | sed -n '1p')" "oversized archive uses chunked v2 records"
+if [ "$(printf '%s\n' "$LARGE_ARCHIVE" | awk 'END { print NR }')" -gt 1 ]; then
+  pass "oversized archive spans more than one durable comment"
+else
+  fail "oversized archive spans more than one durable comment"
+fi
+FIRST_LARGE_ARCHIVE=$(printf '%s\n' "$LARGE_ARCHIVE" | sed -n '1p')
+printf '%s\n' "$FIRST_LARGE_ARCHIVE" >"$PREVIOUS_ARCHIVE"
+RESTORED_LARGE_ARCHIVE=$("$RENDER_ARCHIVE" issue-comment 8601 'github-actions[bot]' \
+  '2026-08-18T22:25:31Z' "$PREVIOUS_ARCHIVE")
+if [ "$RESTORED_LARGE_ARCHIVE" = "$FIRST_LARGE_ARCHIVE" ]; then
+  pass "chunked archive-marker mutation re-emits the exact record"
+else
+  fail "chunked archive-marker mutation re-emits the exact record"
+fi
+printf '%s\n' "$LARGE_ARCHIVE" | jq -Rs '
+  split("\n") | map(select(length > 0)) | to_entries
+  | map({
+      id: (8601 + .key),
+      created_at: "2026-08-18T22:25:31Z",
+      updated_at: "2026-08-18T22:25:31Z",
+      user: {login: "github-actions[bot]"},
+      body: .value
+    })
+' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "complete chunked archive remains an undispositioned finding"
+assert_eq "$(wc -c <"$LARGE_ARCHIVE_BODY" | tr -d ' ')" \
+  "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].body | length')" \
+  "chunked archive reconstructs the complete finding body"
+jq 'del(.[-1])' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$RUN_RC" "incomplete chunked archive fails closed"
+
+OVERSIZED_ARCHIVE_BODY="$TMP/oversized-archive-body.txt"
+awk 'BEGIN { printf "**P1** "; for (i = 0; i < 1600000; i++) printf "x" }' \
+  >"$OVERSIZED_ARCHIVE_BODY"
+set +e
+"$RENDER_ARCHIVE" inline 8499 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:25:59Z' "$OVERSIZED_ARCHIVE_BODY" \
+  >"$TMP/oversized-archive-records" 2>"$TMP/oversized-archive-error"
+OVERSIZED_ARCHIVE_RC=$?
+set -e
+assert_eq 2 "$OVERSIZED_ARCHIVE_RC" "archive producer rejects a payload beyond the consumer chunk limit"
+assert_eq 0 "$(wc -c <"$TMP/oversized-archive-records" | tr -d ' ')" "oversized archive emits no partial record set"
+assert_match '32' "$(cat "$TMP/oversized-archive-error")" "oversized archive names the shared chunk limit"
+
+reset_fixtures
+PREVIOUS_INLINE="$TMP/previous-inline.txt"
+cat >"$PREVIOUS_INLINE" <<'EOF'
+**P1** Inline finding deleted before it received a disposition.
+EOF
+INLINE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8500 'chatgpt-codex-connector[bot]' \
+  '2026-08-18T22:26:00Z' "$PREVIOUS_INLINE")
+jq -n --arg archive "$INLINE_ARCHIVE" '[{
+  "id": 8501,
+  "created_at": "2026-08-18T22:26:01Z",
+  "updated_at": "2026-08-18T22:26:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "deleted inline finding remains in the accounting inventory"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "deleted inline feedback retains its source kind"
+INLINE_ARCHIVE_ACK=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+assert_match '^\[mergepath-inline-ack: 8500 [0-9a-f]{12}\]$' "$INLINE_ARCHIVE_ACK" "deleted inline finding gets a content-pinned acknowledgement path"
+assert_match 'archived inline .* finding' "$RUN_ERR" "deleted inline remediation names the archived source surface"
+jq --arg token "$INLINE_ARCHIVE_ACK" '. + [{
+  "id": 8502,
+  "created_at": "2026-08-18T22:27:00Z",
+  "updated_at": "2026-08-18T22:27:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nDispositioned the deleted inline finding after archival.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-deletion acknowledgement reconciles archived inline feedback"
+
+reset_fixtures
+cat >"$PREVIOUS_INLINE" <<'EOF'
+**P1** Registered reviewer inline finding deleted before disposition.
+EOF
+REGISTERED_INLINE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8510 'nathanpayne-claude' \
+  '2026-08-18T22:28:00Z' "$PREVIOUS_INLINE")
+jq -n --arg archive "$REGISTERED_INLINE_ARCHIVE" '[{
+  "id": 8511,
+  "created_at": "2026-08-18T22:28:01Z",
+  "updated_at": "2026-08-18T22:28:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "deleted registered-reviewer inline finding remains in inventory"
+assert_eq nathanpayne-claude "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "archived inline finding stays bound to the registered reviewer"
+
+# A distinct live rewrite and its archived predecessor are separate finding
+# versions. Neither may hide the other merely because they reuse a source id.
+jq -n '[{
+  "id": 8510,
+  "in_reply_to_id": null,
+  "created_at": "2026-08-18T22:28:00Z",
+  "updated_at": "2026-08-18T22:29:00Z",
+  "user": {"login": "nathanpayne-claude"},
+  "path": "src/live.ts",
+  "line": 12,
+  "body": "**P1** Registered reviewer inline finding re-raised live."
+}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "live inline rewrite retains its distinct archived predecessor"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "inline")] | length')" "live inline finding keeps the direct inventory path"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "inline-archive")] | length')" "distinct archived inline finding remains independently dispositionable"
+
+reset_fixtures
+EXACT_INLINE_BODY='**P1** Identical live and archived inline finding.'
+printf '%s' "$EXACT_INLINE_BODY" >"$PREVIOUS_INLINE"
+EXACT_INLINE_ARCHIVE=$("$RENDER_ARCHIVE" inline 8520 'nathanpayne-claude' \
+  '2026-08-18T22:31:00Z' "$PREVIOUS_INLINE")
+jq -n --arg archive "$EXACT_INLINE_ARCHIVE" '[{
+  "id": 8521,
+  "created_at": "2026-08-18T22:31:01Z",
+  "updated_at": "2026-08-18T22:31:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+jq -n --arg body "$EXACT_INLINE_BODY" '[{
+  "id": 8520,
+  "in_reply_to_id": null,
+  "created_at": "2026-08-18T22:31:00Z",
+  "updated_at": "2026-08-18T22:31:00Z",
+  "user": {"login": "nathanpayne-claude"},
+  "path": "src/live.ts",
+  "line": 12,
+  "body": $body
+}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "identical live and archived bodies collapse to one logical finding"
+assert_eq inline "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].kind')" "identical archive retry defers to the direct inventory path"
+
+reset_fixtures
+PREVIOUS_SUMMARY="$TMP/previous-summary.txt"
+printf '%s' '_⚠️ Potential issue_ Original CodeRabbit summary finding.' >"$PREVIOUS_SUMMARY"
+SUMMARY_ARCHIVE=$("$RENDER_ARCHIVE" issue-comment 8530 'coderabbitai[bot]' \
+  '2026-08-18T22:32:00Z' "$PREVIOUS_SUMMARY")
+jq -n --arg archive "$SUMMARY_ARCHIVE" '[
+  {
+    "id": 8530,
+    "created_at": "2026-08-18T22:30:00Z",
+    "updated_at": "2026-08-18T22:33:00Z",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "_🟠 Major_ Replacement CodeRabbit summary finding."
+  },
+  {
+    "id": 8531,
+    "created_at": "2026-08-18T22:32:01Z",
+    "updated_at": "2026-08-18T22:32:01Z",
+    "user": {"login": "github-actions[bot]"},
+    "body": $archive
+  }
+]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "CodeRabbit summary rewrite preserves both distinct finding versions"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '[.findings[] | select(.kind == "issue-comment-archive")] | length')" "rewritten CodeRabbit summary retains the archived predecessor"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 901,
+    "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "submitted_at": "2026-08-18T22:30:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "coderabbitai[bot]"},
+    "body": "**Actionable comments posted: 0**\n\n```text\n_🟠 Major_ quoted source text\n```\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "CodeRabbit fenced markers and pre-merge warnings are not invented into review-body findings"
+jq '.[0].body = "**Actionable comments posted: 1**\n\n_🟠 Major_ real review-body finding\n\n```text\n_⚠️ Potential issue_ quoted source text\n```\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "CodeRabbit finding outside sanitized regions still blocks"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "sanitized CodeRabbit body preserves the real finding tier"
+
+# #1407: warning headings cannot manufacture a P1 inventory obligation, and
+# removing the warning glyph alone must not leave an invented P3 category.
+cp "$TMP/fixtures/reviews.json" "$TMP/fixtures/reviews.before-headings.json"
+for heading in '> **⚠️ Outside diff range comments (1)**' \
+  '<summary>Outside diff range comments (1)</summary>'; do
+  jq --arg heading "$heading" '.[0].body = ($heading + "\n> <details>\n> <summary><strong>🟡 Minor</strong> · Restrict Phase 0 preflight to local sessions.</summary><blockquote>\n> </blockquote></details>")' \
+    "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+  mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "outside-diff container retains the real unaccounted finding"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "outside-diff container inventories one review-body finding"
+  assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "outside-diff heading does not change nested Minor severity"
+  assert_eq "$(jq -r '.[0].body' "$TMP/fixtures/reviews.json")" \
+    "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].body')" "outside-diff classification preserves original review text"
+  expected_fingerprint=$(printf '%s' "$(jq -c '.[0].body' "$TMP/fixtures/reviews.json")" | archive_test_sha | cut -c 1-12)
+  assert_eq "$expected_fingerprint" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].body_fingerprint')" \
+    "outside-diff acknowledgement fingerprint retains the original heading"
+
+  jq '.[0].body += "\n_🟠 Major_ Real required finding in the same container."' \
+    "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+  mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "outside-diff container still blocks on nested Major"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "outside-diff container preserves strongest real finding"
+done
+mv "$TMP/fixtures/reviews.before-headings.json" "$TMP/fixtures/reviews.json"
+
+# An unmatched pre-merge-check START earlier in the body must not extend the
+# later, properly paired block back over the intervening text. Pairing on the
+# FIRST start swallowed a real Major badge sitting between the two markers and
+# the inventory reported clear with nothing to disposition (#1000 Codex P1).
+jq '.[0].body = "**Actionable comments posted: 1**\n\n<!-- pre_merge_checks_walkthrough_start -->\n\n_🟠 Major_ real finding between an unpaired start and a paired block\n\n<!-- pre_merge_checks_walkthrough_start -->\n| Docstring Coverage | ⚠️ Warning |\n<!-- pre_merge_checks_walkthrough_end -->"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "an unpaired pre-merge-check start does not suppress a later real finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the re-anchored block leaves the intervening finding at its real tier"
+
+# The properly paired block itself is still suppressed: re-anchoring must not
+# start classifying pre-merge-check hygiene warnings as findings.
+jq '.[0].body = "**Actionable comments posted: 0**\n\n<!-- pre_merge_checks_walkthrough_start -->\n\n<!-- pre_merge_checks_walkthrough_start -->\n_🟠 Major_ hygiene warning inside the paired block\n<!-- pre_merge_checks_walkthrough_end -->"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 0 "$RUN_RC" "re-anchoring still suppresses the properly paired pre-merge-check block"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 903,
+    "commit_id": "cccccccccccccccccccccccccccccccccccccccc",
+    "submitted_at": "2026-08-18T22:40:00Z",
+    "state": "CHANGES_REQUESTED",
+    "user": {"login": "nathanpayne-claude"},
+    "body": "## Phase 4b review\n\n- **P1** Registered reviewer finding"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "registered Phase 4b reviewer body finding blocks"
+assert_eq nathanpayne-claude "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "registered reviewer identity is preserved"
+
+reset_fixtures
+cp "$TMP/review-policy.yml" "$TMP/review-policy.default.yml"
+cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p0: required
+    p1: required
+    p2: discretionary
+    p3: ignore
+    nitpick: ignore
+YAML
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 30,
+    "created_at": "2026-08-18T22:50:00Z",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "path": "src/cosmetic.sh",
+    "line": 2,
+    "body": "![P3 Badge] Cosmetic wording"
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "feedback tier configured ignore is excluded from inventory"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "ignored finding does not contribute to posted count"
+cp "$TMP/fixtures/inline.json" "$TMP/fixtures/ignored-inline.json"
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 904,
+    "commit_id": "dddddddddddddddddddddddddddddddddddddddd",
+    "submitted_at": "2026-08-18T22:55:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "body": "### Codex Review\n\n- **P3** Cosmetic wording\n- **P1** Required safety guard"
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "ignored marker before required marker does not hide the review-body finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed-severity review body keeps its strongest tier"
+jq '.[0].id = 905
+  | .[0].user.login = "coderabbitai[bot]"
+  | .[0].body = "**Actionable comments posted: 2**\n\n🔵 Trivial cosmetic wording\n\n🟠 Major required safety guard"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "ignored CodeRabbit marker before required marker does not hide the review-body finding"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed-severity CodeRabbit review body keeps its strongest tier"
+cp "$TMP/review-policy.yml" "$TMP/review-policy.mixed.yml"
+sed -e 's/p1: required/p1: ignore/' -e 's/p2: discretionary/p2: required/' \
+  "$TMP/review-policy.yml" >"$TMP/review-policy.next"
+mv "$TMP/review-policy.next" "$TMP/review-policy.yml"
+jq '.[0].id = 906
+  | .[0].user.login = "chatgpt-codex-connector[bot]"
+  | .[0].body = "### Codex Review\n\n- **P1** Ignored urgent marker\n- **P2** Required lower-tier guard"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "ignored strongest marker does not hide a required lower-tier finding"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "mixed-severity body keeps the strongest non-ignored tier"
+mv "$TMP/review-policy.mixed.yml" "$TMP/review-policy.yml"
+reset_fixtures
+mv "$TMP/fixtures/ignored-inline.json" "$TMP/fixtures/inline.json"
+sed -i.bak 's/p3: ignore/p3: discretionary/' "$TMP/review-policy.yml"
+rm -f "$TMP/review-policy.yml.bak"
+run_gate
+assert_eq 1 "$RUN_RC" "discretionary tier remains in the accounting inventory"
+mv "$TMP/review-policy.default.yml" "$TMP/review-policy.yml"
+
+reset_fixtures
+cat >"$TMP/fixtures/reviews.json" <<'JSON'
+[
+  {
+    "id": 902,
+    "commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "submitted_at": "2026-08-18T23:00:00Z",
+    "state": "COMMENTED",
+    "user": {"login": "chatgpt-codex-connector[bot]"},
+    "body": "### Codex Review\n\nNo findings in this review."
+  }
+]
+JSON
+run_gate
+assert_eq 0 "$RUN_RC" "markerless COMMENTED review is not invented into a finding"
+jq '.[0].body = "### Codex Review\n\n```text\n**P1** Preserve the exact registered-reviewer body contract\n```"' \
+  "$TMP/fixtures/reviews.json" >"$TMP/fixtures/reviews.next"
+mv "$TMP/fixtures/reviews.next" "$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "CodeRabbit-only sanitization does not suppress a Codex marker"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "Codex top-level body uses the unsanitized canonical ladder"
+
+reset_fixtures
+GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7/reviews"
+run_gate
+assert_eq 2 "$RUN_RC" "API read failure is an infrastructure error"
+assert_match 'failed to fetch review objects' "$RUN_ERR" "API failure names the unread surface"
+unset GH_FAIL_ENDPOINT
+
+reset_fixtures
+run_gate
+
+for endpoint in \
+  repos/acme/widget/pulls/7/comments \
+  repos/acme/widget/pulls/7/reviews \
+  repos/acme/widget/issues/7/comments; do
+  if grep -F -- "--paginate $endpoint" "$TMP/gh-calls.log" >/dev/null; then
+    pass "$endpoint read is paginated"
+  else
+    fail "$endpoint read is paginated"
+  fi
+done
+
+reset_fixtures
+FINGERPRINT_ONE=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+
+# An unreadable surface must reach the caller as BOTH a status and a
+# diagnostic. The parent-side handler removed in #1089 delivered neither:
+# GH_API_ARRAY_ERROR is set inside the command-substitution SUBSHELL, so by
+# the time the parent referenced it the variable was unset, and under `set -u`
+# the handler itself died on the unbound variable -- exiting 1 rather than the
+# 2 it was written to return. Assert the MESSAGE and not only the code: a
+# code-only assertion is satisfied by any nonzero exit, which the broken form
+# already produced, and that gap is what let this survive since #1018.
+set +e
+FINGERPRINT_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  GH_FAIL_ENDPOINT="repos/acme/widget/pulls/7/reviews" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_RC" "feedback-surface fingerprint preserves API failure status"
+assert_match 'failed to fetch review objects' "$FINGERPRINT_ERROR" \
+  "feedback-surface fingerprint preserves API failure detail"
+
+# #1088: the fetch case above is one of THREE gh_api_array failure kinds
+# (fetch, flatten, shape — scripts/lib/gh-api-array.sh). A fix scoped to only
+# the fetch path would leave the other two free to regress back into the
+# unbound-variable trace #1089 removed.
+reset_fixtures
+printf 'not valid json\n' >"$TMP/fixtures/reviews.json"
+set +e
+FINGERPRINT_FLATTEN_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_FLATTEN_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_FLATTEN_RC" "feedback-surface fingerprint preserves flatten failure status"
+assert_match 'failed to flatten review objects pagination output' "$FINGERPRINT_FLATTEN_ERROR" \
+  "feedback-surface fingerprint preserves flatten failure detail"
+
+reset_fixtures
+printf '{"message":"Bad credentials"}\n' >"$TMP/fixtures/reviews.json"
+set +e
+FINGERPRINT_SHAPE_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_SHAPE_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_SHAPE_RC" "feedback-surface fingerprint preserves shape failure status"
+assert_match 'came back as .*not a stream of JSON arrays' "$FINGERPRINT_SHAPE_ERROR" \
+  "feedback-surface fingerprint preserves shape failure detail"
+
+reset_fixtures
+jq '. + [{
+  "id": 9900,
+  "created_at": "2026-08-18T23:10:00Z",
+  "updated_at": "2026-08-18T23:10:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": "A new disposition changes the feedback generation."
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+FINGERPRINT_TWO=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+if [ -n "$FINGERPRINT_ONE" ] && [ "$FINGERPRINT_ONE" != "$FINGERPRINT_TWO" ]; then
+  pass "feedback-surface fingerprint changes with PR-level disposition state"
+else
+  fail "feedback-surface fingerprint changes with PR-level disposition state"
+fi
+
+# #1113 item 2: a code-scanning alert's severity is a FOURTH mutable input
+# this fingerprint must cover. Before this, two evaluations straddling a
+# same-window severity retriage (or a newly-resolvable alert) would hash
+# identically even though accounting's own tier for that finding changed
+# underneath them -- a race the fingerprint exists specifically to catch.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 60,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/e.js",
+    "line": 1,
+    "body": "## CodeQL / Rule\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/60)"
+  }
+]
+JSON
+cat >"$TMP/fixtures/code-scanning-alert-60.json" <<'JSON'
+{"number": 60, "rule": {"security_severity_level": "medium"}}
+JSON
+FINGERPRINT_GHAS_BEFORE=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+
+cat >"$TMP/fixtures/code-scanning-alert-60.json" <<'JSON'
+{"number": 60, "rule": {"security_severity_level": "critical"}}
+JSON
+FINGERPRINT_GHAS_AFTER=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+if [ -n "$FINGERPRINT_GHAS_BEFORE" ] && [ "$FINGERPRINT_GHAS_BEFORE" != "$FINGERPRINT_GHAS_AFTER" ]; then
+  pass "feedback-surface fingerprint changes when a referenced alert's severity changes (#1113)"
+else
+  fail "feedback-surface fingerprint changes when a referenced alert's severity changes (#1113)"
+fi
+
+FINGERPRINT_GHAS_REPEAT=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget)
+assert_eq "$FINGERPRINT_GHAS_AFTER" "$FINGERPRINT_GHAS_REPEAT" \
+  "feedback-surface fingerprint is stable when nothing (including alert severity) changed"
+
+# An unresolvable code-scanning alert must fail the fingerprint just as
+# loudly as the live accounting gate -- a silently stale fingerprint would
+# defeat the whole point of a before/after consistency check.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 61,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/f.js",
+    "line": 1,
+    "body": "## CodeQL / Rule\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/61)"
+  }
+]
+JSON
+set +e
+FINGERPRINT_GHAS_ERROR=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget 2>&1 >/dev/null)
+FINGERPRINT_GHAS_RC=$?
+set -e
+assert_eq 2 "$FINGERPRINT_GHAS_RC" "feedback-surface fingerprint fails closed on an unreadable code-scanning alert (#1113)"
+assert_match 'could not read code-scanning alert' "$FINGERPRINT_GHAS_ERROR" \
+  "feedback-surface fingerprint names the unreadable alert"
+
+# Codex review, PR #1124: a NON-GHAS comment happening to contain a
+# `/security/code-scanning/<number>` link (e.g. a human or Codex quoting a
+# link into a different repository) must not be treated as this repo's
+# own alert -- accounting itself never resolves severity for a comment
+# outside github-advanced-security[bot]'s own login, so the fingerprint
+# scanning it too would hard-fail the required check on a lookup nothing
+# else in this codebase performs. No fixture is created for alert #62
+# deliberately: if the scan incorrectly included this comment, the
+# missing fixture would 404 and the assertion below would catch it.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 63,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "src/g.js",
+    "line": 1,
+    "body": "See https://github.com/other-org/other-repo/security/code-scanning/62 for a similar issue in that repo."
+  }
+]
+JSON
+FINGERPRINT_UNRELATED_LINK_RC=0
+FINGERPRINT_UNRELATED_LINK=$(env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token \
+  GH_FIXTURE_DIR="$TMP/fixtures" GH_CALL_LOG="$TMP/gh-calls.log" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget) || FINGERPRINT_UNRELATED_LINK_RC=$?
+assert_eq 0 "$FINGERPRINT_UNRELATED_LINK_RC" \
+  "a non-GHAS comment's unrelated alert-shaped link does not fail the fingerprint (#1124)"
+if [ -n "$FINGERPRINT_UNRELATED_LINK" ]; then
+  pass "fingerprint still produces a real hash despite the unrelated link"
+else
+  fail "fingerprint still produces a real hash despite the unrelated link"
+fi
+if grep -F 'repos/acme/widget/code-scanning/alerts/62' "$TMP/gh-calls.log" >/dev/null; then
+  fail "a non-GHAS comment's alert-shaped link is not looked up (#1124)"
+else
+  pass "a non-GHAS comment's alert-shaped link is not looked up (#1124)"
+fi
+
+# Codex P2, PR #1124: after a bot_login override the fingerprint must scan ONLY
+# the configured identity -- the one accounting inventories -- not a union with
+# the default. Unioning leaves an old default-authored comment scanned HERE and
+# nowhere else, and a single unreadable alert of its holds this required gate
+# red over input accounting ignores entirely. Flow style is deliberate: the
+# line-oriented reader could not see it at all, so this pins both findings at
+# once. Alert 900 has NO fixture, so if the default login is still scanned the
+# stub 404s and the run fails closed -- the assertion cannot pass vacuously.
+reset_fixtures
+CFG_OVERRIDE="$TMP/policy-override.yml"
+cat >"$CFG_OVERRIDE" <<'YAML'
+code_scanning: {bot_login: "custom-ghas[bot]"}
+YAML
+write_override_fixtures() {
+  jq -n '[
+    {"id":9001,"created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z",
+     "user":{"login":"github-advanced-security[bot]"},"path":"a.js","line":1,
+     "body":"## CodeQL\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/900)"},
+    {"id":9002,"created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z",
+     "user":{"login":"custom-ghas[bot]"},"path":"b.js","line":1,
+     "body":"## CodeQL\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/901)"}
+  ]' >"$TMP/fixtures/inline.json"
+  cat >"$TMP/fixtures/code-scanning-alert-901.json" <<'JSON'
+{"number":901,"rule":{"security_severity_level":"high"}}
+JSON
+}
+write_override_fixtures
+: >"$TMP/gh-calls.log"
+set +e
+env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_FIXTURE_DIR="$TMP/fixtures" \
+  GH_CALL_LOG="$TMP/gh-calls.log" CONFIG="$CFG_OVERRIDE" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget >/dev/null 2>&1
+OVERRIDE_RC=$?
+set -e
+assert_eq 0 "$OVERRIDE_RC" "an overridden GHAS login substitutes for the default (flow style parsed; Codex P2, #1124)"
+if grep -F 'code-scanning/alerts/900' "$TMP/gh-calls.log" >/dev/null; then
+  fail "the default GHAS login is no longer scanned once bot_login is overridden (#1124)"
+else
+  pass "the default GHAS login is no longer scanned once bot_login is overridden (#1124)"
+fi
+if grep -F 'code-scanning/alerts/901' "$TMP/gh-calls.log" >/dev/null; then
+  pass "the configured GHAS login IS scanned (#1124)"
+else
+  fail "the configured GHAS login IS scanned (#1124)"
+fi
+
+# The guard that makes the narrowing safe: an UNREADABLE policy is "unknown",
+# not "unset". The scan must WIDEN back to the union rather than narrow on a
+# read that never happened -- so the default-authored comment is scanned again,
+# and its missing alert fixture makes the fingerprint fail closed.
+write_override_fixtures
+: >"$TMP/gh-calls.log"
+set +e
+env PATH="$TMP/bin:$PATH" GH_TOKEN=test-token GH_FIXTURE_DIR="$TMP/fixtures" \
+  GH_CALL_LOG="$TMP/gh-calls.log" CONFIG="$TMP/no-such-policy.yml" \
+  "$SURFACE_FINGERPRINT" 7 acme/widget >/dev/null 2>&1
+UNKNOWN_RC=$?
+set -e
+if grep -F 'code-scanning/alerts/900' "$TMP/gh-calls.log" >/dev/null; then
+  pass "an unreadable policy widens back to the union instead of narrowing (#1124)"
+else
+  fail "an unreadable policy widens back to the union instead of narrowing (#1124)"
+fi
+assert_eq 2 "$UNKNOWN_RC" "and the widened scan still fails closed on its unreadable alert"
+
+for caller in \
+  scripts/codex-review-request.sh \
+  scripts/phase-4b-review.sh \
+  scripts/post-phase-4b-handoff.sh \
+  scripts/codex-p1-gate.sh; do
+  if grep -F 'MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD' "$ROOT/$caller" >/dev/null; then
+    pass "$caller invokes the accounting gate"
+  else
+    fail "$caller invokes the accounting gate"
+  fi
+done
+
+if grep -Eq -- '--argjson (findings|missing)([[:space:]\\]|$)' "$SCRIPT"; then
+  fail "final result must stream finding arrays instead of passing them through argv"
+else
+  pass "final result streams finding arrays instead of passing them through argv"
+fi
+if grep -F -- "--argjson c \"\$comment\"" "$SCRIPT" >/dev/null; then
+  fail "inline finding inventory must stream each comment instead of passing it through argv"
+else
+  pass "inline finding inventory streams each comment instead of passing it through argv"
+fi
+if grep -Eq -- '--argjson (inline|reviews|issues)([[:space:]\\]|$)' "$SURFACE_FINGERPRINT"; then
+  fail "surface fingerprint must stream complete histories instead of passing them through argv"
+else
+  pass "surface fingerprint streams complete histories instead of passing them through argv"
+fi
+
+# GHAS severity must stay resolved by alert NUMBER (code-scanning/alerts/N),
+# never by a ref-scoped list -- that shape (?ref=refs/pull/{pr}/head) is
+# exactly the #1101 mechanism that couldn't see a finding raised on a
+# superseded head (#1113 item 3). A regression back to it would reopen
+# that gap silently, since every unit test above exercises the CURRENT
+# head only and would not itself catch the reintroduction.
+if grep -F 'ref=refs/pull' "$SCRIPT" >/dev/null; then
+  fail "GHAS severity resolution must not reintroduce ref-scoped list fetching (#1113)"
+else
+  pass "GHAS severity resolution stays alert-number-scoped, not ref-scoped (#1113)"
+fi
+
+# CodeRabbit, PR #1124: ghas_severity_cache_cleanup must never itself decide
+# the caller's exit status. Under `set -e`, a command inside an EXIT trap
+# that returns non-zero aborts the rest of that trap AND overrides the
+# script's real exit code with its own -- so an empty/unset
+# GHAS_SEVERITY_CACHE (the state right after a failed
+# ghas_severity_cache_init) must not make cleanup fail.
+CLEANUP_RC=0
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE=""
+  trap "ghas_severity_cache_cleanup" EXIT
+  exit 0
+' || CLEANUP_RC=$?
+assert_eq 0 "$CLEANUP_RC" "ghas_severity_cache_cleanup with an empty cache var does not override the caller's exit status (#1124)"
+
+CLEANUP_TMP_RC=0
+CLEANUP_TMP_FILE="$TMP/ghas-cleanup-check"
+: >"$CLEANUP_TMP_FILE"
+: >"$CLEANUP_TMP_FILE.tmp"
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$CLEANUP_TMP_FILE"'"
+  ghas_severity_cache_cleanup
+' || CLEANUP_TMP_RC=$?
+assert_eq 0 "$CLEANUP_TMP_RC" "ghas_severity_cache_cleanup with a set cache var succeeds"
+
+# Codex P2, PR #1124: the cache holds repository names, alert numbers and
+# security severities, so an update must never widen its mode. The old write
+# path opened a predictable `$CACHE.tmp` by redirection -- 0644 under the usual
+# 022 umask -- and renamed it over the 0600 mktemp cache.
+CACHE_MODE_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  umask 022
+  ghas_severity_cache_init
+  ghas_alert_severity acme/widget 50 >/dev/null
+  ls -l "$GHAS_SEVERITY_CACHE" | cut -c1-10
+  rm -f "$GHAS_SEVERITY_CACHE"
+' 2>/dev/null || true)
+assert_eq "-rw-------" "$CACHE_MODE_OUT" "severity cache stays 0600 after an update under a 022 umask (Codex P2, #1124)"
+
+# The false-positive guard for that fix: the update must still actually land,
+# not merely be mode-correct because it never happened.
+CACHE_VALUE_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  ghas_severity_cache_init
+  ghas_alert_severity acme/widget 50 >/dev/null
+  jq -r ".[\"acme/widget#50\"] // \"MISSING\"" "$GHAS_SEVERITY_CACHE"
+  rm -f "$GHAS_SEVERITY_CACHE"
+' 2>/dev/null || true)
+assert_eq "high" "$CACHE_VALUE_OUT" "the memoized severity is actually written to the cache (#1124)"
+
+# CodeRabbit, PR #1124 round 5: the write-failure branch's own `rm -f` must not
+# decide the caller's status either. Under `set -e` in a sourced caller a
+# genuinely failing rm (-f only silences "already gone") would abort
+# ghas_alert_severity before the WARN and before it prints $value, turning a
+# cache-write hiccup into a severity-read failure. mv and rm are stubbed to
+# fail so the write-failure branch is genuinely entered AND its cleanup fails --
+# a read-only directory would instead fail mktemp and never reach this branch.
+RM_FATAL_RC=0
+RM_FATAL_OUT=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  gh_api_scalar() { printf "high"; }
+  ghas_severity_cache_init
+  mv() { return 1; }
+  rm() { return 1; }
+  ghas_alert_severity acme/widget 50
+' 2>/dev/null) || RM_FATAL_RC=$?
+assert_eq 0 "$RM_FATAL_RC" "a failing cleanup rm in the write-failure branch does not fail the read (CodeRabbit, #1124 round 5)"
+assert_eq "high" "$RM_FATAL_OUT" "the correctly-resolved severity is still returned when the cache update cannot be committed"
+
+# And cleanup must still sweep a randomized update file a killed process left.
+CACHE_SWEEP_FILE="$TMP/ghas-sweep-cache"
+: >"$CACHE_SWEEP_FILE"
+: >"$CACHE_SWEEP_FILE.update.ABC123"
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$CACHE_SWEEP_FILE"'"
+  ghas_severity_cache_cleanup
+' || true
+if [ -f "$CACHE_SWEEP_FILE.update.ABC123" ]; then
+  fail "ghas_severity_cache_cleanup sweeps a leftover randomized .update file (Codex P2, #1124)"
+else
+  pass "ghas_severity_cache_cleanup sweeps a leftover randomized .update file (Codex P2, #1124)"
+fi
+
+# Codex P1, PR #1124: codex-p1-gate.yml must not extract an alert number or
+# perform the privileged security-events read from a commenter-controlled body
+# before confirming the source is a configured-GHAS INLINE comment. Asserted
+# structurally, because the vulnerable ordering is the bug: extraction textually
+# preceding the author guard is exactly what let a non-GHAS commenter plant a
+# guessed alert URL and have Actions resolve it.
+P1_GATE_WF="$ROOT/.github/workflows/codex-p1-gate.yml"
+GUARD_LINE=$(grep -n 'if \[ "\$source_kind" = "inline" \] && printf.*\$source_providers.*index("ghas")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+EXTRACT_LINE=$(grep -n 'alert_number=\$(ghas_alert_number_from_body' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+LOOKUP_LINE=$(grep -n 'ghas_severity=\$(ghas_alert_severity "\$REPO" "\$alert_number")' "$P1_GATE_WF" | head -n1 | cut -d: -f1)
+if [ -n "$GUARD_LINE" ] && [ -n "$EXTRACT_LINE" ] && [ -n "$LOOKUP_LINE" ] \
+   && [ "$GUARD_LINE" -lt "$EXTRACT_LINE" ] && [ "$GUARD_LINE" -lt "$LOOKUP_LINE" ]; then
+  pass "codex-p1-gate.yml gates alert extraction and the privileged read on a GHAS inline source (Codex P1, #1124)"
+else
+  fail "codex-p1-gate.yml gates alert extraction and the privileged read on a GHAS inline source (Codex P1, #1124) — guard=$GUARD_LINE extract=$EXTRACT_LINE lookup=$LOOKUP_LINE"
+fi
+if [ -f "$CLEANUP_TMP_FILE" ] || [ -f "$CLEANUP_TMP_FILE.tmp" ]; then
+  fail "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
+else
+  pass "ghas_severity_cache_cleanup removes both the cache file and its .tmp sibling (#1124)"
+fi
+
+# CodeRabbit round 2, PR #1124: a genuinely FAILING `rm -f` (not just an
+# empty cache var) inside the EXIT trap must also not override the
+# caller's exit status -- the same class of bug one line down from the
+# one just fixed above. Shadows `rm` to fail unconditionally, matching
+# CodeRabbit's own PoC.
+CLEANUP_RM_FAIL_RC=0
+bash -c '
+  set -euo pipefail
+  rm() { return 1; }
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$TMP"'/ghas-cleanup-rm-fail"
+  : >"$GHAS_SEVERITY_CACHE"
+  trap "ghas_severity_cache_cleanup" EXIT
+  exit 0
+' || CLEANUP_RM_FAIL_RC=$?
+assert_eq 0 "$CLEANUP_RM_FAIL_RC" "ghas_severity_cache_cleanup survives a genuinely failing rm without overriding the caller's exit status (#1124 round 2)"
+
+# CodeRabbit round 2, PR #1124: this library is sourced by scripts that run
+# under `set -u`. Calling ghas_alert_severity with too few arguments must
+# hit the documented rc=3 usage error, not an unbound-variable abort from
+# `local repo="$1"` evaluating a $1 that was never passed.
+ARGCOUNT_RC=0
+ARGCOUNT_ERR=$(bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  ghas_alert_severity
+' 2>&1) || ARGCOUNT_RC=$?
+assert_eq 3 "$ARGCOUNT_RC" "ghas_alert_severity with zero arguments returns rc=3, not an unbound-variable abort (#1124 round 2)"
+assert_match 'usage: ghas_alert_severity' "$ARGCOUNT_ERR" "missing-argument error names correct usage"
+
+ARGCOUNT_ONE_RC=0
+bash -c '
+  set -euo pipefail
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  ghas_alert_severity acme/widget
+' >/dev/null 2>&1 || ARGCOUNT_ONE_RC=$?
+assert_eq 3 "$ARGCOUNT_ONE_RC" "ghas_alert_severity with only one argument returns rc=3, not an unbound-variable abort (#1124 round 2)"
+
+# CodeRabbit round 2, PR #1124: a failed cache COMMIT (jq or mv failing) must
+# not be folded into the "could not read" rc=3 contract -- the read already
+# succeeded and the correct value must still be returned. `mv` is shadowed
+# to fail deterministically rather than relying on chmod-based permission
+# enforcement (Codex review round 2, PR #1124: running this suite as root,
+# as many containerized dev/CI environments do, lets root write through a
+# 0500 directory, so the intended failure never occurred and this
+# assertion flaked green-when-it-should-fail).
+COMMIT_FAIL_DIR="$TMP/ghas-commit-fail-dir"
+mkdir -p "$COMMIT_FAIL_DIR"
+printf '{}' >"$COMMIT_FAIL_DIR/cache"
+COMMIT_FAIL_RC=0
+COMMIT_FAIL_OUT=$(bash -c '
+  set -euo pipefail
+  mv() { return 1; }
+  . "'"$ROOT"'/scripts/lib/gh-api-scalar.sh"
+  gh_api_scalar() { printf "high"; }
+  . "'"$ROOT"'/scripts/lib/ghas-alert-severity.sh"
+  GHAS_SEVERITY_CACHE="'"$COMMIT_FAIL_DIR"'/cache"
+  ghas_alert_severity acme/widget 99
+' 2>"$TMP/commit-fail-stderr.txt") || COMMIT_FAIL_RC=$?
+assert_eq 0 "$COMMIT_FAIL_RC" "a failed cache commit does not fail the read (#1124 round 2)"
+assert_eq high "$COMMIT_FAIL_OUT" "a failed cache commit still returns the correctly-resolved severity"
+assert_match 'WARN.*could not write severity cache' "$(cat "$TMP/commit-fail-stderr.txt")" "a failed cache commit is not silent"
+
+# --- github-advanced-security / code scanning (#1101) ----------------------
+#
+# Before #1101, a github-advanced-security[bot] inline comment (the form
+# GitHub's CodeQL code scanning posts) was invisible to this script — not
+# even counted in `posted` — so a real finding could ride through repeated
+# "fully accounted" rounds unread (observed on nathanpaynedotcom#809).
+
+# Severity is resolved BY ALERT NUMBER (a direct
+# code-scanning/alerts/{number} GET), not by a ref-scoped list (#1113) --
+# see scripts/lib/ghas-alert-severity.sh for why. A missing fixture file
+# for a referenced number is therefore a genuine 404 in this harness, same
+# as a real unreadable alert.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "tests/verify-brevity.test.js",
+    "line": 185,
+    "body": "## CodeQL / Replacement of a substring with itself\n\nThis replaces 'title: \"Signed\"' with itself.\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/25)"
+  }
+]
+JSON
+
+# A FAILED alert read (no fixture -> 404) is a hard infrastructure
+# failure, not a silent p2 downgrade -- unlike "no severity data", it
+# must not look like a confident low-severity verdict. This is the
+# #1113 redesign's deliberate asymmetry: a systemic security-events
+# permission gap (Codex's #1106 finding) must surface loudly here too.
+run_gate
+assert_eq 2 "$RUN_RC" "a failed alert read is an infrastructure error, not a p2 downgrade (#1113)"
+
+if grep -F 'repos/acme/widget/code-scanning/alerts/25' "$TMP/gh-calls.log" >/dev/null; then
+  pass "a CodeQL comment on the PR triggers the code-scanning alert-by-number lookup"
+else
+  fail "a CodeQL comment on the PR triggers the code-scanning alert-by-number lookup"
+fi
+
+# Alert successfully read, but its rule carries no security_severity_level
+# (a non-security CodeQL quality query) -- THIS is the legitimate p2
+# fallback, distinct from a failed read above.
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {}}
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "undispositioned CodeQL finding blocks (#1101)"
+assert_eq unaccounted "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "CodeQL miss emits unaccounted status"
+assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "CodeQL finding contributes to posted count"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "CodeQL finding is inventoried under its bot login"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "alert with no assigned severity falls back to p2, not dropped"
+
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "medium"}}
+JSON
+run_gate
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "medium security_severity_level maps to p2"
+
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "critical"}}
+JSON
+run_gate
+assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "critical security_severity_level maps to p0"
+
+cat >"$TMP/fixtures/code-scanning-alert-25.json" <<'JSON'
+{"number": 25, "rule": {"security_severity_level": "high"}}
+JSON
+cat >"$TMP/fixtures/inline-with-reply.json" <<'JSON'
+[
+  {
+    "id": 20,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "tests/verify-brevity.test.js",
+    "line": 185,
+    "body": "## CodeQL / Replacement of a substring with itself\n\nThis replaces 'title: \"Signed\"' with itself.\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/25)"
+  },
+  {
+    "id": 21,
+    "in_reply_to_id": 20,
+    "created_at": "2026-08-26T21:00:00Z",
+    "user": {"login": "nathanpayne-codex"},
+    "path": "tests/verify-brevity.test.js",
+    "line": 185,
+    "body": "Confirmed and fixed the self-replace in commit abc1234."
+  }
+]
+JSON
+cp "$TMP/fixtures/inline-with-reply.json" "$TMP/fixtures/inline.json"
+run_gate
+assert_eq 0 "$RUN_RC" "agent reply after a CodeQL finding accounts for it"
+assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "disposed CodeQL finding clears the gate"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].tier')" "high security_severity_level maps to p1"
+assert_eq thread-reply "$(printf '%s' "$RUN_JSON" | jq -r '.findings[0].evidence')" "CodeQL reply evidence is visible"
+
+# feedback_policy tiers apply uniformly across reviewers: a repo that
+# marks p2 `ignore` must drop a no-severity CodeQL finding from inventory
+# exactly as it would a CodeRabbit or Codex one.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 22,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/a.js",
+    "line": 1,
+    "body": "## CodeQL / Some quality rule\n\nNo severity assigned.\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/99)"
+  }
+]
+JSON
+cat >"$TMP/fixtures/code-scanning-alert-99.json" <<'JSON'
+{"number": 99, "rule": {}}
+JSON
+cp "$TMP/review-policy.yml" "$TMP/review-policy.ignore-p2.yml"
+cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p2: ignore
+YAML
+run_gate
+assert_eq 0 "$RUN_RC" "feedback_policy p2:ignore excludes a no-severity CodeQL finding"
+assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq -r '.posted')" "ignored CodeQL tier contributes nothing to posted count"
+mv "$TMP/review-policy.ignore-p2.yml" "$TMP/review-policy.yml"
+
+# The alerts lookup is lazy: a PR with no CodeQL comment must never call
+# code-scanning/alerts, so a repo without code scanning enabled (the
+# common fleet case) never pays the extra API round-trip or risks a
+# permissions failure on an endpoint it has no reason to use.
+reset_fixtures
+run_gate
+if grep -F 'repos/acme/widget/code-scanning/alerts' "$TMP/gh-calls.log" >/dev/null; then
+  fail "code-scanning/alerts must not be fetched when no CodeQL comment is present"
+else
+  pass "code-scanning/alerts is not fetched when no CodeQL comment is present"
+fi
+
+# A CodeQL comment body with no parseable alert-number link at all (not
+# just a link to an alert absent from the fetched set) must fall back to
+# p2 rather than aborting the gate under `set -euo pipefail` — the grep
+# pipeline that extracts the alert number legitimately produces no match.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 23,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/b.js",
+    "line": 1,
+    "body": "## CodeQL / Some rule\n\nNo alert link in this body at all."
+  }
+]
+JSON
+run_gate
+assert_eq 1 "$RUN_RC" "CodeQL comment with no alert link still blocks (does not abort)"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "no parseable alert link falls back to p2"
+
+# --- GHAS archive coverage (#1113 item 1) -----------------------------------
+#
+# Before #1113, render-feedback-archive.sh recognized only Codex/CodeRabbit
+# body-text markers, so an edited/deleted github-advanced-security[bot]
+# inline comment left NO history record at all -- the finding vanished from
+# accounting exactly like the pre-#1101 defect this whole mechanism exists
+# to close, just for GHAS instead of Codex/CodeRabbit. The calling workflow
+# (codex-p1-gate.yml) now resolves the alert's severity BEFORE the comment
+# disappears and hands it to render-feedback-archive.sh as an explicit
+# GHAS_TIER argument, which validate_archive_payload accepts as the
+# optional `ghas_tiers` array.
+reset_fixtures
+PREVIOUS_GHAS="$TMP/previous-ghas.txt"
+cat >"$PREVIOUS_GHAS" <<'EOF'
+## CodeQL / Hardcoded credential
+
+This stores a credential directly in source.
+
+[Show more details](https://github.com/acme/widget/security/code-scanning/50)
+EOF
+GHAS_ARCHIVE=$("$RENDER_ARCHIVE" inline 8600 'github-advanced-security[bot]' \
+  '2026-08-26T22:00:00Z' "$PREVIOUS_GHAS" p1)
+jq -n --arg archive "$GHAS_ARCHIVE" '[{
+  "id": 8601,
+  "created_at": "2026-08-26T22:00:01Z",
+  "updated_at": "2026-08-26T22:00:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "deleted GHAS inline finding remains in the accounting inventory (#1113)"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "archived GHAS finding retains inline source kind"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "archived GHAS finding is inventoried under its bot login"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "archived GHAS finding preserves the workflow-resolved tier"
+GHAS_ARCHIVE_ACK=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+assert_match '^\[mergepath-inline-ack: 8600 [0-9a-f]{12}\]$' "$GHAS_ARCHIVE_ACK" "archived GHAS finding gets a content-pinned acknowledgement path"
+
+jq --arg token "$GHAS_ARCHIVE_ACK" '. + [{
+  "id": 8602,
+  "created_at": "2026-08-26T22:05:00Z",
+  "updated_at": "2026-08-26T22:05:00Z",
+  "user": {"login": "nathanpayne-codex"},
+  "body": ($token + "\nRemoved the hardcoded credential in commit def5678.")
+}]' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "post-deletion acknowledgement reconciles the archived GHAS finding"
+assert_eq clear "$(printf '%s' "$RUN_JSON" | jq -r '.status')" "acknowledged archived GHAS finding clears the gate"
+
+# render-feedback-archive.sh itself stays a pure function of its
+# arguments: with NO GHAS_TIER passed at all (the pre-#1113 call shape,
+# or any future caller that genuinely has nothing to report), a body
+# with no other classifiable marker still emits no record -- the
+# "markerless edits have nothing to preserve" contract every other
+# reviewer already gets.
+#
+# codex-p1-gate.yml's archive job itself, however, does NOT leave
+# GHAS_TIER empty for this exact body+login combination (Codex review,
+# PR #1124): live accounting's ghas_finding_tier ALSO falls back to p2
+# when a GHAS-authored comment has no parseable alert link -- unlike a
+# Codex/CodeRabbit body with no marker at all, which was never a
+# "finding" even while live, a linkless GHAS comment IS still tracked as
+# p2 today. The workflow resolves this by checking source_login == the
+# well-known default GHAS bot login when alert_number extraction fails,
+# and passes p2 explicitly -- asserted below by exercising the render
+# script exactly as that workflow branch now calls it, not as a bare
+# no-argument invocation.
+reset_fixtures
+PREVIOUS_GHAS_NO_LINK="$TMP/previous-ghas-no-link.txt"
+cat >"$PREVIOUS_GHAS_NO_LINK" <<'EOF'
+## CodeQL / Some rule
+
+No alert link in this body at all.
+EOF
+GHAS_ARCHIVE_NO_LINK=$("$RENDER_ARCHIVE" inline 8610 'github-advanced-security[bot]' \
+  '2026-08-26T22:10:00Z' "$PREVIOUS_GHAS_NO_LINK")
+assert_eq "" "$GHAS_ARCHIVE_NO_LINK" "render-feedback-archive.sh with no GHAS_TIER argument emits no archive record for a linkless body (pure-function contract)"
+
+GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE=$("$RENDER_ARCHIVE" inline 8611 'github-advanced-security[bot]' \
+  '2026-08-26T22:11:00Z' "$PREVIOUS_GHAS_NO_LINK" p2)
+jq -n --arg archive "$GHAS_ARCHIVE_NO_LINK_WORKFLOW_SHAPE" '[{
+  "id": 8612,
+  "created_at": "2026-08-26T22:11:01Z",
+  "updated_at": "2026-08-26T22:11:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "codex-p1-gate.yml's GHAS-login p2 fallback preserves a linkless GHAS finding across archival (#1124)"
+assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the workflow-shaped archive record carries the p2 fallback tier"
+assert_eq github-advanced-security\[bot\] "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "the workflow-shaped archive record stays bound to the GHAS bot login"
+
+# Codex review, PR #1124: codex-p1-gate.yml archives a FAILED severity
+# read (network/rate-limit) at p1, not p2 -- distinct from the p2 branch
+# above, which is a successful read that simply found no assigned
+# severity. A repo with feedback_policy.priorities.p2: ignore would
+# otherwise have strongest_nonignored_archive_tier drop an originally
+# p0/p1 finding from inventory entirely just because its severity read
+# failed at the moment of archival, not because anyone reviewed it.
+reset_fixtures
+PREVIOUS_GHAS_READ_FAILED="$TMP/previous-ghas-read-failed.txt"
+cat >"$PREVIOUS_GHAS_READ_FAILED" <<'EOF'
+## CodeQL / Some rule
+
+[Show more details](https://github.com/acme/widget/security/code-scanning/70)
+EOF
+GHAS_ARCHIVE_READ_FAILED=$("$RENDER_ARCHIVE" inline 8620 'github-advanced-security[bot]' \
+  '2026-08-26T22:20:00Z' "$PREVIOUS_GHAS_READ_FAILED" p1)
+jq -n --arg archive "$GHAS_ARCHIVE_READ_FAILED" '[{
+  "id": 8621,
+  "created_at": "2026-08-26T22:20:01Z",
+  "updated_at": "2026-08-26T22:20:01Z",
+  "user": {"login": "github-actions[bot]"},
+  "body": $archive
+}]' >"$TMP/fixtures/issues.json"
+cp "$TMP/review-policy.yml" "$TMP/review-policy.ignore-p2-archive.yml"
+cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities:
+    p2: ignore
+YAML
+run_gate
+assert_eq 1 "$RUN_RC" "a failed archive-time severity read at p1 survives a p2:ignore policy (#1124)"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "the failed-read archive record carries p1, not p2"
+mv "$TMP/review-policy.ignore-p2-archive.yml" "$TMP/review-policy.yml"
+cp "$TMP/review-policy.yml" "$TMP/policy-before-unknown.yml"
+UNKNOWN_GHAS_ARCHIVE=$("$RENDER_ARCHIVE" inline 8622 'github-advanced-security[bot]' \
+  '2026-08-26T22:20:00Z' "$PREVIOUS_GHAS_READ_FAILED" unknown)
+for selected in p0 p1 p2 p3 none; do
+  cp "$TMP/policy-before-unknown.yml" "$TMP/review-policy.yml"
+  printf '\nfeedback_policy:\n  mode: by-priority\n  priorities:\n' >>"$TMP/review-policy.yml"
+  for priority in p0 p1 p2 p3; do
+    disposition=ignore; [ "$priority" != "$selected" ] || disposition=required
+    printf '    %s: %s\n' "$priority" "$disposition" >>"$TMP/review-policy.yml"
+  done
+  jq -n --arg body "$UNKNOWN_GHAS_ARCHIVE" '[{id:8623,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  if [ "$selected" = none ]; then
+    assert_eq 0 "$RUN_RC" "explicit all-GHAS-tiers-ignore policy excludes unknown severity"
+    assert_eq 0 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "all-ignore policy has no GHAS history obligation"
+    assert_eq "$UNKNOWN_GHAS_ARCHIVE" "$(jq -r '.[0].body' "$TMP/fixtures/issues.json")" "all-ignore inventory preserves the durable unresolved archive record"
+  else
+    assert_eq 1 "$RUN_RC" "unknown severity survives when only $selected is required"
+    assert_eq "$selected" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "unknown severity uses strongest permitted possibility $selected"
+  fi
+done
+mv "$TMP/policy-before-unknown.yml" "$TMP/review-policy.yml"
+
+# Two comments linking the SAME alert number must fetch it only ONCE
+# (scripts/lib/ghas-alert-severity.sh's GHAS_SEVERITY_CACHE) -- without
+# memoization a PR with several comments on one finding would re-read the
+# same alert per comment, needlessly spending the reviewer PAT's rate
+# limit budget.
+reset_fixtures
+cat >"$TMP/fixtures/inline.json" <<'JSON'
+[
+  {
+    "id": 30,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:49:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/c.js",
+    "line": 1,
+    "body": "## CodeQL / Rule one\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/40)"
+  },
+  {
+    "id": 31,
+    "in_reply_to_id": null,
+    "created_at": "2026-08-26T20:50:01Z",
+    "user": {"login": "github-advanced-security[bot]"},
+    "path": "src/d.js",
+    "line": 1,
+    "body": "## CodeQL / Rule one, again\n\n[Show more details](https://github.com/acme/widget/security/code-scanning/40)"
+  }
+]
+JSON
+cat >"$TMP/fixtures/code-scanning-alert-40.json" <<'JSON'
+{"number": 40, "rule": {"security_severity_level": "high"}}
+JSON
+run_gate
+CALLS=$(grep -cF 'repos/acme/widget/code-scanning/alerts/40' "$TMP/gh-calls.log" || true)
+assert_eq 1 "$CALLS" "same alert number referenced by two comments is fetched only once (memoized)"
+
+# Force only the shared CodeRabbit marker read to fail after partial output.
+# Other grep users and all fixture/API reads keep their normal behavior.
+REAL_GREP=$(command -v grep) || {
+  echo "missing grep required by feedback-accounting fixture" >&2
+  exit 1
+}
+case "$REAL_GREP" in
+  /*) ;;
+  *) echo "feedback-accounting fixture requires an absolute grep path" >&2; exit 1 ;;
+esac
+printf '#!/usr/bin/env bash\nREAL_GREP=%q\n' "$REAL_GREP" >"$TMP/bin/grep"
+cat >>"$TMP/bin/grep" <<'SH'
+if [ "${CODERABBIT_EXTRACT_FAIL:-0}" = 1 ] && [ "${1:-}" = -oE ]; then
+  case "${2:-}" in
+    '🟠 Major|'*)
+      printf 'called\n' >>"$CODERABBIT_EXTRACT_FAIL_LOG"
+      printf '🟠 Major\n'
+      exit 2
+      ;;
+  esac
+fi
+exec "$REAL_GREP" "$@"
+SH
+chmod +x "$TMP/bin/grep"
+export CODERABBIT_EXTRACT_FAIL_LOG="$TMP/extract-failure.log"
+for surface in inline issues reviews; do
+  reset_fixtures
+  jq -n '[{id:87801,user:{login:"coderabbitai[bot]"},body:"_🟠 Major_",
+    created_at:"2026-09-13T01:00:00Z",updated_at:"2026-09-13T01:00:00Z",
+    submitted_at:"2026-09-13T01:00:00Z",path:"src/a.js",line:1}]' \
+    >"$TMP/fixtures/$surface.json"
+  : >"$CODERABBIT_EXTRACT_FAIL_LOG"
+  export CODERABBIT_EXTRACT_FAIL=1
+  run_gate
+  assert_eq 2 "$RUN_RC" "$surface tier read failure is accounting infrastructure error"
+  assert_eq "" "$RUN_JSON" "$surface tier read failure emits no accounting verdict"
+  assert_eq called "$(cat "$CODERABBIT_EXTRACT_FAIL_LOG")" "$surface failure reached the actual marker extractor"
+  export CODERABBIT_EXTRACT_FAIL=0
+  run_gate
+  assert_eq 1 "$RUN_RC" "$surface control: readable Major remains an unaccounted finding"
+  expected_kind=inline
+  case "$surface" in
+    issues) expected_kind=issue-comment ;;
+    reviews) expected_kind=review-body ;;
+  esac
+  assert_eq "$expected_kind" "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$surface control identifies the intended feedback surface"
+  assert_eq 'coderabbitai[bot]' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].reviewer')" "$surface control preserves the readable Major author identity"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$surface control preserves the readable Major required tier"
+done
+
+printf '_🟠 Major_\n' >"$TMP/failed-archive-body.txt"
+: >"$CODERABBIT_EXTRACT_FAIL_LOG"
+ARCHIVE_RC=0
+ARCHIVE_OUT=$(PATH="$TMP/bin:$PATH" CODERABBIT_EXTRACT_FAIL=1 "$RENDER_ARCHIVE" \
+  issue-comment 87802 'coderabbitai[bot]' '2026-09-13T01:00:00Z' \
+  "$TMP/failed-archive-body.txt" 2>"$TMP/failed-archive.err") || ARCHIVE_RC=$?
+assert_eq 2 "$ARCHIVE_RC" "archive tier read failure is infrastructure error"
+assert_eq "" "$ARCHIVE_OUT" "archive tier read failure emits no successful empty record"
+assert_eq called "$(cat "$CODERABBIT_EXTRACT_FAIL_LOG")" "archive failure reached the actual marker extractor"
+ARCHIVE_OUT=$(PATH="$TMP/bin:$PATH" CODERABBIT_EXTRACT_FAIL=0 "$RENDER_ARCHIVE" \
+  issue-comment 87802 'coderabbitai[bot]' '2026-09-13T01:00:00Z' "$TMP/failed-archive-body.txt")
+assert_match '^<!-- mergepath-feedback-archive:v1 ' "$ARCHIVE_OUT" "archive control: readable Major produces its history record"
+ARCHIVE_PAYLOAD=$(printf '%s' "$ARCHIVE_OUT" | jq -Rr 'capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data|@base64d|fromjson')
+assert_eq 'coderabbitai[bot]' "$(printf '%s' "$ARCHIVE_PAYLOAD" | jq -r '.source_login')" "archive control preserves the readable Major author identity"
+assert_eq p1 "$(printf '%s' "$ARCHIVE_PAYLOAD" | jq -r '.coderabbit_tiers[0]')" "archive control preserves the readable Major required tier"
+unset CODERABBIT_EXTRACT_FAIL CODERABBIT_EXTRACT_FAIL_LOG
+rm "$TMP/bin/grep"
+
+# #1437: a delayed event after reviewer retirement still inventories the sole
+# old body, even with no live source object. Enrollment cannot acknowledge it.
+cp "$TMP/review-policy.yml" "$TMP/policy-before-retirement.yml"
+sed '/^  - nathanpayne-claude$/d; s/login: nathanpayne-claude, provider: reviewer, status: active/login: nathanpayne-claude, provider: reviewer, status: retired/' \
+  "$TMP/review-policy.yml" >"$TMP/retired-policy.yml"
+mv "$TMP/retired-policy.yml" "$TMP/review-policy.yml"
+reset_fixtures
+printf '**P1** Retired reviewer sole previous body.\n' >"$TMP/retired-body.txt"
+RETIRED_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9090 nathanpayne-claude \
+  '2026-10-11T01:00:00Z' "$TMP/retired-body.txt")
+jq -n --arg body "$RETIRED_ARCHIVE" '[{id:9091,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "a retired reviewer deleted-source archive stays unaccounted without live prior-body fallback"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "retired history uses the archive acknowledgement channel"
+# Delayed delivery can leave an equal live object after policy removal. Since
+# that live object is no longer inventoried, it cannot suppress the archive.
+jq -n --rawfile body "$TMP/retired-body.txt" '[{id:9090,user:{login:"nathanpayne-claude"},body:$body,created_at:"2026-10-11T00:00:00Z"}]' >"$TMP/fixtures/inline.json"
+run_gate
+assert_eq 1 "$RUN_RC" "an equal surviving retired source cannot suppress the only inventoried history"
+assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "equal retired live text leaves the archive obligation intact"
+printf '[]\n' >"$TMP/fixtures/inline.json"
+RETIRED_TOKEN=$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].ack_token')
+jq --arg token "$RETIRED_TOKEN" '. + [{id:9092,user:{login:"nathanpayne-claude"},created_at:"2026-10-11T01:01:00Z",body:($token+"\nI addressed this historical finding.")}]' \
+  "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "retained enrollment grants no current acknowledgement standing"
+jq '.[1].user.login="nathanpayne-codex"' "$TMP/fixtures/issues.json" >"$TMP/fixtures/issues.next"
+mv "$TMP/fixtures/issues.next" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 0 "$RUN_RC" "a current reviewer can account for the retained historical finding"
+# A valid, parsed Actions archive cannot silently disappear when its retained
+# entry is omitted. This differs from an ordinary never-enrolled live event.
+cp "$TMP/review-policy.yml" "$TMP/policy-with-retired-entry.yml"
+sed '/login: nathanpayne-claude, provider: reviewer, status: retired/d' "$TMP/review-policy.yml" >"$TMP/omitted-entry.yml"
+mv "$TMP/omitted-entry.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "omitting an already archived retired identity is an infrastructure failure"
+assert_eq "" "$RUN_JSON" "omitted archive enrollment emits no clean accounting verdict"
+assert_match 'feedback archive source lacks retained enrollment' "$RUN_ERR" "omitted history names the missing retained source"
+mv "$TMP/policy-with-retired-entry.yml" "$TMP/review-policy.yml"
+
+# Wrong active provider roles must fail configuration rather than select an
+# empty tier array and erase a Major. Correct retired roles survive bot rename.
+reset_fixtures
+printf '_🟠 Major_\nSole previous CodeRabbit body.\n' >"$TMP/role-body.txt"
+ROLE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9093 'coderabbitai[bot]' \
+  '2026-10-11T01:00:00Z' "$TMP/role-body.txt")
+jq -n --arg body "$ROLE_ARCHIVE" '[{id:9094,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+cp "$TMP/review-policy.yml" "$TMP/correct-active-policy.yml"
+sed 's/login: "coderabbitai\[bot\]", provider: coderabbit/login: "coderabbitai[bot]", provider: codex/' "$TMP/correct-active-policy.yml" >"$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "an active CodeRabbit login enrolled as Codex is a configuration failure"
+assert_eq "" "$RUN_JSON" "wrong active role emits no empty-success verdict"
+sed 's/bot_login: "coderabbitai\[bot\]"/bot_login: "new-coderabbit[bot]"/' "$TMP/correct-active-policy.yml" >"$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "a stale active provider absent from current policy fails configuration"
+sed 's/login: "coderabbitai\[bot\]", provider: coderabbit, status: active/login: "coderabbitai[bot]", provider: coderabbit, status: retired/' "$TMP/review-policy.yml" >"$TMP/retired-provider.yml"
+mv "$TMP/retired-provider.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 1 "$RUN_RC" "a correctly retired CodeRabbit identity preserves required history after bot rename"
+assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retired CodeRabbit history retains its specialized Major tier"
+# Reusing the old CodeRabbit login as current Codex cannot let the current
+# Codex parser (which does not inventory Major) suppress retired history.
+sed -e 's/bot_login: "chatgpt-codex-connector\[bot\]"/bot_login: "coderabbitai[bot]"/' \
+  -e 's/login: "chatgpt-codex-connector\[bot\]", provider: codex, status: active/login: "chatgpt-codex-connector[bot]", provider: codex, status: retired/' \
+  "$TMP/review-policy.yml" >"$TMP/reused-login-policy.yml"
+mv "$TMP/reused-login-policy.yml" "$TMP/review-policy.yml"
+for shape in equal ack-suffix; do
+  jq -n --rawfile body "$TMP/role-body.txt" --arg shape "$shape" '[{id:9093,user:{login:"coderabbitai[bot]"},created_at:"2026-10-10T01:00:00Z",updated_at:"2026-10-11T01:01:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc",body:($body + if $shape=="ack-suffix" then "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->" else "" end)}]' >"$TMP/fixtures/inline.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "$shape live source in another provider role cannot erase retired Major history"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$shape role reuse retains historical required CodeRabbit tier"
+  assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$shape role reuse retains the archived finding"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$shape role reuse has one historical finding despite the current parser omitting Major"
+done
+# A new Codex revision under the reused login retains its existing classifier
+# evidence, even though the one retained identity still names CodeRabbit.
+printf '**P1** New current Codex revision under a retained CodeRabbit login.\n' >"$TMP/reused-codex-body.txt"
+for kind in inline issue-comment review-body; do
+  for action in edited deleted; do
+    reset_fixtures
+    NEW_ROLE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" "$kind" 9095 'coderabbitai[bot]' \
+      '2026-10-11T02:00:00Z' "$TMP/reused-codex-body.txt")
+    jq -n --arg body "$NEW_ROLE_ARCHIVE" '[{id:9096,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+    if [ "$action" = edited ]; then
+      case "$kind" in inline) surface=inline ;; issue-comment) surface=issues ;; review-body) surface=reviews ;; esac
+      jq '. + [{id:9095,user:{login:"coderabbitai[bot]"},body:"current markerless rewrite",created_at:"2026-10-11T02:01:00Z",submitted_at:"2026-10-11T02:01:00Z"}]' \
+        "$TMP/fixtures/$surface.json" >"$TMP/rewritten-source.json"
+      mv "$TMP/rewritten-source.json" "$TMP/fixtures/$surface.json"
+    fi
+    run_gate
+    assert_eq 1 "$RUN_RC" "$action $kind new Codex body survives retained CodeRabbit role ambiguity"
+    assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "$action $kind ambiguity retains the new Codex P1 evidence"
+    assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$action $kind new revision creates exactly one history obligation"
+  done
+done
+# Delayed old CodeRabbit body remains visible alongside new Codex history.
+jq --arg body "$ROLE_ARCHIVE" '. + [{id:9097,user:{login:"github-actions[bot]"},body:$body}]' "$TMP/fixtures/issues.json" >"$TMP/both-roles.json"
+mv "$TMP/both-roles.json" "$TMP/fixtures/issues.json"
+run_gate
+assert_eq 1 "$RUN_RC" "delayed old and new provider revisions both remain unaccounted"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "role ambiguity preserves both distinct body histories"
+printf '**P1** Never enrolled author quotes a provider tier.\n' >"$TMP/never-enrolled-body.txt"
+assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9098 nathanjohnpayne \
+  '2026-10-11T02:00:00Z' "$TMP/never-enrolled-body.txt")" "current classifier evidence grants no archive enrollment to the author"
+# A subsequent provider move must not erase either previously captured role.
+sed 's/bot_login: "coderabbitai\[bot\]"/bot_login: "third-codex[bot]"/' "$TMP/review-policy.yml" >"$TMP/third-policy.yml"
+mv "$TMP/third-policy.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 1 "$RUN_RC" "third policy transition retains both old and new captured provider histories"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "third policy transition cannot drop the new Codex-only classifier evidence"
+
+# Explicit precision cost: an enrolled CodeRabbit source quoting a Codex tier
+# creates conservative archive evidence even though CodeRabbit's live parser
+# excludes the fenced example. Equal live text cannot erase that history.
+cp "$TMP/correct-active-policy.yml" "$TMP/review-policy.yml"
+reset_fixtures
+printf 'Example only:\n```text\n**P1** Quoted cross-provider marker.\n```\n' >"$TMP/quoted-provider-body"
+QUOTED_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9099 'coderabbitai[bot]' \
+  '2026-10-11T03:00:00Z' "$TMP/quoted-provider-body")
+jq -n --arg body "$QUOTED_ARCHIVE" '[{id:9109,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+for state in absent equal ack-suffix; do
+  if [ "$state" != absent ]; then
+    jq -n --rawfile body "$TMP/quoted-provider-body" --arg state "$state" '[{id:9099,user:{login:"coderabbitai[bot]"},body:($body + if $state=="ack-suffix" then "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->" else "" end)}]' >"$TMP/fixtures/inline.json"
+  fi
+  run_gate
+  assert_eq 1 "$RUN_RC" "$state cross-provider quoted marker retains its conservative archive obligation"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$state quoted marker adds exactly one archive disposition burden"
+  assert_eq inline-archive "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].kind')" "$state current parser omission cannot suppress conservative history"
+done
+# Same-kind GHAS/text role reuse consumes only existing captured arrays.
+cp "$TMP/correct-active-policy.yml" "$TMP/roles-baseline.yml"
+for provider in codex coderabbit; do
+  reset_fixtures
+  python3 - "$TMP/roles-baseline.yml" "$TMP/review-policy.yml" "$provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); p=sys.argv[3]
+old={'codex':'chatgpt-codex-connector[bot]','coderabbit':'coderabbitai[bot]'}[p]
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "new-ghas[bot]"')
+s=s.replace('login: "github-advanced-security[bot]", provider: ghas, status: active','login: "github-advanced-security[bot]", provider: ghas, status: retired')
+s=s.replace('bot_login: "'+old+'"','bot_login: "github-advanced-security[bot]"')
+s=s.replace('login: "'+old+'", provider: '+p+', status: active','login: "'+old+'", provider: '+p+', status: retired')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  if [ "$provider" = codex ]; then printf '**P1** New Codex body.\n' >"$TMP/ghas-reuse-body";
+  else printf '_🟠 Major_\nNew CodeRabbit body.\n' >"$TMP/ghas-reuse-body"; fi
+  GHAS_REUSE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9100 'github-advanced-security[bot]' \
+    '2026-10-11T03:00:00Z' "$TMP/ghas-reuse-body")
+  jq -n --arg body "$GHAS_REUSE_ARCHIVE" '[{id:9101,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "retained GHAS/current $provider inline history remains inventoried"
+  assert_eq p1 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retained GHAS/current $provider keeps existing text tier evidence"
+  assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" issue-comment 9100 'github-advanced-security[bot]' \
+    '2026-10-11T03:00:00Z' "$TMP/ghas-reuse-body")" "current $provider cannot expand retained GHAS source kinds"
+  # Reverse direction: source-kind admission remains the retired text role;
+  # current GHAS captures only its already-supported one-shot severity result.
+  python3 - "$TMP/roles-baseline.yml" "$TMP/review-policy.yml" "$provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); p=sys.argv[3]
+old={'codex':'chatgpt-codex-connector[bot]','coderabbit':'coderabbitai[bot]'}[p]
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "'+old+'"')
+s=s.replace('login: "github-advanced-security[bot]", provider: ghas, status: active','login: "github-advanced-security[bot]", provider: ghas, status: retired')
+s=s.replace('bot_login: "'+old+'"\n'+('codex:' if p=='coderabbit' else 'code_scanning:'),'bot_login: "new-'+p+'[bot]"\n'+('codex:' if p=='coderabbit' else 'code_scanning:'))
+s=s.replace('login: "'+old+'", provider: '+p+', status: active','login: "'+old+'", provider: '+p+', status: retired')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  source='chatgpt-codex-connector[bot]'; [ "$provider" != coderabbit ] || source='coderabbitai[bot]'
+  GHAS_REUSE_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9102 "$source" \
+    '2026-10-11T03:00:00Z' "$PREVIOUS_GHAS_READ_FAILED" unknown)
+  jq -n --arg body "$GHAS_REUSE_ARCHIVE" '[{id:9103,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "retained $provider/current GHAS inline unknown severity remains inventoried"
+  assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "retained $provider/current GHAS keeps strongest permitted severity possibility"
+  # Delivery after the current GHAS role moves again must still capture the
+  # disappearing link-only body, without inventing a past provider identity.
+  sed "s/bot_login: \"$source\"/bot_login: \"third-ghas[bot]\"/" "$TMP/review-policy.yml" >"$TMP/delayed-ghas-policy"
+  mv "$TMP/delayed-ghas-policy" "$TMP/review-policy.yml"
+  DELAYED_GHAS_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9104 "$source" \
+    '2026-10-11T04:00:00Z' "$PREVIOUS_GHAS_READ_FAILED")
+  jq -n --arg body "$DELAYED_GHAS_ARCHIVE" '[{id:9105,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "delayed $provider-to-GHAS-to-third-login inline capture retains unresolved history"
+  assert_eq p0 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "delayed $provider source captures conservative severity without a surviving GHAS role"
+  cat >>"$TMP/review-policy.yml" <<'YAML'
+feedback_policy:
+  mode: by-priority
+  priorities: {p0: ignore, p1: ignore, p2: required, p3: ignore}
+YAML
+  run_gate
+  assert_eq 1 "$RUN_RC" "delayed $provider GHAS capture survives p1-ignore/p2-required policy"
+  assert_eq p2 "$(printf '%s' "$RUN_JSON" | jq -r '.missing[0].tier')" "delayed $provider GHAS capture selects the permitted unresolved p2 possibility"
+done
+mv "$TMP/correct-active-policy.yml" "$TMP/review-policy.yml"
+
+# Missing registry is fatal when there is an archive, but unrelated live
+# feedback keeps its existing accounting semantics during seed migration.
+sed '/^feedback_archive:/,/^    - {login: nathanpayne-release/d' "$TMP/review-policy.yml" >"$TMP/missing-registry.yml"
+mv "$TMP/missing-registry.yml" "$TMP/review-policy.yml"
+run_gate
+assert_eq 2 "$RUN_RC" "an archived source with missing enrollment fails conservatively"
+reset_fixtures
+run_gate
+assert_eq 0 "$RUN_RC" "an unrelated empty live inventory needs no archive registry"
+mv "$TMP/policy-before-retirement.yml" "$TMP/review-policy.yml"
+
+# Current provider standing determines whether the actual live parser can
+# cover an identical archived revision; retained role only admits the source.
+cp "$TMP/review-policy.yml" "$TMP/dedup-policy-before.yml"
+for direction in coderabbit-to-codex codex-to-coderabbit; do
+  source='coderabbitai[bot]'; current_provider=codex
+  if [ "$direction" = codex-to-coderabbit ]; then source='chatgpt-codex-connector[bot]'; current_provider=coderabbit; fi
+  python3 - "$TMP/dedup-initial-policy.yml" "$TMP/dedup-role-policy.yml" "$source" "$current_provider" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read(); source,current=sys.argv[3:]
+s=s.replace('status: active','status: retired')
+s=s.replace('bot_login: "coderabbitai[bot]"','bot_login: "new-coderabbit[bot]"')
+s=s.replace('bot_login: "chatgpt-codex-connector[bot]"','bot_login: "new-codex[bot]"')
+s=s.replace('bot_login: "new-'+current+'[bot]"','bot_login: "'+source+'"')
+open(sys.argv[2],'w').write(s)
+PYTHON
+  for kind in inline issue-comment review-body; do
+    for standing in current retired weaker; do
+      reset_fixtures
+      cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+      printf '_🟠 Major_\n**P1** Returning identical role-reassigned finding.\n' >"$TMP/dedup-body"
+      if [ "$standing" = weaker ]; then
+        # The current CR parser sees Major/p1 while the captured Codex parser
+        # also saw p0; current Codex's first inline marker sees p1 before p0.
+        if [ "$current_provider" = coderabbit ]; then printf '_🟠 Major_\n**P0** Stronger captured possibility.\n' >"$TMP/dedup-body";
+        else printf '_🟠 Major_\n**P1** First live tier.\n**P0** Stronger captured possibility.\n' >"$TMP/dedup-body"; fi
+      fi
+      DEDUP_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" "$kind" 9201 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body")
+      jq -n --arg body "$DEDUP_ARCHIVE" '[{id:9202,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+      if [ "$standing" = retired ]; then
+        python3 - "$TMP/review-policy.yml" "$source" "$current_provider" <<'PYTHON'
+import sys
+p,source,current=sys.argv[1:]
+s=open(p).read().replace('bot_login: "'+source+'"','bot_login: "third-'+current+'[bot]"')
+open(p,'w').write(s)
+PYTHON
+      fi
+      case "$kind" in inline) surface=inline ;; issue-comment) surface=issues ;; review-body) surface=reviews ;; esac
+      jq --arg source "$source" --rawfile body "$TMP/dedup-body" '. + [{id:9201,user:{login:$source},body:$body,created_at:"2026-10-11T01:00:00Z",submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' \
+        "$TMP/fixtures/$surface.json" >"$TMP/dedup-live.json"
+      mv "$TMP/dedup-live.json" "$TMP/fixtures/$surface.json"
+      run_gate
+      assert_eq 1 "$RUN_RC" "$direction $kind $standing identical history remains a required obligation"
+      expected=1
+      # Compound top-level current Codex parsing covers its captured p0 too.
+      if [ "$standing" = weaker ] && { [ "$current_provider" = coderabbit ] || [ "$kind" = inline ]; }; then expected=2; fi
+      assert_eq "$expected" "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$direction $kind $standing collapses only a covered live obligation"
+      archives=$(printf '%s' "$RUN_JSON" | jq '[.missing[] | select(.kind|endswith("-archive"))] | length')
+      expected_archives=0
+      if [ "$standing" = retired ] || [ "$expected" = 2 ]; then expected_archives=1; fi
+      assert_eq "$expected_archives" "$archives" "$direction $kind $standing preserves only necessary archive dispositions"
+    done
+  done
+  # Vendor acknowledgment syntax follows the current provider. Applying a
+  # retained CR role's suffix grammar to current Codex text would erase an edit.
+  reset_fixtures
+  cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+  printf '_🟠 Major_\n**P1** Provider-specific acknowledgment handling.\n' >"$TMP/dedup-body"
+  DEDUP_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9211 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body")
+  jq -n --arg body "$DEDUP_ARCHIVE" '[{id:9212,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  jq -n --arg source "$source" --rawfile body "$TMP/dedup-body" '[{id:9211,user:{login:$source},body:($body+"\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->"),created_at:"2026-10-11T01:00:00Z",updated_at:"2026-10-11T03:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/inline.json"
+  run_gate
+  expected=2; [ "$current_provider" != coderabbit ] || expected=1
+  assert_eq 1 "$RUN_RC" "$direction suffix handling preserves the live obligation"
+  assert_eq "$expected" "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$direction suffix equivalence uses only the current CR role"
+  expected_archives=1; [ "$current_provider" != coderabbit ] || expected_archives=0
+  assert_eq "$expected_archives" "$(printf '%s' "$RUN_JSON" | jq '[.missing[]|select(.kind=="inline-archive")]|length')" "$direction vendor suffix cannot invent another provider's equivalence"
+
+  # A -> B -> A collapses only identical A history, while B's later source
+  # edit still advances the live review floor beyond an old A acknowledgment.
+  reset_fixtures
+  cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+  printf '_🟠 Major_\n**P1** Re-raised original body A.\n' >"$TMP/dedup-body-a"
+  printf '_🟠 Major_\n**P1** Intermediate body B.\n' >"$TMP/dedup-body-b"
+  DEDUP_ARCHIVE_A=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9221 "$source" '2026-10-11T02:00:00Z' "$TMP/dedup-body-a")
+  DEDUP_ARCHIVE_B=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9221 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body-b")
+  DEDUP_FINGERPRINT_A=$(printf '%s' "$DEDUP_ARCHIVE_A" | jq -Rr 'capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data|@base64d|fromjson|.body_fingerprint')
+  jq -n --arg a "$DEDUP_ARCHIVE_A" --arg b "$DEDUP_ARCHIVE_B" --arg ack "[mergepath-review-ack: 9221 $DEDUP_FINGERPRINT_A]" '[{id:9222,user:{login:"github-actions[bot]"},body:$a},{id:9223,user:{login:"github-actions[bot]"},body:$b},{id:9224,user:{login:"nathanpayne-codex"},created_at:"2026-10-11T02:30:00Z",body:($ack+"\nDispositioned A before B was re-raised.")}]' >"$TMP/fixtures/issues.json"
+  jq -n --arg source "$source" --rawfile body "$TMP/dedup-body-a" '[{id:9221,user:{login:$source},body:$body,submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/reviews.json"
+  run_gate
+  assert_eq 1 "$RUN_RC" "$direction re-raised review cannot use its old A acknowledgment"
+  assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$direction A-B-A inventories live A and distinct archived B only"
+  assert_eq '2026-10-11T03:00:00Z' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[]|select(.kind=="review-body")|.updated_at')" "$direction equal-body collapse preserves the latest historical source floor"
+  DEDUP_ACKS=$(printf '%s' "$RUN_JSON" | jq '[.missing[].ack_token]')
+  jq --argjson acks "$DEDUP_ACKS" '. + [$acks[]|{id:9225,user:{login:"nathanpayne-codex"},created_at:"2026-10-11T03:01:00Z",body:(.+"\nDispositioned after the latest edit.")}]' "$TMP/fixtures/issues.json" >"$TMP/dedup-acknowledged.json"
+  mv "$TMP/dedup-acknowledged.json" "$TMP/fixtures/issues.json"
+  run_gate
+  assert_eq 0 "$RUN_RC" "$direction post-floor acknowledgments account for both distinct obligations"
+done
+# Match the existing finding_tier precedence: Codex/current reviewers win
+# over a simultaneous CR login, so those parses never gain CR suffix grammar.
+for precedence in codex reviewer; do
+  reset_fixtures
+  cp "$TMP/dedup-role-policy.yml" "$TMP/review-policy.yml"
+  python3 - "$TMP/review-policy.yml" "$source" "$precedence" <<'PYTHON'
+import sys
+p,source,precedence=sys.argv[1:]; s=open(p).read()
+if precedence=='codex': s=s.replace('bot_login: "new-codex[bot]"','bot_login: "'+source+'"')
+else: s=s.replace('available_reviewers:\n','available_reviewers:\n  - "'+source+'"\n')
+open(p,'w').write(s)
+PYTHON
+  printf '_🟠 Major_\n**P1** Current parser precedence.\n' >"$TMP/dedup-body"
+  DEDUP_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" inline 9231 "$source" '2026-10-11T03:00:00Z' "$TMP/dedup-body")
+  jq -n --arg body "$DEDUP_ARCHIVE" '[{id:9232,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+  jq -n --arg source "$source" --rawfile body "$TMP/dedup-body" '[{id:9231,user:{login:$source},body:$body,created_at:"2026-10-11T01:00:00Z"}]' >"$TMP/fixtures/inline.json"
+  run_gate
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$precedence parser precedence still collapses byte-identical history"
+  jq '.[0].body += "\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit def5678\n\n<!-- This is an auto-generated reply by CodeRabbit -->"' "$TMP/fixtures/inline.json" >"$TMP/dedup-precedence-live.json"
+  mv "$TMP/dedup-precedence-live.json" "$TMP/fixtures/inline.json"
+  run_gate
+  assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$precedence parser precedence does not apply simultaneous CR suffix grammar"
+  assert_eq 1 "$(printf '%s' "$RUN_JSON" | jq '[.missing[]|select(.kind=="inline-archive")]|length')" "$precedence parser keeps the distinct edited archive obligation"
+done
+# A GHAS login can also have current reviewer standing. Source-kind live
+# inventory must match the actual review loop, which includes that reviewer.
+for kind in inline review-body; do
+  for standing in current retired weaker; do
+    reset_fixtures
+    python3 - "$TMP/dedup-initial-policy.yml" "$TMP/review-policy.yml" "$standing" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read().replace('status: active','status: retired')
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "nathanpayne-codex"')
+if sys.argv[3]=='retired': s=s.replace('  - nathanpayne-codex\n','')
+open(sys.argv[2],'w').write(s)
+PYTHON
+    printf '**P1** Identical GHAS and current reviewer body.\n' >"$TMP/ghas-reviewer-body"
+    if [ "$standing" = weaker ]; then printf '_🟠 Major_\n**P2** Weaker current reviewer tier.\n' >"$TMP/ghas-reviewer-body"; fi
+    GHAS_REVIEWER_ARCHIVE=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" "$kind" 9241 nathanpayne-codex '2026-10-11T03:00:00Z' "$TMP/ghas-reviewer-body")
+    jq -n --arg body "$GHAS_REVIEWER_ARCHIVE" '[{id:9242,user:{login:"github-actions[bot]"},body:$body}]' >"$TMP/fixtures/issues.json"
+    surface=inline; [ "$kind" != review-body ] || surface=reviews
+    jq -n --rawfile body "$TMP/ghas-reviewer-body" '[{id:9241,user:{login:"nathanpayne-codex"},body:$body,created_at:"2026-10-11T01:00:00Z",submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/$surface.json"
+    run_gate
+    assert_eq 1 "$RUN_RC" "$kind GHAS/reviewer $standing keeps a finding obligation"
+    expected=1
+    # With reviewer standing removed, the remaining inline GHAS parser uses
+    # its existing p2 default; it cannot cover the stronger archived p1.
+    if [ "$standing" = weaker ] || { [ "$standing" = retired ] && [ "$kind" = inline ]; }; then expected=2; fi
+    assert_eq "$expected" "$(printf '%s' "$RUN_JSON" | jq '.posted')" "$kind GHAS/reviewer $standing collapses only current parser coverage"
+    expected_archives=0; [ "$standing" = current ] || expected_archives=1
+    assert_eq "$expected_archives" "$(printf '%s' "$RUN_JSON" | jq '[.missing[]|select(.kind|endswith("-archive"))]|length')" "$kind GHAS/reviewer $standing respects standing and stronger history"
+  done
+done
+# Preserve the historical floor when A -> B -> A uses reviewer precedence
+# over the same configured GHAS login; only byte-identical A may collapse.
+reset_fixtures
+python3 - "$TMP/dedup-initial-policy.yml" "$TMP/review-policy.yml" <<'PYTHON'
+import sys
+s=open(sys.argv[1]).read().replace('status: active','status: retired')
+s=s.replace('bot_login: "github-advanced-security[bot]"','bot_login: "nathanpayne-codex"')
+open(sys.argv[2],'w').write(s)
+PYTHON
+printf '**P1** Re-raised reviewer body A.\n' >"$TMP/ghas-reviewer-body-a"
+printf '**P1** Intermediate reviewer body B.\n' >"$TMP/ghas-reviewer-body-b"
+GHAS_REVIEWER_A=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9251 nathanpayne-codex '2026-10-11T02:00:00Z' "$TMP/ghas-reviewer-body-a")
+GHAS_REVIEWER_B=$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9251 nathanpayne-codex '2026-10-11T03:00:00Z' "$TMP/ghas-reviewer-body-b")
+GHAS_REVIEWER_FP=$(printf '%s' "$GHAS_REVIEWER_A" | jq -Rr 'capture("^<!-- mergepath-feedback-archive:v1 (?<data>.+) -->$").data|@base64d|fromjson|.body_fingerprint')
+jq -n --arg a "$GHAS_REVIEWER_A" --arg b "$GHAS_REVIEWER_B" --arg ack "[mergepath-review-ack: 9251 $GHAS_REVIEWER_FP]" '[{id:9252,user:{login:"github-actions[bot]"},body:$a},{id:9253,user:{login:"github-actions[bot]"},body:$b},{id:9254,user:{login:"nathanpayne-cursor"},created_at:"2026-10-11T02:30:00Z",body:($ack+"\nOld A disposition before the latest source edit.")}]' >"$TMP/fixtures/issues.json"
+jq -n --rawfile body "$TMP/ghas-reviewer-body-a" '[{id:9251,user:{login:"nathanpayne-codex"},body:$body,submitted_at:"2026-10-11T01:00:00Z",commit_id:"cccccccccccccccccccccccccccccccccccccccc"}]' >"$TMP/fixtures/reviews.json"
+run_gate
+assert_eq 1 "$RUN_RC" "GHAS/reviewer A-B-A keeps the later historical obligations unaccounted"
+assert_eq 2 "$(printf '%s' "$RUN_JSON" | jq '.posted')" "GHAS/reviewer A-B-A inventories live A and distinct archived B only"
+assert_eq '2026-10-11T03:00:00Z' "$(printf '%s' "$RUN_JSON" | jq -r '.missing[]|select(.kind=="review-body")|.updated_at')" "GHAS/reviewer collapse preserves the latest historical review floor"
+# Current reviewer standing must not expand a retained GHAS-only source kind.
+sed 's/login: nathanpayne-codex, provider: reviewer/login: nathanpayne-codex, provider: ghas/' "$TMP/review-policy.yml" >"$TMP/ghas-only-retained-policy.yml"
+mv "$TMP/ghas-only-retained-policy.yml" "$TMP/review-policy.yml"
+assert_eq "" "$(CONFIG="$TMP/review-policy.yml" "$RENDER_ARCHIVE" review-body 9251 nathanpayne-codex '2026-10-11T03:00:00Z' "$TMP/ghas-reviewer-body-a")" "current reviewer role does not admit retained GHAS-only review bodies"
+run_gate
+assert_eq 2 "$RUN_RC" "retained GHAS-only review history fails admission before live deduplication"
+mv "$TMP/dedup-policy-before.yml" "$TMP/review-policy.yml"
+
+if [ "$FAIL" -ne 0 ]; then
+  printf 'review-feedback-accounting: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2
+  exit 1
+fi
+
+printf 'review-feedback-accounting: PASS (%s assertions)\n' "$PASS"

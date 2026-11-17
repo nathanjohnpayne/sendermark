@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# Offline coverage for scripts/audit-propagation-lane.sh (#434) via its
+# --check-files mode, which evaluates the same lane predicate the live
+# per-consumer loop evaluates.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/scripts/audit-propagation-lane.sh"
+
+[[ -x "$SCRIPT" ]] || { echo "missing or non-executable $SCRIPT" >&2; exit 1; }
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lane-audit-test.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+PASS=0
+FAIL=0
+pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+# A workflow file carrying the #434 default-ON lane marker, and one
+# predating it. The marker literal must match the one in the REAL
+# synced workflow — assert that first so the audit can't silently
+# diverge from what pr-review-policy.yml actually ships.
+# Since #2727 slice 3b the workflow runs the lane from the classifier script,
+# so the marker lives there and the workflow names the script.
+MARKER='PROP_ENABLED=${PROP_ENABLED:-true}'
+CLASSIFIER_PATH='scripts/workflow/external_review_classify.sh'
+if grep -qF "$CLASSIFIER_PATH" "$ROOT/.github/workflows/pr-review-policy.yml" \
+   && grep -qF "$MARKER" "$ROOT/$CLASSIFIER_PATH"; then
+  pass "the real pr-review-policy.yml delegates to $CLASSIFIER_PATH, which carries the default-ON marker"
+else
+  fail "the real workflow must name $CLASSIFIER_PATH and the script must carry the marker — audit and lane have diverged"
+fi
+
+WF_NEW="$WORKDIR/wf-new.yml"
+printf 'jobs:\n  x:\n    run: |\n      %s\n' "$MARKER" >"$WF_NEW"
+WF_OLD="$WORKDIR/wf-old.yml"
+printf 'jobs:\n  x:\n    run: |\n      PROP_ENABLED=$(prop_field f propagation_prs enabled)\n' >"$WF_OLD"
+
+POLICY_BARE="$WORKDIR/policy-bare.yml"        # no propagation_prs block (the fleet-wide #434 shape)
+printf 'author_identity: nathanjohnpayne\n' >"$POLICY_BARE"
+POLICY_ON="$WORKDIR/policy-on.yml"            # explicit enabled: true
+printf 'propagation_prs:\n  enabled: true\nauthor_identity: nathanjohnpayne\n' >"$POLICY_ON"
+POLICY_OFF="$WORKDIR/policy-off.yml"          # explicit opt-out
+printf 'propagation_prs:\n  enabled: false\nauthor_identity: nathanjohnpayne\n' >"$POLICY_OFF"
+POLICY_NO_AUTHOR="$WORKDIR/policy-no-author.yml"
+printf 'propagation_prs:\n  enabled: true\n' >"$POLICY_NO_AUTHOR"
+POLICY_ALT_PREFIX="$WORKDIR/policy-alt-prefix.yml"  # prefix that sync never opens
+printf 'propagation_prs:\n  enabled: true\n  branch_prefix: "other-prefix/"\nauthor_identity: nathanjohnpayne\n' >"$POLICY_ALT_PREFIX"
+POLICY_STD_PREFIX="$WORKDIR/policy-std-prefix.yml"  # explicit standard prefix
+printf 'propagation_prs:\n  enabled: true\n  branch_prefix: "mergepath-sync/"\nauthor_identity: nathanjohnpayne\n' >"$POLICY_STD_PREFIX"
+POLICY_WRONG_AUTHOR="$WORKDIR/policy-wrong-author.yml"  # author that sync never uses
+printf 'propagation_prs:\n  enabled: true\nauthor_identity: nathanpayne-claude\n' >"$POLICY_WRONG_AUTHOR"
+POLICY_CASED="$WORKDIR/policy-cased.yml"  # YAML-boolean-ish but not the lane's exact match
+printf 'propagation_prs:\n  enabled: TRUE\nauthor_identity: nathanjohnpayne\n' >"$POLICY_CASED"
+
+run_check() {  # <policy> <workflow> [<classifier>] — sets OUT and RC
+  set +e
+  OUT=$("$SCRIPT" --check-files "$@" 2>&1)
+  RC=$?
+  set -e
+}
+
+# A delegating workflow (#2727 slice 3b): the marker is read from the
+# classifier script it runs, not from the workflow.
+WF_DELEGATING="$WORKDIR/wf-delegating.yml"
+printf 'jobs:\n  x:\n    run: bash %s\n' "$CLASSIFIER_PATH" >"$WF_DELEGATING"
+CLS_NEW="$WORKDIR/classify-new.sh"
+printf '%s\n' "$MARKER" >"$CLS_NEW"
+CLS_OLD="$WORKDIR/classify-old.sh"
+printf 'PROP_ENABLED=$(prop_field f propagation_prs enabled)\n' >"$CLS_OLD"
+
+run_check "$POLICY_BARE" "$WF_DELEGATING" "$CLS_NEW"
+if [ "$RC" = "0" ] && grep -q "default-ON" <<<"$OUT"; then
+  pass "a delegating workflow fires the lane when its classifier carries the marker"
+else
+  fail "delegating workflow with a default-ON classifier should fire; got rc=$RC, out: $OUT"
+fi
+run_check "$POLICY_BARE" "$WF_DELEGATING"
+if [ "$RC" = "1" ] && grep -q "$CLASSIFIER_PATH, which is ABSENT" <<<"$OUT"; then
+  pass "a delegating workflow without its classifier fails the audit"
+else
+  fail "delegating workflow without the classifier should fail as absent; got rc=$RC, out: $OUT"
+fi
+run_check "$POLICY_BARE" "$WF_DELEGATING" "$CLS_OLD"
+if [ "$RC" = "1" ] && grep -q "$CLASSIFIER_PATH predates the #434 default-ON lane" <<<"$OUT"; then
+  pass "a delegating workflow whose classifier lacks the marker fails the audit"
+else
+  fail "delegating workflow with a pre-#434 classifier should fail; got rc=$RC, out: $OUT"
+fi
+run_check "$POLICY_BARE" "$WF_NEW" "$CLS_OLD"
+if [ "$RC" = "0" ]; then
+  pass "an inline-lane workflow is judged by its own text, whatever the classifier file holds"
+else
+  fail "inline-lane workflow carrying the marker should fire; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_BARE" "$WF_NEW"
+if [ "$RC" = "0" ] && grep -q "default-ON" <<<"$OUT"; then
+  pass "absent propagation_prs block fires the lane under the default-ON workflow"
+else
+  fail "absent block should fire (rc=0, default-ON); got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_ON" "$WF_NEW"
+if [ "$RC" = "0" ]; then
+  pass "explicit enabled: true fires the lane"
+else
+  fail "explicit enabled: true should fire; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_OFF" "$WF_NEW"
+if [ "$RC" = "1" ] && grep -q "explicit opt-out" <<<"$OUT"; then
+  pass "explicit enabled: false is flagged as an opt-out and fails the audit"
+else
+  fail "explicit enabled: false should fail with opt-out message; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_BARE" "$WF_OLD"
+if [ "$RC" = "1" ] && grep -q "predates the #434" <<<"$OUT"; then
+  pass "pre-#434 workflow without the default-ON marker fails the audit"
+else
+  fail "pre-#434 workflow should fail with marker message; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_NO_AUTHOR" "$WF_NEW"
+if [ "$RC" = "1" ] && grep -q "no author_identity" <<<"$OUT"; then
+  pass "missing author_identity fails the audit"
+else
+  fail "missing author_identity should fail; got rc=$RC, out: $OUT"
+fi
+
+run_check "" "$WF_NEW"
+if [ "$RC" = "1" ]; then
+  pass "absent review-policy.yml fails the audit (no author fingerprint)"
+else
+  fail "absent review-policy.yml should fail; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_ALT_PREFIX" "$WF_NEW"
+if [ "$RC" = "1" ] && grep -q "never match a real sync PR" <<<"$OUT"; then
+  pass "overridden branch_prefix that sync never opens fails the audit"
+else
+  fail "non-sync branch_prefix should fail; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_STD_PREFIX" "$WF_NEW"
+if [ "$RC" = "0" ]; then
+  pass "explicit standard branch_prefix fires the lane"
+else
+  fail "explicit mergepath-sync/ prefix should fire; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_WRONG_AUTHOR" "$WF_NEW"
+if [ "$RC" = "1" ] && grep -q "sync PRs are authored by" <<<"$OUT"; then
+  pass "author_identity that is not the sync actor fails the audit"
+else
+  fail "non-sync author_identity should fail; got rc=$RC, out: $OUT"
+fi
+
+run_check "$POLICY_CASED" "$WF_NEW"
+if [ "$RC" = "1" ] && grep -q "only fires on exactly" <<<"$OUT"; then
+  pass "non-lowercase enabled value fails the audit (lane matches exactly 'true')"
+else
+  fail "enabled: TRUE should fail; got rc=$RC, out: $OUT"
+fi
+
+# --- #452: quoted author_identity normalization ---------------------------
+# A quoted-but-correct author_identity must pass (the lane and this audit
+# strip both quote styles). Wrong author still fails even when quoted.
+POLICY_QUOTED_DQ="$WORKDIR/policy-quoted-dq.yml"
+printf 'propagation_prs:\n  enabled: true\nauthor_identity: "nathanjohnpayne"\n' >"$POLICY_QUOTED_DQ"
+run_check "$POLICY_QUOTED_DQ" "$WF_NEW"
+if [ "$RC" = "0" ]; then
+  pass "#452: double-quoted author_identity passes (quotes stripped)"
+else
+  fail "#452: double-quoted author_identity should pass; got rc=$RC, out: $OUT"
+fi
+
+POLICY_QUOTED_SQ="$WORKDIR/policy-quoted-sq.yml"
+printf "propagation_prs:\n  enabled: true\nauthor_identity: 'nathanjohnpayne'\n" >"$POLICY_QUOTED_SQ"
+run_check "$POLICY_QUOTED_SQ" "$WF_NEW"
+if [ "$RC" = "0" ]; then
+  pass "#452: single-quoted author_identity passes (quotes stripped)"
+else
+  fail "#452: single-quoted author_identity should pass; got rc=$RC, out: $OUT"
+fi
+
+POLICY_QUOTED_WRONG="$WORKDIR/policy-quoted-wrong.yml"
+printf 'propagation_prs:\n  enabled: true\nauthor_identity: "nathanpayne-claude"\n' >"$POLICY_QUOTED_WRONG"
+run_check "$POLICY_QUOTED_WRONG" "$WF_NEW"
+if [ "$RC" = "1" ] && grep -q "sync PRs are authored by" <<<"$OUT"; then
+  pass "#452: quoted-but-WRONG author_identity still fails (quote-strip is not author-blind)"
+else
+  fail "#452: quoted wrong author should fail; got rc=$RC, out: $OUT"
+fi
+
+# --- #454: live-mode credential binding -----------------------------------
+# Offline --check-files stays credential-free: no GH_TOKEN required.
+set +e
+OUT=$(env -u GH_TOKEN "$SCRIPT" --check-files "$POLICY_BARE" "$WF_NEW" 2>&1)
+RC=$?
+set -e
+if [ "$RC" = "0" ] && ! grep -qi "reviewer token" <<<"$OUT"; then
+  pass "#454: --check-files mode stays credential-free (no GH_TOKEN required)"
+else
+  fail "#454: --check-files should not need GH_TOKEN; got rc=$RC, out: $OUT"
+fi
+
+# Live mode binds to a VERIFIED reviewer token; with no GH_TOKEN and no
+# fresh preflight cache it fails closed (exit 3) BEFORE any network read.
+# Stub yq/gh on PATH so the test doesn't depend on the CI yq-install order
+# (check_propagation_lane_audit runs before the yq install step).
+STUB_BIN="$WORKDIR/stub-bin"; mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/yq" <<'YQ'
+#!/usr/bin/env bash
+case "${1:-}" in --version) echo "yq (https://github.com/mikefarah/yq/) version v4.53.6" ;; *) echo "[]" ;; esac
+YQ
+cat > "$STUB_BIN/gh" <<'GH'
+#!/usr/bin/env bash
+echo "stub-gh must not be called on the fail-closed path" >&2; exit 99
+GH
+chmod +x "$STUB_BIN/yq" "$STUB_BIN/gh"
+EMPTY_CACHE="$WORKDIR/empty-cache"; mkdir -p "$EMPTY_CACHE"
+set +e
+OUT=$( cd "$ROOT" && PATH="$STUB_BIN:$PATH" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
+  MERGEPATH_AGENT="nobody-xyz" env -u GH_TOKEN "$SCRIPT" --repos __none__ 2>&1 )
+RC=$?
+set -e
+if [ "$RC" = "3" ] && grep -qi "reviewer token" <<<"$OUT"; then
+  pass "#454: live mode fails closed (exit 3) with no token + no fresh cache"
+else
+  fail "#454: live mode should fail closed w/o a token; got rc=$RC, out: $OUT"
+fi
+
+# --- #521: token check ordered BEFORE manifest/yq prerequisites -----------
+# Run live mode from a directory with NO .mergepath-sync.yml and NO yq on
+# PATH, with no token. Pre-#521 the yq/manifest checks ran first and the
+# script exited 2 ("yq is required" / "manifest not found") — the WRONG
+# diagnostic when the real blocker is the absent reviewer token. After the
+# reorder, the token-presence check fires first → exit 3 + "reviewer token".
+NO_MANIFEST_DIR="$WORKDIR/no-manifest"; mkdir -p "$NO_MANIFEST_DIR"
+# Minimal PATH WITHOUT yq (and without the stub yq), so if the yq check ran
+# first it would exit 2. jq/coreutils from /usr/bin keep the script runnable
+# up to the token gate.
+NOYQ_PATH_521="/usr/bin:/bin:/usr/sbin:/sbin"
+set +e
+OUT=$( cd "$NO_MANIFEST_DIR" && PATH="$NOYQ_PATH_521" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
+  MERGEPATH_AGENT="nobody-xyz" env -u GH_TOKEN -u GITHUB_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT "$SCRIPT" --repos __none__ 2>&1 )
+RC=$?
+set -e
+if [ "$RC" = "3" ] && grep -qi "reviewer token" <<<"$OUT" \
+   && ! grep -qi "yq is required" <<<"$OUT" \
+   && ! grep -qi "not found" <<<"$OUT"; then
+  pass "#521: missing token fails fast (exit 3) BEFORE the yq/manifest checks"
+else
+  fail "#521: token check should precede manifest/yq prereqs; got rc=$RC, out: $OUT"
+fi
+
+# --- #799: the token-identity read must not report an error body as the -----
+# --- identity --------------------------------------------------------------
+# `gh api user --jq .login` writes the JSON error body to STDOUT on an HTTP
+# failure, so `LANE_TOKEN_LOGIN=$(… || true)` came back holding
+# `{"message":"Bad credentials",…}` and the `[ -z ]` half of the guard never
+# fired. The DECISION stayed safe by a different route — a JSON blob is not in
+# available_reviewers either — but the diagnostic named the blob as the
+# effective identity, which sends the reader hunting a permissions problem
+# when the real fault is an unreachable or unauthenticated API. Both halves
+# are asserted: still exit 3, and the lane's OWN verdict line must name
+# `<unresolvable>` rather than quoting the blob as an identity.
+#
+# The assertion is scoped to that one line on purpose. gh_api_scalar DOES echo
+# the error body — to stderr, as a diagnostic, which is the point: the body is
+# useful to a human and fatal to a parser, so it belongs on the stream nobody
+# reads as a value. A blanket "the body appears nowhere in the output" check
+# would forbid the very reporting the fix adds.
+#
+# Driven at BOTH gh exit statuses. Exit 1 is what real gh does; exit 0 is the
+# pathological variant that only `--shape login` can catch.
+#
+# Run from a SCRATCH root, not from $ROOT. These two cases supply a token, so
+# unlike the fail-closed cases above they get past the token gate and reach the
+# `[ -f "$MANIFEST" ]` prerequisite — and check_repo_lint_consumer_safety runs
+# this whole suite inside a CONSUMER fixture tree that has no
+# `.mergepath-sync.yml`, where the script would exit 2 on the missing manifest
+# long before the identity read under test. CI caught exactly that. An empty
+# manifest file is enough: the identity gate fires before anything parses it,
+# and an absent review-policy.yml leaves available_reviewers empty, which only
+# makes the fail-closed verdict more certain.
+LANE799_ROOT="$WORKDIR/lane799-root"; mkdir -p "$LANE799_ROOT"
+: > "$LANE799_ROOT/.mergepath-sync.yml"
+for lane_rc in 1 0; do
+  LANE799_BIN="$WORKDIR/lane799-bin.$lane_rc"; mkdir -p "$LANE799_BIN"
+  cp "$STUB_BIN/yq" "$LANE799_BIN/yq"
+  cat > "$LANE799_BIN/gh" <<GH
+#!/usr/bin/env bash
+# Model real \`gh api --jq\` on an HTTP failure: error BODY on STDOUT with the
+# filter NOT applied, human-readable line on stderr. A stub writing the body
+# to stderr would prove nothing — the script's 2>/dev/null would swallow it
+# and the dead guard would fire correctly for the wrong reason (#799).
+printf '%s' '{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}'
+echo "gh: Bad credentials (HTTP 401)" >&2
+exit $lane_rc
+GH
+  chmod +x "$LANE799_BIN/gh" "$LANE799_BIN/yq"
+  set +e
+  OUT=$( cd "$LANE799_ROOT" && PATH="$LANE799_BIN:$PATH" OP_PREFLIGHT_CACHE_DIR="$EMPTY_CACHE" \
+    MERGEPATH_AGENT="nobody-xyz" GH_TOKEN="dummy-token-for-the-identity-read" \
+    "$SCRIPT" --repos __none__ 2>&1 )
+  RC=$?
+  set -e
+  VERDICT_LINE=$(echo "$OUT" | grep "live-mode token identity" || true)
+  if [ "$RC" = "3" ] && grep -q "'<unresolvable>'" <<<"$VERDICT_LINE" \
+     && ! grep -q '"message"' <<<"$VERDICT_LINE"; then
+    pass "#799: an unreadable token-identity read reports <unresolvable>, not the error body (gh exit $lane_rc)"
+  else
+    fail "#799: token-identity diagnostic leaked the error body at gh exit $lane_rc; got rc=$RC, out: $OUT"
+  fi
+done
+
+echo ""
+echo "test_audit_propagation_lane: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

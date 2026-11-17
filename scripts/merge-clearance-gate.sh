@@ -1,0 +1,1570 @@
+#!/usr/bin/env bash
+# scripts/merge-clearance-gate.sh — HEAD-pinned merge-clearance gate
+#
+# Read-only required-status-check gate that fails CLOSED at merge time
+# when a PR's clearance condition is not satisfied ON THE CURRENT HEAD.
+# Never merges, labels, or comments.
+#
+# Context — nathanjohnpayne/mergepath#427 + #428. Two merge-gate escapes
+# slipped past the enforcement layer and were caught only by the WEEKLY
+# retroactive audit (pr-audit.yml), a week after merge:
+#
+#   #427 (matchline#245): a Dependabot dev-dependencies group bump merged
+#        with NO reviewer-identity APPROVED review on the merge HEAD. The
+#        dependabot-auto-merge.yml approval is transient — a rebase push
+#        dismisses it (or it was never re-posted on the final SHA) — and a
+#        human then merged the approved-but-unmerged PR. Nothing failed
+#        closed.
+#   #428 (nathanpaynedotcom#405): an over-threshold (needs-external-review)
+#        PR merged with no APPROVED CLI review and no Codex review on the
+#        merge HEAD. Clearance was evaluated on an EARLIER HEAD, the
+#        removable-label proxy went stale, and the only required checks
+#        (Label Gate green-but-stale, Codex P1 vacuously green) did not
+#        represent clearance on the merge HEAD.
+#
+# Shared root cause: clearance was enforced via a MUTABLE proxy (a
+# dismissable review, a removable label) plus a weekly audit — never as a
+# HEAD-pinned required status check that re-evaluates on every push and
+# fails closed. This script is that check. Modeled on the proven
+# codex-p1-gate.sh / codex-p1-gate.yml pattern (required check +
+# scheduled sweep + trusted default-branch checkout).
+#
+# Usage:
+#   scripts/merge-clearance-gate.sh [PR_NUMBER] [REPO]
+#   scripts/merge-clearance-gate.sh                  # env-only mode
+#
+# Arguments (positional take precedence; env fallbacks support the
+# scheduled-sweep / workflow_dispatch invocation shape):
+#   PR_NUMBER  Required (positional or $PR_NUMBER env). Integer.
+#   REPO       Optional. "owner/repo". Falls back to $REPO env, then to
+#              the current repo via `gh repo view`.
+#
+# Environment:
+#   GH_TOKEN   Required. Needs pull_requests:read (+ the read scopes
+#              codex-review-check.sh needs for the external-review path).
+#              The #772 enforcement probe (reached only from
+#              --derive-rate-limit-protection) reads two ADDITIONAL surfaces
+#              whose access pull_requests:read does NOT imply: GraphQL
+#              `ref.refUpdateRule` (classic branch protection — null for a
+#              viewer without push access) and REST
+#              `repos/{owner}/{repo}/rules/branches/{branch}` (rulesets —
+#              needs repo metadata read). Verifying a candidate ruleset's
+#              bypass actors then reads the ruleset in ITS OWN scope —
+#              `repos/{owner}/{repo}/rulesets/{id}` for a repository ruleset,
+#              `orgs/{org}/rulesets/{id}` for an org ruleset inherited by the
+#              repo (which does NOT exist under the repository path). The org
+#              read needs an org-scoped token; without one the ruleset is
+#              unreadable, hence unproven, hence not counted — availability,
+#              not safety. A plain write-scoped classic PAT,
+#              which is what agent-review.yml runs this query under, reads
+#              both. A fine-grained PAT scoped to pull-requests only still
+#              satisfies the line above but gets null/403 on BOTH: the probe
+#              then reports "not enforced" (the conservative direction, so
+#              nothing unsafe happens) and arm 1 is permanently unavailable on
+#              that repo — every answer comes from the arm-2 current-head
+#              clearance probe. That state is indistinguishable from a
+#              genuinely unprotected base branch in the true/false output, so
+#              grep the job log for `enforcement probe:` lines to tell them
+#              apart before concluding a repo is unprotected.
+#   MERGE_CLEARANCE_CODEX_CHECK_BIN
+#              Optional. Path to codex-review-check.sh. Defaults to the
+#              sibling script next to this one. Tests override it to a
+#              stub so the external-review dispatch + exit-code mapping
+#              can be exercised without re-deriving codex-review-check's
+#              full behavior.
+#
+# What it enforces, by PR class (evaluated on pr.head.sha):
+#
+#   Every full-gate invocation:
+#     BLOCKS on human-hold, needs-human-review, or policy-violation before
+#     class exemptions, even when both review-gate knobs are disabled (#1277).
+#     Query modes retain their narrower applicability/coverage contracts.
+#
+#   Dependabot PR (author == 'dependabot[bot]' AND every commit on the PR is
+#   Dependabot-authored, GitHub-committed and signature-verified — see
+#   scripts/lib/dependabot-commit-provenance.sh; a Dependabot-opened PR that
+#   carries any other commit is judged as an ordinary PR below):
+#     Gated by `dependabot.reviewer_gate.enabled` (default false; true in
+#     mergepath). When enabled, BLOCKS unless a reviewer identity in
+#     `available_reviewers` (≠ PR author) has a latest-state APPROVED
+#     review whose commit_id == HEAD. This is the HEAD-pinned form of
+#     pr-audit.yml Check 2's Dependabot path — a transient approval
+#     dismissed on a rebase push re-blocks on the new HEAD.
+#
+#   External-review PR:
+#     Gated by `codex.external_review_gate.enabled` (default false; true
+#     in mergepath). Applicability is DERIVED from the PR's intrinsic
+#     properties — over `external_review_threshold` lines, OR a changed
+#     file matching `external_review_paths`, OR the `needs-external-review`
+#     label present — NOT from the label alone. (Trusting the label would
+#     reopen the #428 stale-label race: after a push, this gate can run
+#     before pr-review-policy.yml re-adds the label, and a label-only check
+#     would false-clear on an uncleared HEAD. #429 Codex P1.) When it
+#     applies, delegates to codex-review-check.sh — the SAME clearance
+#     predicate (gate (b) reviewer APPROVED + gate (c) Codex /
+#     Phase-4b-substitute on HEAD) the auto-clear workflow uses — so the
+#     merge-time gate and the label-clear logic cannot drift. CI checking
+#     (gate (a)) is skipped for this invocation because this gate is ITSELF
+#     a required check; waiting on the full required-check rollup (which
+#     includes this gate) would deadlock. CI green is enforced
+#     independently by the other required checks. When the force-on label is
+#     absent, a propagation PR is exempt only after this gate independently
+#     verifies the live head/base pair from its trusted checkout. The lane
+#     marker is diagnostic evidence only; a later head or base move requires
+#     fresh byte verification. Re-deriving a verified mirror would force it
+#     into Phase 4 and break the lane (#429 Codex round-2 P1).
+#
+#   Any other PR (under-threshold, non-Dependabot, or relevant knob off):
+#     CLEAN PASS (exit 0) unless a human-controlled hold is present. It can be a required
+#     check on every PR without blocking normal under-threshold merges.
+#
+# Exit codes (same contract as scripts/codex-p1-gate.sh):
+#   0   Clearance satisfied (or gate not applicable / disabled).
+#   1   Clearance NOT satisfied on the current HEAD — gate BLOCKS.
+#   2   Usage / config / infrastructure error. Message on stderr.
+#
+# Pending verdict (#2247). Exit 1 covers two different states: a real block
+# (a human-controlled hold, a Dependabot head without a reviewer approval, a
+# Dependabot auto-merge request armed for an earlier head) and external review
+# that simply has not cleared yet. Every caller keeps treating both as exit 1.
+# A caller that needs to tell them apart sets MERGEPATH_GATE_VERDICT_FILE to a
+# path it owns, and the script writes exactly `pending` there, and nothing
+# else, from the one site where external review applies, is derived without a
+# fail-closed fallback, and codex-review-check.sh answered "not cleared" (rc
+# 1). Every other exit leaves the file untouched, so an absent, empty or
+# different file means "not pending" and the caller must fail as before. The
+# exit code and stdout are byte-identical with or without the variable.
+# Only the event-driven job of merge-clearance-gate.yml reads it, to keep its
+# job-native run non-failing while the Checks-API lineage carries the block.
+#
+# Design notes:
+#   - Read-only. Only GETs against the GitHub API (plus a read-only
+#     delegate to codex-review-check.sh on the external-review path).
+#   - bash 3.2 portable; PATH-shimmable `gh` for tests (see
+#     tests/test_merge_clearance_gate.sh).
+#
+# References:
+#   - nathanjohnpayne/mergepath#427, #428 — this script
+#   - scripts/codex-review-check.sh — the shared external-review predicate
+#   - .github/workflows/pr-audit.yml Check 2 — the retroactive backstop
+#   - scripts/codex-p1-gate.sh — the required-check pattern this mirrors
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- tool preflight ---------------------------------------------------------
+# Fail with the documented config/usage code (2) if a hard dependency is
+# missing, rather than dying mid-run with an opaque 127 that the workflow
+# would map to a generic CI error (CodeRabbit ⚠️ on PR #429).
+for _tool in gh jq awk; do
+  if ! command -v "$_tool" >/dev/null 2>&1; then
+    echo "ERROR: required tool '$_tool' not found on PATH" >&2
+    exit 2
+  fi
+done
+
+# Shared available_reviewers reader (#453, adopted here by #817). Replaces
+# the local double-quote-only parser this script used to carry, so every
+# consumer of the allow-list normalizes it identically (dash + inline comment
+# + BOTH quote styles + whitespace). Hard-require it the way
+# scripts/codex-review-check.sh does: REVIEWERS on the Dependabot path is a
+# fail-closed gate input (an empty list exits 2), so a missing helper must
+# error rather than silently degrade to an empty allow-list.
+if [ ! -r "$SCRIPT_DIR/lib/reviewers-helpers.sh" ]; then
+  echo "ERROR: reviewers-helpers missing: $SCRIPT_DIR/lib/reviewers-helpers.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/reviewers-helpers.sh
+. "$SCRIPT_DIR/lib/reviewers-helpers.sh"
+
+if [ ! -r "$SCRIPT_DIR/lib/blocking-labels.sh" ]; then
+  echo "ERROR: blocking-labels helper missing: $SCRIPT_DIR/lib/blocking-labels.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/blocking-labels.sh
+. "$SCRIPT_DIR/lib/blocking-labels.sh"
+
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required for the same reason reviewers-helpers is: the reviews
+# and PR-files reads are fail-closed gate inputs, and an undefined reader
+# would surface as `command not found` rather than as a decision.
+if [ ! -r "$SCRIPT_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $SCRIPT_DIR/lib/gh-api-array.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$SCRIPT_DIR/lib/gh-api-array.sh"
+
+# Dependabot commit provenance: the Dependabot arm below is granted by the
+# commits the PR would merge, not by who opened it. Hard-required: without the
+# predicate the arm cannot be judged, and guessing either way is unsafe.
+if [ ! -r "$SCRIPT_DIR/lib/dependabot-commit-provenance.sh" ]; then
+  echo "ERROR: dependabot-commit-provenance helper missing: $SCRIPT_DIR/lib/dependabot-commit-provenance.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/dependabot-commit-provenance.sh
+. "$SCRIPT_DIR/lib/dependabot-commit-provenance.sh"
+
+# --- argument parsing -------------------------------------------------------
+
+# --derive-external-requiredness (#620/#630): QUERY mode. Runs the same
+# class dispatch + external-review applicability derivation as the gate and
+# prints exactly `true` or `false` on stdout (exit 0) instead of evaluating
+# clearance. `true` iff a NON-VACUOUS downstream CODEX/external *bot*-review
+# gate protects this PR's CURRENT head: the external arm applies (intrinsic
+# threshold / protected paths / label force-on). `false` when no such gate
+# holds the merge until bot review: under threshold with no protected paths
+# and no label, a lane-exempt verified head/base pair, external gate disabled,
+# or a
+# Dependabot PR (its reviewer gate blocks on a reviewer-identity APPROVED,
+# not on Codex — and Codex does not review Dependabot PRs, so it is never a
+# bot-review gate; automated-4b P1). Every error keeps the die()/exit-2
+# paths so callers MUST fail closed on nonzero. Retained as a narrow
+# diagnostic/back-compat query for callers that need only intrinsic external
+# applicability, not clearance. The production CodeRabbit rc=5 branch now uses
+# --derive-rate-limit-protection below because Phase-4b-cleared protected PRs
+# can be safe to auto-merge even after the removable label is gone (#713).
+#
+# --derive-phase-4-requiredness (#1094): QUERY mode for the final approval-
+# independence recheck. It shares the intrinsic threshold/protected-path,
+# force-on label, and exact-pair propagation-lane exemption calculation below,
+# but deliberately ignores whether the optional external merge gate is
+# enabled. Phase 4 policy scope exists independently of that enforcement knob.
+#
+# --derive-rate-limit-protection (#713, tightened by #772): QUERY mode for
+# agent-review.yml's CodeRabbit rc=5 branch. It prints `true` when a
+# rate-limited PR is protected from bot-unreviewed auto-merge by either:
+#   1. the merge-clearance external gate being ENFORCED — enabled in the
+#      governing policy AND observably a required status check on the PR's
+#      base branch (#772) — or
+#   2. intrinsic external-review applicability plus an already-satisfied
+#      current-head Codex/Phase-4b clearance predicate.
+# Arm 1 previously asked only whether the gate was enabled in CONFIG. That is
+# not evidence the gate can hold a merge: mergepath itself runs with the switch
+# on while `Merge clearance gate` is absent from base-branch protection, so the
+# query claimed protection on a repo where the gate blocks nothing. Enforcement
+# that cannot be determined is treated as NOT enforced and falls through to arm
+# 2, which is positive proof — so an undeterminable read costs availability, not
+# safety.
+# This keeps under-threshold stalls blocked while allowing the common
+# Phase-4b timing case where the APPROVED review already removed
+# `needs-external-review` before the auto-merge job re-checks CodeRabbit.
+DERIVE_ONLY=false
+PHASE_4_DERIVE_ONLY=false
+RATE_LIMIT_PROTECTION_ONLY=false
+_positional=()
+for _arg in "$@"; do
+  case "$_arg" in
+    --derive-external-requiredness) DERIVE_ONLY=true ;;
+    --derive-phase-4-requiredness) PHASE_4_DERIVE_ONLY=true ;;
+    --derive-rate-limit-protection) RATE_LIMIT_PROTECTION_ONLY=true ;;
+    *) _positional+=("$_arg") ;;
+  esac
+done
+set -- ${_positional[@]+"${_positional[@]}"}
+
+query_mode_count=0
+[ "$DERIVE_ONLY" = "true" ] && query_mode_count=$((query_mode_count + 1))
+[ "$PHASE_4_DERIVE_ONLY" = "true" ] && query_mode_count=$((query_mode_count + 1))
+[ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ] && query_mode_count=$((query_mode_count + 1))
+if [ "$query_mode_count" -gt 1 ]; then
+  echo "ERROR: choose only one query mode" >&2
+  exit 2
+fi
+
+if [ $# -gt 2 ]; then
+  echo "Usage: $0 [--derive-external-requiredness|--derive-phase-4-requiredness|--derive-rate-limit-protection] [PR_NUMBER] [REPO]" >&2
+  echo "       PR_NUMBER and REPO may also be set via env." >&2
+  exit 2
+fi
+
+PR_NUMBER=${1:-${PR_NUMBER:-}}
+if [ -z "$PR_NUMBER" ]; then
+  echo "ERROR: PR_NUMBER required (positional arg or \$PR_NUMBER env)" >&2
+  exit 2
+fi
+if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+  echo "ERROR: PR_NUMBER must be an integer; got '$PR_NUMBER'" >&2
+  exit 2
+fi
+
+REPO=${2:-${REPO:-}}
+if [ -z "$REPO" ]; then
+  REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+  if [ -z "$REPO" ]; then
+    echo "ERROR: could not detect current repo via 'gh repo view'. Pass REPO explicitly." >&2
+    exit 2
+  fi
+fi
+
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
+  exit 2
+fi
+
+# --- config readers ---------------------------------------------------------
+
+CONFIG=".github/review-policy.yml"
+
+# Scratch file for the PR-base review policy (#763; see the derivation block).
+BASE_POLICY_TMP=""
+# Policy source for every gating decision. Defaults to the trusted
+# default-branch checkout and is redirected to the PR base tree only for a
+# non-default base (see the #763 block after the PR metadata fetch).
+POLICY_CONFIG="$CONFIG"
+# shellcheck disable=SC2329  # invoked via the EXIT trap below
+cleanup_base_policy() {
+  [ -z "$BASE_POLICY_TMP" ] || rm -f "$BASE_POLICY_TMP"
+}
+trap cleanup_base_policy EXIT
+
+# Read a scalar field nested two levels deep: `<block>:` `<sub>:` `<field>:`.
+# Same state-machine awk pattern as codex-p1-gate.sh's
+# codex_p1_gate_field, generalized over the top block + sub-block names so
+# it serves both `dependabot.reviewer_gate.enabled` and
+# `codex.external_review_gate.enabled`.
+nested_field() {  # <top_block> <sub_block> <field>
+  # NOTE: do not name an awk -v variable `sub` — it shadows awk's
+  # built-in sub() used in the body. Use topkey/subkey/fldkey.
+  local topkey=$1 subkey=$2 fldkey=$3
+  [ -f "$CONFIG" ] || return 0
+  awk -v topkey="$topkey" -v subkey="$subkey" -v fldkey="$fldkey" '
+    $0 ~ "^" topkey ":" { in_top=1; in_sub=0; next }
+    in_top && /^[^[:space:]#]/ { in_top=0; in_sub=0 }
+    in_top && $1 == subkey":" { in_sub=1; next }
+    in_sub && /^[[:space:]]{0,3}[^[:space:]#]/ { in_sub=0 }
+    in_sub && $1 == fldkey":" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+      # Strip BOTH single and double quotes (#536): a single-quoted
+      # scalar like `enabled: '"'"'true'"'"'` previously kept its quotes
+      # and tripped the true|false validator (exit 2). \047 is the octal
+      # escape for a single quote inside the awk character class, mirroring
+      # codex-p1-gate.sh codex_field and the policy parsers in
+      # check_workflow_parsers.
+      gsub(/^["\047]/, "", $0)
+      gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+      gsub(/[[:space:]]*#.*$/, "", $0)
+      sub(/[[:space:]]+$/, "", $0)
+      print
+      exit
+    }
+  ' "$POLICY_CONFIG"
+}
+
+# --- logging helpers --------------------------------------------------------
+
+log() {
+  echo "[merge-clearance-gate] $*" >&2
+}
+
+die() {  # <code> <msg>
+  local code=$1; shift
+  echo "[merge-clearance-gate] ERROR: $*" >&2
+  exit "$code"
+}
+
+block() {  # <reason>
+  echo ""
+  echo "Merge clearance: BLOCKED — $*"
+  echo ""
+  exit 1
+}
+
+# #2247: the explicit pending verdict. Same exit code and the same stdout as
+# block(), so no caller that does not ask for the distinction can see one; the
+# distinction exists only in MERGEPATH_GATE_VERDICT_FILE (see Exit codes
+# above). A failed write is ignored on purpose: the caller then reads no
+# `pending` and fails closed, which is the pre-#2247 behaviour.
+block_pending() {  # <reason>
+  if [ -n "${MERGEPATH_GATE_VERDICT_FILE:-}" ]; then
+    printf 'pending\n' 2>/dev/null >"$MERGEPATH_GATE_VERDICT_FILE" || true
+  fi
+  block "$@"
+}
+
+clear_pass() {  # <reason>
+  echo "Merge clearance: PASS — $*"
+  exit 0
+}
+
+# Paginated fetch helper. The algorithm lives in scripts/lib/gh-api-array.sh
+# (#1008); what stays here is this gate's failure ACTION — `die 2`, the
+# documented config/usage code, so an unreadable reviews or files read can
+# never weaken the gate by reading as an empty list.
+fetch_api_array() {  # <endpoint> <label>
+  gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
+}
+
+# --- merge-clearance required-check enforcement probe (#772) ----------------
+#
+# The required-status-check CONTEXT this gate reports. Branch protection and
+# rulesets both key on the workflow JOB name, and
+# .github/workflows/merge-clearance-gate.yml names that job `Merge clearance
+# gate`. Every trigger path POSTs a check_run under that same CHECK_NAME — the
+# scheduled sweep, the #658 dispatch-recheck job, and since #843 the
+# event-driven job too. That last one is not redundancy: supersession is
+# reliable only WITHIN the Checks-API slot, so a job-native completion can
+# never retire a Checks-API entry, and an event path that reported only
+# natively left stale entries blocking cleared PRs (#841).
+# scripts/ci/check_merge_clearance_gate asserts that job name verbatim and
+# scripts/audit-branch-protection.sh carries the same string in
+# CANONICAL_REQUIRED_CHECKS, so this constant cannot drift from the workflow
+# without CI saying so.
+MERGE_CLEARANCE_CHECK_NAME="Merge clearance gate"
+
+# The app that must PRODUCE the required check for it to count as proof.
+# A context is just a string: a branch rule that requires
+# `Merge clearance gate` from a different integration — or from ANY source —
+# is satisfied by some other producer emitting that name, while this script
+# would conclude the trusted Actions job is enforced (#772 r5 P1). Both
+# surfaces carry the producer, so it is checkable: classic protection exposes
+# `required_status_checks.checks[].app_id`, rulesets expose
+# `parameters.required_status_checks[].integration_id`.
+#
+# 15368 is github.com's `github-actions` app. Verified live rather than looked
+# up: every check run on this repo's head reports `app.slug=github-actions`
+# with `app.id=15368`, and mergepath's own three required contexts are
+# recorded under that same app_id. Overridable for GitHub Enterprise Server,
+# where the id differs.
+MERGE_CLEARANCE_EXPECTED_APP_ID="${MERGE_CLEARANCE_EXPECTED_APP_ID:-15368}"
+
+# The login that will run the final `gh pr merge`, read from the GOVERNING
+# review policy's `author_identity` after POLICY_CONFIG resolves. Empty means
+# "the merging identity is unknown", which disables every bypass-actor
+# rule-out below (see the applicability model). Declared here so the probe
+# function can reference it; assigned once the base policy is resolved.
+MERGE_CLEARANCE_AUTHOR_IDENTITY=""
+
+# Positive proof that $MERGE_CLEARANCE_CHECK_NAME is an ENFORCED required
+# status check on the PR's base branch. Returns 0 ONLY when the context is
+# observed in a required-status-check list for $BASE_REF; returns 1 for
+# everything else — definitively absent, unknown base ref, API failure, or an
+# unparseable payload. "Undeterminable" is deliberately NOT distinguished from
+# "absent": the only caller's next step is the positive-proof current-head
+# clearance probe, so treating an unknown as not-enforced costs availability,
+# never safety (#768's positive-proof rule). Prints nothing; every diagnostic
+# goes to stderr via log() so the query's stdout stays exactly true/false.
+#
+# Why two surfaces, and why not the obvious REST endpoint: reading
+# repos/{owner}/{repo}/branches/{branch}/protection[/required_status_checks]
+# needs Administration:read and 404s for the write-scoped reviewer PAT this
+# query runs under in agent-review.yml (verified live against
+# nathanjohnpayne/mergepath). The two below are readable by a plain
+# write-scoped token and together cover both protection models:
+#   1. GraphQL ref.refUpdateRule.requiredStatusCheckContexts — CLASSIC branch
+#      protection, which is what the whole fleet uses today.
+#   2. REST repos/{owner}/{repo}/rules/branches/{branch} — repository RULESETS,
+#      the modern model. Classic protection does NOT surface there: verified
+#      live on mergepath@main, whose classic contexts are
+#      ["Label Gate","Self-Review Required","lint"] while that endpoint returns
+#      []. So neither surface alone is sufficient and the two lists are unioned.
+# Both are scoped to rules enforced on the VIEWER, so bypass filtering can only
+# HIDE a rule, never invent one — it can push this probe toward "not enforced"
+# (the conservative direction) and never toward a false "enforced".
+merge_clearance_check_enforced() {
+  local owner name contexts="" out err rc parsed observed
+  local ruleset_recs rs_rec rs_id rs_rest rs_src_type rs_src rs_endpoint rs_out rs_rc rs_blocking
+  owner=${REPO%%/*}
+  name=${REPO##*/}
+
+  if [ -z "$BASE_REF" ]; then
+    log "enforcement probe: PR base ref is unknown — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    return 1
+  fi
+
+  # errexit is suppressed inside a function called as an `if` condition, so an
+  # unguarded mktemp failure would leave $err empty and turn every redirect
+  # below into a confusing "no such file" — check it explicitly and take the
+  # conservative branch instead.
+  err=$(mktemp "${TMPDIR:-/tmp}/mcg-enforcement-err.XXXXXX" 2>/dev/null) || err=""
+  if [ -z "$err" ]; then
+    log "enforcement probe: could not create a scratch file for API diagnostics — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    return 1
+  fi
+
+  local base_ref_enc
+  base_ref_enc=$(printf '%s' "$BASE_REF" | LC_ALL=C awk '
+    BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
+    {
+      out = ""
+      n = length($0)
+      for (i = 1; i <= n; i++) {
+        c = substr($0, i, 1)
+        if (c ~ /[A-Za-z0-9._~\/-]/) out = out c
+        else out = out sprintf("%%%02X", ord[c])
+      }
+      printf "%s", out
+    }')
+  if [ -z "$base_ref_enc" ]; then
+    log "enforcement probe: could not encode base ref '$BASE_REF' for the ruleset URL — treating '$MERGE_CLEARANCE_CHECK_NAME' as NOT enforced"
+    rm -f "$err"
+    return 1
+  fi
+
+  # Surface 1 — classic branch protection.
+  set +e
+  # shellcheck disable=SC2016  # $owner/$name/$qref are GraphQL variables, bound by the -f flags below
+  out=$(gh api graphql \
+    -f query='query($owner:String!,$name:String!,$qref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$qref){refUpdateRule{requiredStatusCheckContexts}}}}' \
+    -f owner="$owner" -f name="$name" -f qref="refs/heads/$BASE_REF" 2>"$err")
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    log "enforcement probe: classic branch-protection read failed on '$BASE_REF' (gh rc=$rc): $(tr '\n' ' ' <"$err")"
+  else
+    set +e
+    parsed=$(printf '%s' "$out" \
+      | jq -r '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // [] | .[]' 2>"$err")
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      log "enforcement probe: could not parse the classic branch-protection response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
+    elif [ -n "$parsed" ]; then
+      # A required context is not proof that the MERGING identity is bound by
+      # it. Classic protection exempts repo admins unless `enforce_admins` is
+      # on, and this probe runs under the reviewer/CI token while the final
+      # `gh pr merge` runs under the author token — so a context merely
+      # VISIBLE to the reviewer would let an admin author merge on a
+      # downgraded rate-limit stall with no bot review. Same defect class as
+      # the ruleset bypass_actors case below (#772 r3 P1).
+      #
+      # `enforce_admins` is exposed only on the admin-scoped REST endpoint;
+      # GraphQL's refUpdateRule does not carry it (verified: it offers
+      # requiredStatusCheckContexts / viewerCanPush / viewerAllowedToDismiss-
+      # Reviews and nothing about admin exemption). That endpoint 404s for the
+      # write-scoped reviewer PAT this query runs under, so on the normal CI
+      # path enforcement is NOT provable here and the classic surface
+      # contributes nothing — the probe falls through to arm 2's positive-proof
+      # clearance check. Where the token IS admin-scoped, the read succeeds and
+      # the classic arm still works. Availability degrades, safety does not.
+      set +e
+      prot_out=$(gh api "repos/$REPO/branches/$base_ref_enc/protection" 2>"$err")
+      prot_rc=$?
+      set -e
+      if [ "$prot_rc" -ne 0 ]; then
+        log "enforcement probe: classic protection lists required contexts on '$BASE_REF' but admin-exemption state is unreadable with this token (gh rc=$prot_rc) — not counting the classic surface: $(tr '\n' ' ' <"$err")"
+      else
+        set +e
+        # Type-check rather than `// "unknown"`: jq's alternative operator
+        # treats `false` as empty, so an explicit enforce_admins=false would
+        # collapse into the undeterminable state. The verdict is the same
+        # either way (classic surface not counted), but the two are different
+        # facts — "admins are exempt" vs "we could not look" — and the
+        # `enforcement probe:` log lines are what an operator greps to tell a
+        # deliberately-unprotected base branch from a token-scope problem.
+        enforce_admins=$(printf '%s' "$prot_out" \
+          | jq -r 'if (.enforce_admins.enabled | type) == "boolean" then (.enforce_admins.enabled | tostring) else "unknown" end' 2>"$err")
+        prot_rc=$?
+        set -e
+        if [ "$prot_rc" -ne 0 ] || [ "$enforce_admins" = "unknown" ]; then
+          log "enforcement probe: could not determine enforce_admins on '$BASE_REF' — not counting the classic surface: $(tr '\n' ' ' <"$err")"
+        elif [ "$enforce_admins" != "true" ]; then
+          log "enforcement probe: classic protection on '$BASE_REF' requires contexts but enforce_admins=false, so an admin merger is not bound by them — not counting the classic surface"
+        else
+          # Producer check (#772 r5 P1). The same admin response carries
+          # `required_status_checks.checks[] = {context, app_id}`, so the
+          # producer is verifiable from a call already made. A context-only
+          # match would accept the required check being satisfied by some
+          # other app emitting that name.
+          set +e
+          # ANY matching entry with the trusted app is enough. Classic
+          # protection may list the same context more than once under
+          # different producers; taking `.[0]` would report not-enforced
+          # whenever a foreign entry happened to sort first, even though the
+          # expected producer IS explicitly required (#772 r6 P2).
+          classic_app=$(printf '%s' "$prot_out" | jq -r --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
+            if (.required_status_checks.checks | type) == "array"
+            then ([ .required_status_checks.checks[] | select(.context == $ctx) | .app_id | tostring ]) as $ids
+                 | if   ($ids | length) == 0 then "absent"
+                   elif ($ids | index($app)) then $app
+                   else ($ids | join(","))
+                   end
+            else "unknown" end' 2>"$err")
+          prot_rc=$?
+          set -e
+          if [ "$prot_rc" -ne 0 ] || [ "$classic_app" = "unknown" ]; then
+            log "enforcement probe: classic protection on '$BASE_REF' does not expose per-check producer data (no checks[] array) — cannot prove '$MERGE_CLEARANCE_CHECK_NAME' comes from the trusted workflow; not counting the classic surface"
+          elif [ "$classic_app" = "absent" ]; then
+            log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is not among the classic required checks on '$BASE_REF' — not counting the classic surface"
+          elif [ "$classic_app" != "$MERGE_CLEARANCE_EXPECTED_APP_ID" ]; then
+            log "enforcement probe: classic protection on '$BASE_REF' requires '$MERGE_CLEARANCE_CHECK_NAME' from app_id=$classic_app, not the expected $MERGE_CLEARANCE_EXPECTED_APP_ID — a same-named check from another producer is not proof; not counting the classic surface"
+          else
+            contexts="$contexts$parsed"$'\n'
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # Surface 2 — repository rulesets.
+  #
+  # --paginate is load-bearing: this endpoint pages at 30 applicable rules, and
+  # stacked rulesets can push the `required_status_checks` rule carrying
+  # $MERGE_CLEARANCE_CHECK_NAME onto page 2. A truncated first page is
+  # INDISTINGUISHABLE from an absent rule — same empty match, same log line —
+  # so the omission would silently and permanently disable arm 1 on such a repo
+  # instead of announcing itself.
+  #
+  # fetch_api_array() (which also paginates) is deliberately NOT reused here:
+  # it die()s with exit 2 on a failed fetch or flatten, which would turn an
+  # unreadable rulesets endpoint into a hard failure of the entire query
+  # instead of the conservative fall-through to arm 2 that this probe's
+  # contract promises. Hence the local set +e / rc capture.
+  #
+  # --paginate emits one JSON array per page, so the filter slurps (`-s`) and
+  # concatenates with `add`; `objects` keeps a non-object page element (an
+  # error envelope on a partial-failure page) from hard-erroring the filter
+  # mid-stream.
+  #
+  # $BASE_REF is percent-encoded before interpolation. A branch name is far
+  # more permissive than a URL path segment: `#` truncates the request at a
+  # fragment (querying `.../rules/branches/feat` for a base ref `feat#2`), `%`
+  # can form an accidental escape, and `?` starts a query string — each
+  # silently reads a DIFFERENT branch's rules, or none, and an empty result is
+  # indistinguishable from "not enforced". On a ruleset-only repo the classic
+  # GraphQL surface cannot compensate, so a genuinely enforced gate would be
+  # reported unproven and the rate-limit path would block unnecessarily.
+  # `/` is deliberately left RAW: GitHub addresses nested branch names
+  # (`release/1.0`) with literal slashes in this endpoint's `{branch}`
+  # parameter, so encoding it as %2F would break the common case to guard the
+  # rare one (#772 r1 P2).
+  set +e
+  out=$(gh api --paginate "repos/$REPO/rules/branches/$base_ref_enc" 2>"$err")
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    log "enforcement probe: ruleset read failed on '$BASE_REF' (gh rc=$rc): $(tr '\n' ' ' <"$err")"
+  else
+    # Only rules that carry OUR context matter, and each is kept only if its
+    # owning ruleset provably constrains the identity that will merge.
+    #
+    # `rules/branches` filters to rules enforced on the REQUESTING identity —
+    # here the CI reviewer token — but the account that runs the final
+    # `gh pr merge` is the AUTHOR identity. A ruleset whose `bypass_actors`
+    # lists that author therefore still appears in this response while not
+    # constraining the merge at all, and counting it would reproduce the exact
+    # defect this PR exists to remove: treating configuration as enforcement.
+    # `bypass_actors` is not returned by this endpoint, so each candidate
+    # ruleset is fetched and its bypass actors evaluated against the merging
+    # identity. A ruleset that cannot be read, or one carrying an actor whose
+    # applicability cannot be ruled out, is not proof — drop it and fall
+    # through to arm 2 (#772 r2 P1, refined by #781 item 11).
+    set +e
+    # A rule counts only when it requires OUR context FROM the trusted app.
+    # `integration_id` absent means the rule accepts the context from ANY
+    # producer, so an untrusted workflow emitting that name would satisfy it —
+    # not proof, and dropped here rather than trusted (#772 r5 P1).
+    #
+    # Each surviving rule is emitted as `<ruleset_id>|<source_type>|<source>`.
+    # The source metadata is load-bearing (#781 item 1): an ORG-level ruleset
+    # inherited by this repo appears in this response but does NOT exist at
+    # `repos/{owner}/{repo}/rulesets/{id}`, so a repo-only lookup 404s, the
+    # ruleset is discarded as unreadable, and arm 1 returns false permanently
+    # on every centrally governed repo. The endpoint is selected from
+    # `ruleset_source_type` / `ruleset_source` below.
+    ruleset_recs=$(printf '%s' "$out" \
+      | jq -r -s --arg ctx "$MERGE_CLEARANCE_CHECK_NAME" --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" '
+          add // []
+          | [ .[]? | objects
+              | select(.type == "required_status_checks")
+              | select([ .parameters.required_status_checks[]?
+                         | select(.context == $ctx)
+                         | select((.integration_id | tostring) == $app) ] | length > 0)
+              | { id: .ruleset_id,
+                  src_type: (.ruleset_source_type // "" | tostring),
+                  src: (.ruleset_source // "" | tostring) } ]
+          | map(select(.id != null)) | unique
+          | .[] | [ (.id | tostring), .src_type, .src ] | join("|")' 2>"$err")
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      log "enforcement probe: could not parse the ruleset response for '$BASE_REF': $(tr '\n' ' ' <"$err")"
+    elif [ -n "$ruleset_recs" ]; then
+      while IFS= read -r rs_rec; do
+        [ -n "$rs_rec" ] || continue
+        # Split on the first two `|`. Field-splitting via IFS is deliberately
+        # avoided: a tab/space IFS collapses adjacent empty fields, which would
+        # silently shift `ruleset_source` into the `ruleset_source_type` slot
+        # when the type is absent.
+        rs_id=${rs_rec%%|*}
+        rs_rest=${rs_rec#*|}
+        rs_src_type=${rs_rest%%|*}
+        rs_src=${rs_rest#*|}
+        if ! [[ "$rs_id" =~ ^[0-9]+$ ]]; then
+          log "enforcement probe: ruleset entry on '$BASE_REF' has a non-numeric id ('$rs_id') — not counting it"
+          continue
+        fi
+
+        # Endpoint selection from the OWNING scope (#781 item 1). Anything
+        # other than a repository or organization ruleset is not counted:
+        # an Enterprise ruleset is readable only through an enterprise-admin
+        # endpoint this token does not have, and an absent/unrecognized
+        # source type means the payload is not the shape this probe knows how
+        # to verify. Both are "cannot rule out" → conservative drop.
+        case "$rs_src_type" in
+          Repository)
+            rs_endpoint="repos/$REPO/rulesets/$rs_id"
+            ;;
+          Organization)
+            # $rs_src is interpolated into a URL path, so require a bare
+            # GitHub login shape — no slashes, no percent-escapes, nothing
+            # that could redirect the read at a different resource.
+            if ! [[ "$rs_src" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+              log "enforcement probe: ruleset $rs_id on '$BASE_REF' is organization-owned but its ruleset_source ('$rs_src') is not a bare org login — not counting it"
+              continue
+            fi
+            rs_endpoint="orgs/$rs_src/rulesets/$rs_id"
+            ;;
+          *)
+            log "enforcement probe: ruleset $rs_id carries '$MERGE_CLEARANCE_CHECK_NAME' on '$BASE_REF' but its owning scope is '${rs_src_type:-<absent>}' (source '${rs_src:-<absent>}'), which this probe cannot read to verify bypass actors — not counting it"
+            continue
+            ;;
+        esac
+
+        set +e
+        rs_out=$(gh api "$rs_endpoint" 2>"$err")
+        rs_rc=$?
+        set -e
+        if [ "$rs_rc" -ne 0 ]; then
+          log "enforcement probe: ruleset $rs_id carries '$MERGE_CLEARANCE_CHECK_NAME' on '$BASE_REF' but $rs_endpoint could not be read for bypass actors (gh rc=$rs_rc) — not counting it: $(tr '\n' ' ' <"$err")"
+          continue
+        fi
+        set +e
+        # Bypass-actor applicability (#781 item 11, refining #772 r2 P1).
+        #
+        # #772 r2 established that a bypass-capable ruleset must not count as
+        # enforcement, and implemented that as "ANY bypass actor disqualifies".
+        # That is sound but over-broad: a deployment App or a release Team in
+        # `bypass_actors` says nothing about whether the AUTHOR token running
+        # `gh pr merge` is unconstrained, so a genuinely protected merge was
+        # blocked. This narrows the rule to actors that provably cannot BE the
+        # merging identity, and leaves every other case exactly where #772 r2
+        # put it. The full decision, including the alternatives weighed, is
+        # recorded in
+        # docs/architecture/0002-merge-clearance-bypass-actor-applicability.md.
+        #
+        # The list is an ALLOWLIST of provably-inapplicable forms, never a
+        # blocklist: anything not named here — including an actor_type GitHub
+        # adds after this was written — falls through to "cannot rule out" and
+        # disqualifies the ruleset. Per actor type:
+        #
+        #   DeployKey       — RULED OUT. Deploy keys authenticate git transport
+        #                     only; the REST/GraphQL API rejects them, so a
+        #                     deploy key can never perform the PR merge whose
+        #                     protection this probe is asserting.
+        #   Integration     — RULED OUT when actor_id is a number other than
+        #                     $MERGE_CLEARANCE_EXPECTED_APP_ID. A GitHub App is
+        #                     a different principal from the user account
+        #                     `author_identity`, and REVIEW_POLICY.md §
+        #                     Automated merge identity requires the merge to run
+        #                     under an AUTHOR_MERGE_TOKEN verified to resolve to
+        #                     that user. The trusted Actions app is EXCLUDED
+        #                     from the rule-out because workflow steps in this
+        #                     repo do authenticate as it.
+        #   OrganizationAdmin, RepositoryRole, Team
+        #                   — NOT ruled out. Each is a SET of accounts that can
+        #                     contain `author_identity`, and deciding membership
+        #                     needs org/collaborator/team reads this token is not
+        #                     guaranteed to have — and membership can change
+        #                     between this probe and the merge. Fail closed.
+        #   anything else / missing actor_type
+        #                   — NOT ruled out.
+        #
+        # Every rule-out additionally requires the merging identity to be KNOWN
+        # and to be a user account: with `author_identity` absent from the
+        # governing policy, or set to a `[bot]` login, the "an App is not the
+        # merger" premise does not hold, so nothing is ruled out and behaviour
+        # is byte-identical to #772 r2.
+        #
+        # The `bypass_actors` key must still be PRESENT and an ARRAY.
+        # `[ .bypass_actors[]? ]` yields an empty list for an absent key or a
+        # null / non-array value too, so an unknown payload shape would be
+        # recorded as positive proof of "no bypass actors" — the one direction
+        # this probe must never move in (#772 r4).
+        rs_blocking=$(printf '%s' "$rs_out" \
+          | jq -r --arg app "$MERGE_CLEARANCE_EXPECTED_APP_ID" \
+                  --arg author "$MERGE_CLEARANCE_AUTHOR_IDENTITY" '
+            if (.bypass_actors | type) != "array" then "__unknown_shape__"
+            else
+              (($author | length) > 0 and (($author | test("\\[bot\\]$")) | not)) as $merger_known
+              | [ .bypass_actors[]
+                  | (.actor_type // "" | tostring) as $t
+                  | .actor_id as $id
+                  | if $merger_known and $t == "DeployKey" then empty
+                    elif $merger_known and $t == "Integration"
+                         and ($id | type) == "number"
+                         and (($id | tostring) != $app) then empty
+                    else (if $t == "" then "<no actor_type>" else $t end)
+                    end ]
+              | if length == 0 then "__none__" else (unique | join(", ")) end
+            end' 2>"$err")
+        rs_rc=$?
+        set -e
+        if [ "$rs_rc" -ne 0 ] || [ -z "$rs_blocking" ]; then
+          log "enforcement probe: could not evaluate bypass actors for ruleset $rs_id — not counting it: $(tr '\n' ' ' <"$err")"
+        elif [ "$rs_blocking" = "__unknown_shape__" ]; then
+          log "enforcement probe: ruleset $rs_id does not expose a bypass_actors array — not counting it"
+        elif [ "$rs_blocking" != "__none__" ]; then
+          log "enforcement probe: ruleset $rs_id requires '$MERGE_CLEARANCE_CHECK_NAME' but declares bypass actor(s) whose applicability to the merging identity '${MERGE_CLEARANCE_AUTHOR_IDENTITY:-<unknown>}' cannot be ruled out ($rs_blocking) — not counting it"
+        else
+          contexts="$contexts$MERGE_CLEARANCE_CHECK_NAME"$'\n'
+        fi
+      done <<EOF
+$ruleset_recs
+EOF
+    fi
+  fi
+
+  rm -f "$err"
+
+  if printf '%s' "$contexts" | grep -Fxq -- "$MERGE_CLEARANCE_CHECK_NAME"; then
+    return 0
+  fi
+  # Render the observed contexts QUOTED and comma-separated. Every name this
+  # probe compares against contains spaces — `Merge clearance gate`,
+  # `Self-Review Required` — so a space-joined list is ambiguous exactly where
+  # it matters: in `[Label Gate Self-Review Required lint]` a reader cannot
+  # tell three contexts from five, nor whether `Merge clearance gate` is
+  # present as one entry or only as fragments of its neighbours — which is
+  # the one thing this log line exists to let an operator check.
+  # awk (already required by the preflight) formats it; \047 is the octal
+  # escape for a single quote, same idiom as nested_field above. NF skips the
+  # blank line left by the trailing newline on $contexts.
+  observed=$(printf '%s' "$contexts" | awk 'NF { printf "%s\047%s\047", sep, $0; sep=", " }' || true)
+  log "enforcement probe: '$MERGE_CLEARANCE_CHECK_NAME' is NOT among the required status checks observable on base '$BASE_REF' (observed: [$observed])"
+  return 1
+}
+
+# A comment from github-actions[bot] is not provenance: a same-repo PR
+# workflow can mint it. Re-run the byte verifier from this trusted checkout.
+# 0=faithful live mirror, 1=not a mirror, 2=unprovable. Query modes preserve
+# the indeterminate result; full merge checks add review when uncertain.
+lane_verified() {
+  printf '%s' "$PR_JSON" | bash "$SCRIPT_DIR/workflow/verify-live-propagation.sh" \
+    "$REPO" "$PR_NUMBER" "$HEAD_SHA" "$BASE_SHA" "$POLICY_CONFIG" >/dev/null
+}
+
+# --- fetch PR metadata ------------------------------------------------------
+
+log "PR $REPO#$PR_NUMBER — fetching metadata"
+
+PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) \
+  || die 2 "failed to fetch PR metadata: $PR_JSON"
+
+HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+BASE_SHA=$(echo "$PR_JSON" | jq -r '.base.sha // ""')
+EXPECTED_HEAD_SHA=${MERGE_CLEARANCE_EXPECTED_HEAD_SHA:-}
+EXPECTED_BASE_REF=${MERGE_CLEARANCE_EXPECTED_BASE_REF:-}
+EXPECTED_BASE_SHA=${MERGE_CLEARANCE_EXPECTED_BASE_SHA:-}
+MATERIALIZE_BASE_POLICY=${MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY:-false}
+case "$MATERIALIZE_BASE_POLICY" in
+  true|false) ;;
+  *) die 2 "MERGE_CLEARANCE_MATERIALIZE_DEFAULT_POLICY must be true|false" ;;
+esac
+
+# --- PR-base review policy (#763) -------------------------------------------
+#
+# Every policy decision this gate makes must be judged by the policy of the
+# branch the PR TARGETS, not by this trusted default-branch checkout. That
+# includes the gate-enable switches, not just threshold/paths: if the default
+# branch has codex.external_review_gate.enabled:false while the PR base
+# enables it, parsing the switch from the default branch makes the whole
+# external arm vacuous and the required check passes a PR the base policy
+# requires it to gate (Codex P1 on #767). So the base policy is resolved HERE,
+# before any switch is read, and POLICY_CONFIG then feeds nested_field.
+#
+# SCOPED DELIBERATELY to non-default bases. When a PR targets the default
+# branch — the overwhelming majority, including every propagation sync PR —
+# the base policy IS the default-branch policy this job already has checked
+# out, so there is nothing to fetch and behaviour is byte-identical to before.
+# Restricting the call this way keeps a new contents-API dependency (and its
+# rate-limit / token-scope exposure) off the path that every consumer PR takes,
+# instead of making the whole fleet depend on an endpoint this gate never
+# needed before.
+#
+# On a NON-default base the fetch is load-bearing, so a failure other than a
+# confirmed 404 (a base predating the policy file) is an infrastructure error:
+# die 2, exactly as this script already does for a failed PR-metadata fetch.
+# Silently substituting the default-branch policy there is the bypass itself.
+BASE_REF=$(echo "$PR_JSON" | jq -r '.base.ref // ""')
+DEFAULT_BRANCH=$(echo "$PR_JSON" | jq -r '.base.repo.default_branch // ""')
+if [ -n "$EXPECTED_HEAD_SHA" ] && [ "$HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+  die 2 "PR head changed from expected $EXPECTED_HEAD_SHA to ${HEAD_SHA:-unknown} before requiredness evaluation"
+fi
+if [ -n "$EXPECTED_BASE_REF" ] && [ "$BASE_REF" != "$EXPECTED_BASE_REF" ]; then
+  die 2 "PR base ref changed from expected $EXPECTED_BASE_REF to ${BASE_REF:-unknown} before requiredness evaluation"
+fi
+if [ -n "$EXPECTED_BASE_SHA" ] && [ "$BASE_SHA" != "$EXPECTED_BASE_SHA" ]; then
+  die 2 "PR base sha changed from expected $EXPECTED_BASE_SHA to ${BASE_SHA:-unknown} before requiredness evaluation"
+fi
+RESOLVE_POLICY_BIN="${MERGE_CLEARANCE_WORKFLOW_DIR:-$SCRIPT_DIR/workflow}/resolve_base_policy.sh"
+if [ ! -f "$RESOLVE_POLICY_BIN" ]; then
+  # Broken install (the resolver ships with this gate via .mergepath-sync.yml).
+  # Degrade ONLY where the degradation is provably a no-op — a PR targeting the
+  # DEFAULT branch, where the checked-out config IS the governing policy. There,
+  # a missing resolver changes nothing, and hard-failing would turn a mid-sync
+  # consumer into a red required check for no safety gain.
+  #
+  # For a NON-DEFAULT base the same fallback is the unsafe downgrade this whole
+  # change exists to prevent: the gate would evaluate the threshold, protected
+  # paths, reviewer allow-list, and enable switches from a looser default-branch
+  # policy and could clear a PR the base policy would block. That is an
+  # infrastructure failure in a required merge gate — fail closed (Codex P1 on
+  # #768). BASE_REF/DEFAULT_BRANCH come from PR_JSON, so this decision does not
+  # itself need the resolver.
+  # POSITIVE proof required, phrased as such: degrade only when both fields are
+  # present AND equal. The earlier form tested `!=`, so EMPTY metadata — an
+  # undeterminable base — fell through to the degrade branch, which is an
+  # assumption, not proof (CodeRabbit Major on #768). Same rule the resolver
+  # applies: "unknown" is not proof.
+  if [ "$MATERIALIZE_BASE_POLICY" = "true" ]; then
+    echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) while exact-base policy materialization is required — refusing checkout-policy fallback" >&2
+    exit 2
+  fi
+  if [ -z "$BASE_REF" ] || [ -z "$DEFAULT_BRANCH" ] || [ "$BASE_REF" != "$DEFAULT_BRANCH" ]; then
+    echo "ERROR: policy resolver missing ($RESOLVE_POLICY_BIN) and this PR is not provably against the default branch (base='$BASE_REF' default='$DEFAULT_BRANCH') — refusing to evaluate it against the default-branch policy" >&2
+    exit 2
+  fi
+  echo "WARNING: policy resolver missing ($RESOLVE_POLICY_BIN); PR provably targets the default branch, so the checked-out policy already governs" >&2
+  RESOLVED_POLICY="$CONFIG"
+  resolve_rc=0
+else
+# stdout is the policy PATH, stderr is diagnostics — keep them separate so a
+# warning cannot be concatenated into the path (#715/#716 class).
+RESOLVE_ERR=$(mktemp "${TMPDIR:-/tmp}/mcg-resolve-err.XXXXXX")
+MATERIALIZE_ARG=""
+[ "$MATERIALIZE_BASE_POLICY" = "true" ] && MATERIALIZE_ARG="--materialize-default"
+set +e
+RESOLVED_POLICY=$(bash "$RESOLVE_POLICY_BIN" \
+  --repo "$REPO" --base-ref "$BASE_REF" --base-sha "$BASE_SHA" \
+  --default-branch "$DEFAULT_BRANCH" --default-config "$CONFIG" \
+  ${MATERIALIZE_ARG:+"$MATERIALIZE_ARG"} 2>"$RESOLVE_ERR")
+resolve_rc=$?
+set -e
+RESOLVE_MSG=$(cat "$RESOLVE_ERR" 2>/dev/null || true)
+rm -f "$RESOLVE_ERR"
+if [ "$resolve_rc" -ne 0 ]; then
+  echo "ERROR: could not resolve the governing review policy: $RESOLVE_MSG" >&2
+  exit 2
+fi
+fi
+POLICY_CONFIG="$RESOLVED_POLICY"
+# Only a fetched base policy lives in TMPDIR and needs cleanup; the
+# default-config path is the repo checkout.
+case "$POLICY_CONFIG" in
+  "$CONFIG") ;;
+  *) BASE_POLICY_TMP="$POLICY_CONFIG" ;;
+esac
+
+# The account that runs the final `gh pr merge` (#781 item 11). Read from the
+# GOVERNING policy, same as every other gating input, because that is the value
+# REVIEW_POLICY.md § Automated merge identity requires AUTHOR_MERGE_TOKEN to
+# resolve to before any automated merge, and the value gh-pr-guard.sh enforces
+# on manual author writes. It is used ONLY to rule bypass actors OUT in the
+# enforcement probe; absent or unparseable, nothing is ruled out and the probe
+# keeps the stricter #772 r2 behaviour. Quote-tolerant, matching the sibling
+# policy parsers.
+MERGE_CLEARANCE_AUTHOR_IDENTITY=$(grep -m1 '^author_identity:' "$POLICY_CONFIG" 2>/dev/null \
+  | awk '{print $2}' | sed -E "s/^[\"']//; s/[\"']\$//" || true)
+MERGE_CLEARANCE_AUTHOR_IDENTITY=${MERGE_CLEARANCE_AUTHOR_IDENTITY:-}
+
+DEPENDABOT_GATE_ENABLED=$(nested_field dependabot reviewer_gate enabled)
+DEPENDABOT_GATE_ENABLED=${DEPENDABOT_GATE_ENABLED:-false}
+case "$DEPENDABOT_GATE_ENABLED" in
+  true|false) ;;
+  *)
+    echo "ERROR: dependabot.reviewer_gate.enabled must be true|false; got '$DEPENDABOT_GATE_ENABLED'" >&2
+    exit 2
+    ;;
+esac
+
+EXTERNAL_GATE_ENABLED=$(nested_field codex external_review_gate enabled)
+EXTERNAL_GATE_ENABLED=${EXTERNAL_GATE_ENABLED:-false}
+case "$EXTERNAL_GATE_ENABLED" in
+  true|false) ;;
+  *)
+    echo "ERROR: codex.external_review_gate.enabled must be true|false; got '$EXTERNAL_GATE_ENABLED'" >&2
+    exit 2
+    ;;
+esac
+
+PR_AUTHOR=$(echo "$PR_JSON" | jq -r '.user.login')
+if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
+  die 2 "could not determine HEAD sha for PR #$PR_NUMBER"
+fi
+
+HAS_EXTERNAL_LABEL=$(echo "$PR_JSON" \
+  | jq -r 'if any(.labels[]?.name; . == "needs-external-review") then "true" else "false" end')
+
+log "HEAD = $HEAD_SHA    author = $PR_AUTHOR    needs-external-review = $HAS_EXTERNAL_LABEL"
+
+# Human-controlled holds precede every clearance exemption (#1277).
+# needs-external-review keeps its existing delegated clearance semantics;
+# the derivation queries answer coverage/applicability, not merge permission.
+if [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+  HOLD_LABELS=$(printf '%s' "$PR_JSON" \
+    | jq -r '.labels[]?.name | select(. != "needs-external-review")' \
+    | mergepath_blocking_labels_csv)
+  if [ -n "$HOLD_LABELS" ]; then
+    block "human-controlled blocking labels present: $HOLD_LABELS. A human must release the hold before merge clearance."
+  fi
+fi
+
+# --- non-reviewer approval assertion (#1080) --------------------------------
+#
+# Runs on EVERY lane, ahead of the class dispatch, because the lanes below are
+# the gap it closes. The Dependabot and external-review arms already validate
+# the approving identity against `available_reviewers`; an ORDINARY
+# under-threshold PR is judged by neither, so no gate has ever examined WHO
+# approved it. GitHub's own branch protection counts an approval from any
+# account with write access, which includes a CI service account.
+#
+# That is not hypothetical. On 2026-08-22 a stale agent->1Password-item map
+# handed a local Codex session the nathanpayne-robot CI token; it posted two
+# APPROVED reviews on nathanjohnpayne/nathanpaynedotcom#668, a one-approval
+# repo. The PR read APPROVED/CLEAN and this gate passed, because the PR was
+# ordinary and the identity arms never ran. The local PreToolUse hook that was
+# supposed to refuse the write had failed open on an unset variable, so the
+# only surviving defence was a layer that was not looking.
+#
+# Deny-list, not allow-list, and that asymmetry is deliberate. An allow-list of
+# `available_reviewers` would have to answer "is this login a human?" to avoid
+# blocking legitimate human approvals, and GitHub gives no such signal — a
+# service account and a person are both `type: "User"`. A deny-list of the
+# identities this repo has DECLARED to be non-reviewers has no false positives
+# and encodes a claim REVIEW_POLICY.md already makes in prose.
+#
+# An absent or empty `non_reviewer_identities` is a legitimate configuration
+# meaning "no such identity here" and makes this check inert. That keeps a repo
+# that has not adopted the key working exactly as before rather than failing on
+# a key it does not carry; the cost is that the protection is opt-in per repo.
+#
+# Query modes are deliberately exempt: --derive-rate-limit-protection answers a
+# narrow question about bot review coverage, and folding an unrelated identity
+# verdict into that boolean would change what its callers think they asked.
+if [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+  NON_REVIEWERS=$(read_non_reviewer_identities "$POLICY_CONFIG")
+  # A key present with an inline value the block reader cannot consume -- a
+  # YAML flow list or a bare scalar -- parses to NOTHING and is otherwise
+  # indistinguishable from an absent key. Treating it as absent is a silent
+  # fail-OPEN: the repo looks like it declared its service account and gets no
+  # protection. Refuse to run rather than pretend the key is not there.
+  if [ -z "$NON_REVIEWERS" ] \
+     && policy_list_has_unconsumed_inline_value non_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "non_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line). Refusing to run a gate that would silently pass."
+  fi
+  # #2726: the CI app that may resolve review threads is a non-reviewer by
+  # construction. Its identity mode refuses to run unless the app is declared
+  # above, and this union keeps its approval from counting even in a policy
+  # that names the app but omits that declaration. Taken as written, without
+  # validation: deny-listing a malformed value costs nothing.
+  CI_APP_IDENTITY=$(read_thread_resolution_ci_app_identity "$POLICY_CONFIG")
+  if [ -n "$CI_APP_IDENTITY" ] && ! login_is_non_reviewer_identity "$CI_APP_IDENTITY" "$POLICY_CONFIG"; then
+    NON_REVIEWERS=$(printf '%s\n%s\n' "$NON_REVIEWERS" "$CI_APP_IDENTITY" | sed '/^$/d')
+  fi
+  if [ -n "$NON_REVIEWERS" ]; then
+    NON_REVIEWERS_JSON=$(echo "$NON_REVIEWERS" | jq -R . | jq -s .)
+    NR_REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+
+    # Same latest-state-per-reviewer collapse the Dependabot arm uses, with the
+    # membership test inverted -- and deliberately WITHOUT that arm's
+    # commit_id == HEAD pin.
+    #
+    # HEAD-pinning here was a bug, caught by Codex on #1080. Whether an
+    # approval from an earlier commit still counts is decided by
+    # `dismiss_stale_reviews`, which this script cannot see and must not
+    # assume: with it OFF, GitHub keeps counting the older approval, so a
+    # HEAD-pinned check passes while the merge bypass this gate exists to close
+    # is still open -- the non-reviewer only has to approve, then push. The
+    # repo does not even agree with itself about that setting: the live API
+    # reports dismiss_stale_reviews=true on mergepath and three consumers,
+    # while .github/workflows/agent-review.yml's auto-merge arming path
+    # documents it as OFF and relies on the approval carrying across a push.
+    #
+    # A deny-list pays nothing for the wider scope. A declared non-reviewer
+    # should hold no standing approval on this PR at ANY commit, so there is no
+    # false positive to trade against -- unlike the Dependabot arm, where the
+    # pin exists to reject a STALE approval as insufficient (#427).
+    #
+    # Filtering to the opinionated states before the collapse is still
+    # load-bearing and mirrors GitHub: a COMMENTED review does not supersede an
+    # APPROVED one, so a naive "most recent review" would let a later comment
+    # mask a standing approval. A push that dismisses the approval flips the
+    # latest state to DISMISSED, which correctly clears this gate.
+    NR_APPROVERS=$(echo "$NR_REVIEWS_JSON" | jq -r \
+      --argjson deny "$NON_REVIEWERS_JSON" '
+        [ .[]
+          | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          | select(.user.login as $u | $deny | index($u))
+        ]
+        | group_by(.user.login)
+        | map(max_by(.submitted_at))
+        | map(select(.state == "APPROVED"))
+        | map(.user.login)
+        | unique
+        | join(", ")
+      ')
+
+    if [ -n "$NR_APPROVERS" ]; then
+      block "standing APPROVED review on this PR from an identity this repo declares a non-reviewer: $NR_APPROVERS. Such an account holds no reviewer standing and its approval must not satisfy branch protection (see REVIEW_POLICY.md, non_reviewer_identities). Dismiss the review, then find out which process is holding that token."
+    fi
+    log "non-reviewer check: no standing approval anywhere on this PR from [$(echo "$NON_REVIEWERS" | tr '\n' ' ' | sed 's/ $//')]"
+  fi
+fi
+
+# --- class dispatch ---------------------------------------------------------
+#
+# Dependabot is checked FIRST and uses the narrower rule (CLI reviewer
+# APPROVED on HEAD only — Codex does not review Dependabot PRs). This
+# mirrors pr-audit.yml Check 2's precedence: a Dependabot PR that also
+# carries needs-external-review is still judged by the Dependabot rule.
+#
+# The narrower rule is earned by the COMMITS, not by the opener. A PR opened
+# by dependabot[bot] can carry additional commits from anyone with push
+# access, and it is still "authored by dependabot[bot]". So the arm applies
+# only when every commit on the PR, including the current HEAD, is
+# Dependabot-authored, GitHub-committed and signature-verified
+# (scripts/lib/dependabot-commit-provenance.sh). A PR that fails that
+# predicate is judged exactly like any other PR below — threshold /
+# protected-path derivation and the Phase 4 predicate — in the full gate AND
+# in the query modes. An unreadable commit list establishes nothing and fails
+# closed (exit 2) rather than choosing a lane.
+DEPENDABOT_LANE=false
+if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+  provenance_rc=0
+  dependabot_commit_provenance "$REPO" "$PR_NUMBER" "$HEAD_SHA" || provenance_rc=$?
+  case "$provenance_rc" in
+    0)
+      DEPENDABOT_LANE=true
+      log "Dependabot provenance: $DEPENDABOT_PROVENANCE_REASON"
+      ;;
+    1)
+      log "Dependabot provenance: NOT Dependabot-only — $DEPENDABOT_PROVENANCE_REASON. Judging this PR as an ordinary PR (external-review / Phase 4 derivation), not by the Dependabot rule."
+      # A native auto-merge request armed while the head was Dependabot-only
+      # survives a push by a write collaborator, and the workflow job that
+      # withdraws it is neither required nor ordered before this gate. While
+      # that request stands, ordinary clearance (e.g. under threshold) could
+      # release the merge before the withdrawal lands, so the full gate
+      # blocks until the request is gone. The query modes answer
+      # applicability only and keep the ordinary derivation.
+      if [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+        DEP_AUTO_MERGE=$(printf '%s' "$PR_JSON" | jq -r 'if has("auto_merge") then (if .auto_merge == null then "none" else "armed" end) else "unknown" end')
+        case "$DEP_AUTO_MERGE" in
+          none) ;;
+          armed)
+            block "Dependabot-opened PR is no longer Dependabot-only ($DEPENDABOT_PROVENANCE_REASON) and still carries a native auto-merge request armed for an earlier head. Withdraw the auto-merge request (the Dependabot auto-merge workflow does this on its next run); the PR is then judged as an ordinary PR."
+            ;;
+          *)
+            die 2 "could not read the auto-merge state of Dependabot-opened PR #$PR_NUMBER that failed commit provenance"
+            ;;
+        esac
+      fi
+      ;;
+    *)
+      die 2 "could not verify Dependabot commit provenance on HEAD $HEAD_SHA: $DEPENDABOT_PROVENANCE_REASON"
+      ;;
+  esac
+fi
+
+# #2874: a Dependabot-only approver (dependabot_reviewer_identities) holds
+# standing on the provenance-verified Dependabot lane and nowhere else. It is a
+# write collaborator, so GitHub's native required-review count accepts its
+# approval on ANY PR; leaving it out of available_reviewers does not stop that.
+# Outside the lane it is therefore a non-reviewer: the same latest-state,
+# whole-PR (not HEAD-pinned) deny check as non_reviewer_identities above, for
+# the same dismiss_stale_reviews reason. An identity also listed in
+# available_reviewers is a misconfiguration the docs warn against; it keeps its
+# general standing rather than blocking every PR it approves. Query modes are
+# exempt for the reason given above.
+if [ "$DEPENDABOT_LANE" != "true" ] && [ "$DERIVE_ONLY" != "true" ] && [ "$PHASE_4_DERIVE_ONLY" != "true" ] && [ "$RATE_LIMIT_PROTECTION_ONLY" != "true" ]; then
+  # An `if`, not an `&&` chain: a chain whose last entry is filtered out ends
+  # the loop with status 1, which set -euo pipefail turns into a gate exit.
+  DEPENDABOT_ONLY=$(read_dependabot_reviewer_identities "$POLICY_CONFIG" | while IFS= read -r _id; do
+    if [ -n "$_id" ] && ! login_is_available_reviewer "$_id" "$POLICY_CONFIG"; then
+      printf '%s\n' "$_id"
+    fi
+  done)
+  if [ -z "$(read_dependabot_reviewer_identities "$POLICY_CONFIG")" ] \
+     && policy_list_has_unconsumed_inline_value dependabot_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "dependabot_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line)."
+  fi
+  if [ -n "$DEPENDABOT_ONLY" ]; then
+    DEPENDABOT_ONLY_JSON=$(echo "$DEPENDABOT_ONLY" | jq -R . | jq -s .)
+    DO_REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+    DO_APPROVERS=$(echo "$DO_REVIEWS_JSON" | jq -r \
+      --argjson deny "$DEPENDABOT_ONLY_JSON" '
+        [ .[]
+          | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+          | select(.user.login as $u | $deny | index($u))
+        ]
+        | group_by(.user.login)
+        | map(max_by(.submitted_at))
+        | map(select(.state == "APPROVED"))
+        | map(.user.login)
+        | unique
+        | join(", ")
+      ')
+    if [ -n "$DO_APPROVERS" ]; then
+      block "standing APPROVED review from a Dependabot-only approver ($DO_APPROVERS) on a PR outside the provenance-verified Dependabot lane. That identity may approve Dependabot PRs only (dependabot_reviewer_identities, mergepath#2874); its approval must not satisfy branch protection here. Dismiss the review, then find out why that token approved a non-Dependabot PR."
+    fi
+    log "Dependabot-only approver check: no standing approval on this non-Dependabot PR from [$(echo "$DEPENDABOT_ONLY" | tr '\n' ' ' | sed 's/ $//')]"
+  fi
+fi
+
+if [ "$DEPENDABOT_LANE" = "true" ]; then
+  if [ "$DERIVE_ONLY" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+    # Query mode always returns FALSE for a Dependabot PR (automated-4b P1).
+    # The query consumers ask a NARROW question: will this PR be protected
+    # from bot-unreviewed auto-merge after CodeRabbit rate-limits? The
+    # Dependabot reviewer gate is NOT such a gate: when enabled it blocks
+    # until a reviewer-identity APPROVED (a human/CLI approval, which
+    # dependabot-auto-merge supplies automatically), and Codex does not
+    # review Dependabot PRs at all. So neither gate state guarantees a bot
+    # reviewed the head. Returning true here would let the rc=5 branch
+    # downgrade a CodeRabbit rate-limit stall on an approved Dependabot PR
+    # and merge it with NEITHER bot having reviewed (the #512 r3 hazard).
+    # The FULL gate below still enforces the reviewer-APPROVED requirement
+    # for the actual merge.
+    printf 'false\n'
+    exit 0
+  fi
+  if [ "$DEPENDABOT_GATE_ENABLED" != "true" ]; then
+    clear_pass "Dependabot PR and dependabot.reviewer_gate.enabled=false (gate disabled)"
+  fi
+
+  log "Dependabot path: requiring a reviewer-identity APPROVED review on HEAD"
+
+  # $POLICY_CONFIG, not $CONFIG (#769): the reviewer allow-list must come from
+  # the SAME policy as the gate-enable switch and the threshold. Reading it
+  # from the default branch while the switch came from the base was the
+  # half-threaded state the #767 review flagged. Passed explicitly rather than
+  # left to the helper's $CONFIG fallback, which would resolve to the
+  # default-branch path and silently reintroduce that split.
+  if [ -z "$(read_available_reviewers "$POLICY_CONFIG")" ]; then
+    die 2 "no available_reviewers found in $POLICY_CONFIG"
+  fi
+  # #2874: this lane, and only this lane, also accepts the Dependabot-only
+  # approver identities. A flow list or scalar would parse to nothing; fail
+  # loudly rather than let a declared identity look absent.
+  if [ -z "$(read_dependabot_reviewer_identities "$POLICY_CONFIG")" ] \
+     && policy_list_has_unconsumed_inline_value dependabot_reviewer_identities "$POLICY_CONFIG"; then
+    die 2 "dependabot_reviewer_identities in $POLICY_CONFIG carries an inline value this reader cannot parse (use a dash-prefixed block list, one identity per line)."
+  fi
+  REVIEWERS=$(read_dependabot_approvers "$POLICY_CONFIG")
+  REVIEWERS_JSON=$(echo "$REVIEWERS" | jq -R . | jq -s .)
+
+  REVIEWS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/reviews" "reviews")
+
+  # Latest-state-per-reviewer APPROVED on the current HEAD, from a
+  # reviewer identity that is not the PR author. Mirrors the proven
+  # filter shape in codex-review-check.sh gate (c) Phase-4b-substitute:
+  # collapse each reviewer's review history on HEAD to their most-recent
+  # opinionated state, then accept only if that latest state is APPROVED.
+  # A reviewer who APPROVED then later submitted CHANGES_REQUESTED on the
+  # same HEAD does NOT clear (stale APPROVED rejected). commit_id == HEAD
+  # is the HEAD pinning that closes the #427 escape.
+  APPROVER=$(echo "$REVIEWS_JSON" | jq -r \
+    --argjson reviewers "$REVIEWERS_JSON" \
+    --arg author "$PR_AUTHOR" \
+    --arg sha "$HEAD_SHA" '
+      [ .[]
+        | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+        | select(.commit_id == $sha)
+        | select(.user.login as $u | $reviewers | index($u))
+        | select(.user.login != $author)
+      ]
+      | group_by(.user.login)
+      | map(max_by(.submitted_at))
+      | map(select(.state == "APPROVED"))
+      | first
+      | if . == null then "" else .user.login end
+  ')
+
+  if [ -n "$APPROVER" ]; then
+    clear_pass "Dependabot PR has a latest-state APPROVED review on HEAD $HEAD_SHA from $APPROVER"
+  fi
+  block "Dependabot PR has no reviewer-identity APPROVED review on the merge HEAD $HEAD_SHA. The dependabot-auto-merge approval is missing or was dismissed on a push; a fresh reviewer-identity approval on this HEAD is required (mergepath#427)."
+fi
+
+# --- external-review applicability (DERIVED, not label-trusting) -----------
+#
+# #429 Codex P1: keying the external arm on the CURRENT label state would
+# reintroduce the exact stale-label race this gate exists to close. After a
+# push, this gate can run on `synchronize` BEFORE pr-review-policy.yml
+# re-adds `needs-external-review` for the new HEAD; a label-only check would
+# then fall through to "not applicable" and go GREEN on an uncleared HEAD
+# (the #428 escape, reopened). So derive applicability from the PR's
+# INTRINSIC properties — the same line-threshold + protected-paths
+# computation pr-review-policy.yml's External Review Check uses — and treat
+# the label, when present, as an additional force-on signal (a human may
+# add it to a small PR). Config (threshold + paths) is read from the
+# TRUSTED default-branch review-policy.yml; the changed-file set comes from
+# the API (this gate runs on a default-branch checkout with no local PR
+# diff). Propagation PRs are NOT special-cased: they reach clearance via
+# codex-review-check.sh's internal-reviewer-APPROVED-on-HEAD (Phase-4b
+# substitute) path, consistent with the lane's standard "internal
+# reviewer-identity APPROVED required" rule.
+
+# Query mode with the external arm disabled: nothing downstream gates the
+# merge on review state — report vacuous.
+if [ "$DERIVE_ONLY" = "true" ] && [ "$EXTERNAL_GATE_ENABLED" != "true" ]; then
+  printf 'false\n'
+  exit 0
+fi
+
+if [ "$EXTERNAL_GATE_ENABLED" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+  REQUIRES_EXTERNAL=false
+  REQUIRES_REASON=""
+  # #2247: set where applicability is forced on because the derivation could
+  # not run. A not-cleared verdict reached through it is not reported as
+  # pending: the gate does not know whether external review applies at all.
+  REQUIRES_FAIL_CLOSED=false
+
+  if [ "$HAS_EXTERNAL_LABEL" = "true" ]; then
+    # Label present forces the arm on (a human may add it to a small PR;
+    # or the propagation lane RE-ADDED it after a divergence). Not subject
+    # to the propagation exemption below — a present label means the lane's
+    # latest per-pair verdict is "needs review."
+    REQUIRES_EXTERNAL=true
+    REQUIRES_REASON="needs-external-review label present"
+  elif lane_verified; then
+    # The trusted live verifier just verified THIS head/base pair. A lane
+    # marker is diagnostic only; it does not grant this exemption. A later
+    # head/base move requires fresh verification. The force-on label above
+    # still takes precedence over this predicate (#429).
+    log "verified propagation lane (trusted live byte verification for $HEAD_SHA/$BASE_SHA, label absent) — exempt from external-review derivation"
+  else
+    lane_rc=$?
+    # Indeterminate live verification (rc 2): in the FULL gate, falling
+    # through to threshold/paths derivation is fail-safe (external review can only be
+    # ADDED, never removed, so an uncertain read at worst over-requires and
+    # blocks). But in the query modes, `true` is the value that authorizes
+    # the rc=5 CodeRabbit downgrade, and a verified propagation PR's real
+    # Merge clearance gate is already green via the exemption — so an
+    # unknowable exemption state here must NOT assert requiredness or
+    # protection. Fail closed to the caller instead (the rc=5 branch reads a
+    # nonzero query as false → block). automated-4b round-5 P1.
+    if [ "${lane_rc:-0}" -eq 2 ] && { [ "$DERIVE_ONLY" = "true" ] || [ "$PHASE_4_DERIVE_ONLY" = "true" ] || [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; }; then
+      die 2 "propagation-lane marker read was indeterminate (comments API fetch/parse failed) in query mode for $HEAD_SHA; refusing to assert external-review requiredness/protection (fail-closed)"
+    fi
+    # `|| true` so a missing key (grep no-match → pipeline non-zero under
+    # pipefail) does NOT abort the script before the `:-300` fallback runs
+    # (CodeRabbit ⚠️ on PR #429).
+    THRESHOLD=$(grep -E '^external_review_threshold:' "$POLICY_CONFIG" 2>/dev/null | awk '{print $2}' || true)
+    THRESHOLD=${THRESHOLD:-300}
+    if ! [[ "$THRESHOLD" =~ ^[0-9]+$ ]]; then THRESHOLD=300; fi
+
+    FILES_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/files" "PR files")
+
+    # Sum additions+deletions, excluding the same generated/lockfile
+    # patterns pr-review-policy.yml's git-diff pathspec excludes.
+    LINES_CHANGED=$(echo "$FILES_JSON" | jq '
+      [ .[]
+        | select((.filename
+            | test("(\\.lock$)|(lock\\.json$)|(\\.min\\.js$)|(\\.min\\.css$)|(\\.generated\\.)|(\\.g\\.dart$)|(\\.freezed\\.dart$)")) | not)
+        | ((.additions // 0) + (.deletions // 0)) ]
+      | add // 0')
+    LINES_CHANGED=${LINES_CHANGED:-0}
+
+    # GitHub caps the pull-request files listing at 3000 entries. AT the cap the
+    # inventory may be truncated, which makes both tests below unsound: the
+    # lines total is a floor rather than the diff, and the protected-path match
+    # is reading an incomplete file list. Either can say "under threshold,
+    # nothing protected" about a PR that is neither.
+    #
+    # scripts/workflow/external_review_fingerprint.sh has forced requires_review
+    # at this bound since #427; this derivation did not, so the two
+    # implementations of the same question disagreed in the FAIL-OPEN direction
+    # on exactly the largest PRs. The live consumer is
+    # scripts/workflow/approval-independence-check.sh (#1094), which feeds this
+    # answer to the self-approval detector as `requiresExternalReview` — so a
+    # spurious `false` weakens approval independence precisely where the diff is
+    # too large to review casually.
+    #
+    # Keep this bound in step with the fingerprint helper's.
+    PR_FILES_CAP=3000
+    FILES_COUNT=$(echo "$FILES_JSON" | jq 'length')
+    FILES_COUNT=${FILES_COUNT:-0}
+
+    if [ "$FILES_COUNT" -ge "$PR_FILES_CAP" ]; then
+      REQUIRES_EXTERNAL=true
+      REQUIRES_REASON="PR files API returned $FILES_COUNT files; treating as external review required because GitHub may have capped the diff"
+    elif [ "$LINES_CHANGED" -ge "$THRESHOLD" ]; then
+      REQUIRES_EXTERNAL=true
+      REQUIRES_REASON="$LINES_CHANGED lines changed >= threshold $THRESHOLD"
+    else
+      # Protected-paths match, reusing the SAME helpers pr-review-policy.yml
+      # uses (no drift). Resolved relative to this script so they work from a
+      # trusted default-branch checkout; they take the config path + read
+      # candidate filenames on stdin (no filesystem access to PR content).
+      # MERGE_CLEARANCE_WORKFLOW_DIR overrides the helper dir (tests only).
+      #
+      # Fail CLOSED on any failure to RUN the matcher (missing helper, parse
+      # error, match error): a protected-path PR must never slip through as
+      # "threshold-only" just because the matcher couldn't run. The helpers
+      # ship with this gate via .mergepath-sync.yml, so their absence means a
+      # broken install — require external review rather than skip it.
+      # (CodeRabbit ⚠️ Major on PR #429.) Note: a SUCCESSFUL parse that
+      # yields no entries (external_review_paths absent/empty) is NOT a
+      # failure — it legitimately means "no protected paths," so the gate
+      # does not fail closed in that case.
+      WF_DIR="${MERGE_CLEARANCE_WORKFLOW_DIR:-$SCRIPT_DIR/workflow}"
+      PARSE="$WF_DIR/parse_policy_list.sh"
+      MATCH="$WF_DIR/match_protected_paths.sh"
+      if [ ! -f "$PARSE" ] || [ ! -f "$MATCH" ]; then
+        REQUIRES_EXTERNAL=true
+        REQUIRES_REASON="protected-paths check unavailable (parser/matcher missing under $WF_DIR) — failing closed"
+        REQUIRES_FAIL_CLOSED=true
+      else
+        set +e
+        PATHS=$(bash "$PARSE" "$POLICY_CONFIG" external_review_paths)
+        parse_rc=$?
+        set -e
+        if [ "$parse_rc" -ne 0 ]; then
+          REQUIRES_EXTERNAL=true
+          REQUIRES_REASON="protected-paths parse failed (rc=$parse_rc) — failing closed"
+          REQUIRES_FAIL_CLOSED=true
+        elif [ -n "$PATHS" ]; then
+          PATTERNS=()
+          while IFS= read -r pline; do
+            [ -n "$pline" ] && PATTERNS+=("$pline")
+          done <<<"$PATHS"
+          if [ "${#PATTERNS[@]}" -gt 0 ]; then
+            # Both sides of a rename (#763): GitHub reports the
+            # destination in .filename and the source in
+            # .previous_filename. Matching only .filename let a
+            # below-threshold PR MOVE a protected file to an unprotected
+            # path and still get a green required check here — this gate
+            # runs on `synchronize` before the labelers can re-add
+            # needs-external-review, so that green permits auto-merge.
+            CHANGED_FILES=$(echo "$FILES_JSON" | jq -r '.[] | (.filename, (.previous_filename // empty))')
+            set +e
+            MATCHED=$(printf '%s\n' "$CHANGED_FILES" | bash "$MATCH" "${PATTERNS[@]}")
+            match_rc=$?
+            set -e
+            if [ "$match_rc" -ne 0 ]; then
+              REQUIRES_EXTERNAL=true
+              REQUIRES_REASON="protected-paths match failed (rc=$match_rc) — failing closed"
+              REQUIRES_FAIL_CLOSED=true
+            elif [ -n "$MATCHED" ]; then
+              REQUIRES_EXTERNAL=true
+              REQUIRES_REASON="protected paths modified: $(printf '%s' "$MATCHED" | tr '\n' ' ')"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  if [ "$PHASE_4_DERIVE_ONLY" = "true" ]; then
+    log "query mode: Phase 4 requiredness on HEAD $HEAD_SHA = $REQUIRES_EXTERNAL${REQUIRES_REASON:+ ($REQUIRES_REASON)}"
+    printf '%s\n' "$REQUIRES_EXTERNAL"
+    exit 0
+  fi
+
+  if [ "$DERIVE_ONLY" = "true" ]; then
+    log "query mode: external requiredness on HEAD $HEAD_SHA = $REQUIRES_EXTERNAL${REQUIRES_REASON:+ ($REQUIRES_REASON)}"
+    printf '%s\n' "$REQUIRES_EXTERNAL"
+    exit 0
+  fi
+
+  if [ "$RATE_LIMIT_PROTECTION_ONLY" = "true" ]; then
+    if [ "$REQUIRES_EXTERNAL" != "true" ]; then
+      log "rate-limit protection query: external review does not apply on HEAD $HEAD_SHA"
+      printf 'false\n'
+      exit 0
+    fi
+    # Arm 1 (#713, tightened by #772): the merge-clearance gate will really
+    # hold this merge. That needs BOTH the config switch AND positive proof the
+    # check is ENFORCED on the PR's base branch. `codex.external_review_gate.
+    # enabled` alone is CONFIGURATION, not enforcement — on
+    # nathanjohnpayne/mergepath that switch is true while base `main` requires
+    # only ["Label Gate","Self-Review Required","lint"], so the pre-#772
+    # short-circuit reported protected:true on a repo where this gate cannot
+    # block anything, and agent-review.yml's rc=5 branch downgraded a
+    # CodeRabbit rate-limit stall on that strength. Enforcement that cannot be
+    # DETERMINED counts as not-enforced and falls through to arm 2, which is a
+    # positive-proof probe — so nothing is lost but availability.
+    if [ "$EXTERNAL_GATE_ENABLED" = "true" ] && merge_clearance_check_enforced; then
+      log "rate-limit protection query: '$MERGE_CLEARANCE_CHECK_NAME' is an ENFORCED required check on base '$BASE_REF' and its external arm applies on HEAD $HEAD_SHA ($REQUIRES_REASON)"
+      printf 'true\n'
+      exit 0
+    fi
+
+    # Arm 2 (#714, unchanged): no provably-enforced gate — the switch is off,
+    # the check is not required on the base branch, or enforcement was
+    # undeterminable — so fall back to proving clearance is already satisfied
+    # on THIS head.
+    log "rate-limit protection query: external review applies on HEAD $HEAD_SHA ($REQUIRES_REASON), but '$MERGE_CLEARANCE_CHECK_NAME' is not a proven-enforced required check on base '$BASE_REF' (external_review_gate.enabled=$EXTERNAL_GATE_ENABLED); checking current-head Codex/Phase-4b clearance"
+    CODEX_CHECK_BIN="${MERGE_CLEARANCE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
+    if [ ! -f "$CODEX_CHECK_BIN" ]; then
+      die 2 "codex-review-check.sh not found at $CODEX_CHECK_BIN (required for rate-limit protection query)"
+    fi
+    set +e
+    CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+      CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE=0 \
+      MERGEPATH_REVIEW_POLICY_PATH="$POLICY_CONFIG" bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO" >&2
+    crc=$?
+    set -e
+    # codex-review-check.sh's public contract is 0 clear, 1 gate-fail,
+    # 3 infrastructure/config. It has no "pending" success-adjacent code, so
+    # every other rc is treated as infrastructure and fails closed.
+    case "$crc" in
+      0)
+        log "rate-limit protection query: current-head Codex/Phase-4b clearance is already satisfied"
+        printf 'true\n'
+        exit 0
+        ;;
+      1)
+        log "rate-limit protection query: external review applies but current-head Codex/Phase-4b clearance is not satisfied"
+        printf 'false\n'
+        exit 0
+        ;;
+      *) die 2 "codex-review-check.sh returned rc=$crc (config/infrastructure error) in rate-limit protection query on PR #$PR_NUMBER" ;;
+    esac
+  fi
+
+  if [ "$REQUIRES_EXTERNAL" = "true" ]; then
+    log "external review applies ($REQUIRES_REASON); delegating to codex-review-check.sh (CI gate skipped — this gate is itself a required check)"
+
+    CODEX_CHECK_BIN="${MERGE_CLEARANCE_CODEX_CHECK_BIN:-$SCRIPT_DIR/codex-review-check.sh}"
+    if [ ! -f "$CODEX_CHECK_BIN" ]; then
+      die 2 "codex-review-check.sh not found at $CODEX_CHECK_BIN (required for the external-review path)"
+    fi
+
+    # Delegate to the shared predicate. CODEX_REVIEW_CHECK_SKIP_CI=1 skips
+    # gate (a) for THIS invocation only (avoids the required-check
+    # self-deadlock). CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 HEAD-pins
+    # gate (b) so a stale earlier-head reviewer APPROVED can't ride a later
+    # push to clearance (#435) — making this REQUIRED check fully HEAD-pinned
+    # (reviewer + Codex/Phase-4b both on HEAD). codex-review-check.sh exits:
+    # 0 clear, 1 gate fail, 3 infra. Map 3 → 2 (config/infra error).
+    set +e
+    CODEX_REVIEW_CHECK_SKIP_CI=1 CODEX_REVIEW_CHECK_REQUIRE_APPROVAL_ON_HEAD=1 \
+      CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE=1 \
+      MERGEPATH_REVIEW_POLICY_PATH="$POLICY_CONFIG" bash "$CODEX_CHECK_BIN" "$PR_NUMBER" "$REPO"
+    crc=$?
+    set -e
+    case "$crc" in
+      0) clear_pass "external review cleared on HEAD $HEAD_SHA ($REQUIRES_REASON)" ;;
+      1)
+        # The only reason this gate is not green is that clearance has not
+        # been reached yet, so it is the pending verdict (#2247)—unless
+        # applicability itself was a fail-closed fallback, which stays a
+        # plain block.
+        if [ "$REQUIRES_FAIL_CLOSED" = "true" ]; then
+          block "external review is NOT cleared on the merge HEAD $HEAD_SHA ($REQUIRES_REASON; no APPROVED CLI review and/or no Codex clearance on this HEAD). See codex-review-check.sh stderr above (mergepath#428)."
+        fi
+        block_pending "external review is NOT cleared on the merge HEAD $HEAD_SHA ($REQUIRES_REASON; no APPROVED CLI review and/or no Codex clearance on this HEAD). See codex-review-check.sh stderr above (mergepath#428)."
+        ;;
+      *) die 2 "codex-review-check.sh returned rc=$crc (config/infrastructure error) on PR #$PR_NUMBER" ;;
+    esac
+  fi
+fi
+
+# Not a Dependabot PR, and external review does not apply (under threshold,
+# no protected paths, no label — or the external gate is disabled). Clean
+# pass so the required check is green on normal under-threshold PRs.
+clear_pass "merge-clearance gate not applicable (under threshold, no protected paths, no external-review label; or external gate disabled)"

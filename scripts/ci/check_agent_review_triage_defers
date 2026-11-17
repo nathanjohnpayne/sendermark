@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# check_agent_review_triage_defers — trusted live-verifier wiring (#656/#1546).
+# Triage and merge clearance independently compare the current Git pair with
+# reviewed canonical content. Bot comments are diagnostics, not authority.
+# This guard checks the caller bindings and fail-closed label path; the real
+# Git/provenance cases run in check_review_feedback_accounting.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+WORKFLOW=".github/workflows/agent-review.yml"
+LANE_WORKFLOW=".github/workflows/pr-review-policy.yml"
+MERGE_GATE="scripts/merge-clearance-gate.sh"
+
+for f in "$WORKFLOW" "$LANE_WORKFLOW" "$MERGE_GATE"; do
+  if [ ! -f "$f" ]; then
+    echo "check_agent_review_triage_defers: missing required path: $f" >&2
+    exit 1
+  fi
+done
+
+fail() {
+  echo "check_agent_review_triage_defers: $1" >&2
+  echo "  Triage may skip external review only after trusted live byte verification." >&2
+  echo "  Missing or indeterminate proof must retain the external-review label." >&2
+  exit 1
+}
+
+# Isolate the `triage` job block so the anchor/catch-block assertions can't
+# false-pass on an identical pattern copy-pasted into an unrelated job. The
+# block runs from the `  triage:` job header to the next top-level (2-space
+# indented) job header — the same structure agent-review.yml uses for every
+# job under `jobs:`. Fails closed if the block can't be located.
+TRIAGE_JOB="$(awk '
+  /^  triage:[[:space:]]*$/ { grab = 1; print; next }
+  grab && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
+  grab { print }
+' "$WORKFLOW")"
+if [ -z "$TRIAGE_JOB" ]; then
+  fail "$WORKFLOW no longer contains a locatable 'triage:' job block (cannot scope job-specific assertions)"
+fi
+
+# 1. The defer marker + rationale anchor is present IN THE TRIAGE JOB.
+grep -qF 'PROPAGATION-LANE-DEFER (#656)' <<<"$TRIAGE_JOB" \
+  || fail "$WORKFLOW triage job is missing the PROPAGATION-LANE-DEFER (#656) anchor"
+
+# These callers must reach the same trusted executable. The behavior suite
+# proves its positive byte comparison and refusal of forged bot markers.
+for f in "$WORKFLOW" "$MERGE_GATE"; do
+  grep -qF 'verify-live-propagation.sh' "$f" \
+    || fail "$f no longer invokes live byte verification"
+done
+for binding in 'String(pr.number), pr.head.sha, pr.base.sha, policyConfigPath' 'input: JSON.stringify(pr)' 'needsExternal && !policyReadFailed'; do
+  grep -qF "$binding" <<<"$TRIAGE_JOB" \
+    || fail "triage no longer binds the live verifier to trusted PR/policy inputs"
+done
+
+# 5. FAIL-CLOSED on an indeterminate read: the catch path must reset the
+#    verified flag so an API error labels rather than skips. Scoped to the
+#    triage job so an unrelated job's `catch (e)` can't satisfy the proximity
+#    match.
+# Captured in two steps rather than piped. A here-string alone is NOT enough
+# here (#1147): with an intermediate stage, `grep -qF` still short-circuits and
+# the INTERMEDIATE grep takes EPIPE, so `pipefail` reports rc=141 on a genuine
+# match exactly as the printf form did. Measured on a 4 MB haystack:
+#   printf | grep -A6 | grep -qF     rc=141
+#   grep -A6 <<< | grep -qF          rc=141   <- naive fix, still broken
+#   capture, then grep -qF <<<       rc=0
+_catch_ctx="$(grep -A6 'catch (e)' <<<"$TRIAGE_JOB" || true)"
+grep -qF 'laneVerifiedHead = false' <<<"$_catch_ctx" \
+  || fail "$WORKFLOW triage job no longer forces laneVerifiedHead=false on a failed live verification (must label fail-closed)"
+
+# 6. The label add still exists and the skip is conditioned on the
+#    verified flag — i.e. the guard shape is `needsExternal &&
+#    laneVerifiedHead` (skip) vs `else if (needsExternal)` (add). This is
+#    the actual teeth against both regressions: dropping the skip (flap
+#    returns) or dropping the add (fail-open returns).
+grep -qF 'needsExternal && laneVerifiedHead' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer gates the skip on the live verification"
+grep -qF 'else if (needsExternal)' "$WORKFLOW" \
+  || fail "$WORKFLOW no longer retains the fail-closed needs-external-review add"
+
+echo "check_agent_review_triage_defers: PASS"

@@ -1,0 +1,410 @@
+# `scripts/phase-4b/` — automated Phase 4b review handoff
+
+Reference implementation for automating the Phase 4b external-review
+handoff (REVIEW_POLICY.md § Phase 4b). Design and diagrams:
+[`plans/automated-phase-4b-handoff.md`](../../plans/automated-phase-4b-handoff.md).
+
+This started as a disabled reference implementation: runnable, fail-closed,
+unit-tested with fake CLIs, and accompanied by real plan-backed `codex` /
+`claude` validation evidence in PR #580's review thread. **Mergepath itself
+runs it ENABLED since 2026-07-02 (#628: `phase_4b_automation.enabled: true`,
+accounting live; `high` effort on both adapters since #669, with xhigh as
+the per-run, per-adapter env escalation)** — the bootstrap template
+mirror resets the switch to `false`, so any OTHER repo still opts in
+explicitly and should re-run the live adapter validation from its own
+enablement environment before flipping `phase_4b_automation.enabled: true`.
+Invocation and the trusted-path rule (run from a main-ref checkout, never
+the PR-under-review's checkout) live in REVIEW_POLICY.md and AGENTS.md; the
+checkout's on-disk location follows `docs/agents/worktree-placement.md`.
+
+## Components
+
+| Path | Role |
+|------|------|
+| [`../phase-4b-review.sh`](../phase-4b-review.sh) | Orchestrator. Selects the reviewer (≠ author), dispatches to an adapter, fails closed on any doubt, and posts the verdict under the reviewer PAT via `gh-as-reviewer.sh`. |
+| [`adapters/review-via-codex.sh`](adapters/review-via-codex.sh) | Direction A (Claude→Codex). `codex --ask-for-approval never exec --sandbox read-only --output-schema verdict.schema.json`. |
+| [`adapters/review-via-claude.sh`](adapters/review-via-claude.sh) | Direction B (Codex→Claude). `claude -p --system-prompt ... --permission-mode plan --effort medium --tools "" --output-format json`. |
+| [`verdict.schema.json`](verdict.schema.json) | The normalized verdict contract both adapters emit, with optional adapter-populated token usage metadata when the CLI exposes it. **Single source of truth for the structural contract** — the `lib.sh` validator derives its key sets and enums from this file (see below). |
+| [`lib.sh`](lib.sh) | Shared config readers, reviewer selection, `jq`-based verdict validation, JSON-block extraction, and the per-adapter timeout/effort resolvers. |
+| [`collect-enablement-evidence.sh`](collect-enablement-evidence.sh) | Captures the pre-enablement evidence (#586): CLI versions, plan-auth status, API-key env scan, resolved config, and an optional adapter dry-run. Markdown or `--json`; exits `1` when BLOCKED. |
+| [`accounting.sh`](accounting.sh) | Approval-loop accounting (#602). Sourced by the orchestrator; renders the "## Phase 4b Approval Accounting" block + embedded `p4b-accounting:v1` record into the automated `APPROVED` review body. Pure functions, no network; advisory to safety (any failure ⇒ the plain summary posts). |
+| [`accounting.schema.json`](accounting.schema.json) | JSON Schema for the embedded `p4b-accounting/v1` record; the golden #580 sample is validated against it in `tests/test_phase_4b_accounting.sh`. |
+| [`heartbeat.sh`](heartbeat.sh) | Advisory machine-local invocation observations (#1589), atomic stage publication, process-instance status and retention. No GitHub reads or writes and no gate authority. |
+| [`prices.json`](prices.json) | Versioned public-list-price table (#604) for the accounting's **notional** (not-billed) cost figures; every record stamps the `price_table_version` it used. |
+
+### Verdict contract: drift resistance & extraction
+
+- **Schema-derived validation (#585).** `p4b_validate_verdict` no longer
+  hand-mirrors the verdict's structural constants. It reads the top-level key
+  set, the `verdict` enum, the per-finding key set, the `severity` enum, and
+  the `usage` key set **from `verdict.schema.json` at validation time**, so
+  editing the schema reconfigures the validator automatically — the two cannot
+  silently drift. Only the semantics the JSON Schema cannot express stay in
+  `jq`: the config-dependent `feedback_policy` approval gate, the
+  all-or-nothing `usage` object, and the 1-based `line` bound. A missing or
+  malformed schema makes validation fail closed. `tests/test_phase_4b_automation.sh`
+  adds behavior-locking parity fixtures (`tests/fixtures/phase_4b_verdicts.jsonl`),
+  schema-vs-validator boundary assertions, and — when a JSON Schema validator
+  (`check-jsonschema`/`ajv`) is installed — an independent cross-check that every
+  validator-accepted fixture is also schema-valid.
+- **Hardened JSON extraction (#587).** `p4b_extract_json_block` (used by the
+  Claude adapter to pull the verdict out of model output) is a string-aware
+  brace-depth scanner rather than a naive first-`{`-to-last-`}` slice. It tracks
+  JSON string literals (honoring `\"` / `\\` escapes) so braces inside string
+  values don't miscount, and it stops at the matching close of the **first**
+  balanced object — so balanced-brace prose *after* the JSON object can no
+  longer extend the slice and corrupt it. Unbalanced or object-free input emits
+  nothing, so schema validation still fails closed on ambiguous output.
+
+### Approval-loop accounting (#602)
+
+When `phase_4b_automation.accounting.enabled` is not `false` (the default is
+`true`; with mergepath's parent switch now on, the block is live — on a repo
+whose parent `enabled` is false it still gates everything), the
+orchestrator sources `accounting.sh` and:
+
+1. **Records every loop.** Each invocation appends one loop record to a
+   per-PR loop log under `.mergepath/phase-4b-loops/` (gitignored runtime
+   state; override with `P4B_ACCT_STATE_DIR`) — including CHANGES_REQUESTED
+   rounds and fail-closed fallbacks (reason + duration, counted as positive
+   safety evidence), so a changes-requested-then-fixed cycle renders its full
+   history.
+2. **Augments the APPROVED body.** On an approval it appends the
+   "## Phase 4b Approval Accounting" block — loop table, findings lifecycle
+   with dispositions, a rigor proof-of-work table (rows are green only when
+   the backing signal was captured; otherwise `n/a — reason`), the four-part
+   cost model (wall-clock / CLI-exposed tokens / throttle / labeled
+   **notional** $ with billed `$0.00` on the plan; a CLI-REPORTED cost —
+   Claude envelope `total_cost_usd` → `tokens.cost_usd` /
+   `totals.reported_cost_usd` — is preferred over the price-table notional,
+   labeled `CLI-reported`), repo running totals with
+   an explicit totals-source footer, and the embedded machine-readable
+   `<!-- p4b-accounting:v1 ... -->` record (`accounting.schema.json`,
+   comment-delimiter sequences inside record strings emitted as JSON
+   unicode escapes so a hostile title can never close the comment early).
+3. **Fails open for reporting, closed for integrity.** Any generation error ⇒
+   the plain-summary approval posts unchanged (a report failure never blocks
+   or fabricates an approval; exit codes are untouched). The builder and the
+   renderer both refuse a record whose loop history would pair a posted
+   `APPROVED` with a required-tier finding; token counts are never estimated
+   (`unavailable` + source); a missing price ⇒ notional `n/a` while the record
+   still posts; running-totals aggregation trouble degrades to `unavailable`
+   rather than wrong numbers.
+
+Running totals prefer an injected GitHub-derived prior-record file
+(`P4B_ACCT_PRIOR_RECORDS_JSONL`, e.g. prior review bodies piped through
+`p4b_acct_extract_records`); when none is injected the hook layer fetches
+one itself — a single read-only `gh api graphql` call over the most
+recently updated 50 merged PRs (cap via `P4B_ACCT_PRIOR_SCAN_PRS`),
+plan-safe, PATH-shimmable in tests — so the real orchestrator path reports
+repo-wide totals from any checkout. On fetch failure they fall back to the
+append-only `.mergepath/phase-4b-ledger.jsonl` cache (two-phase commit: the record is
+staged at render time and appended only after the review POST actually
+succeeds, so dry-runs, head drift, and POST failures never contaminate it —
+those failure paths also correct the per-PR loop log in place, so local state
+never claims a phantom posted approval), else render `unavailable`. A prior
+record with an unavailable (null) tokens/elapsed/notional measurement makes
+that CUMULATIVE figure `unavailable` too, per metric — never coerced to 0. Notional pricing
+requires the opt-in `accounting.{codex,claude}_price_key` mappings into
+`prices.json` because the adapters do not capture exact model IDs yet.
+Covered by `tests/test_phase_4b_accounting.sh` via
+`scripts/ci/check_phase_4b_accounting`; design detail in
+`plans/automated-phase-4b-handoff.md` § 17 and the reconciled spec
+`plans/issue-602-phase-4b-accounting-SPEC.md`.
+
+After posting an approval, the orchestrator acknowledges its exact review body when the feedback-accounting gate requires it (#1261). It uses the gate's emitted token under the selected reviewer identity and verifies the resulting accounting evidence. Optional findings already have the step-9 dispositions recorded above, and the gate’s governing base policy must still allow those dispositions. Changes-requested, unrelated, and edited bodies are not automatically acknowledged. Gradeable nonignored markers in the freeform summary lack structured step-9 evidence, so their approval body is left for acknowledgment repair. An acknowledgment failure exits `7` while reporting `review_posted: true` and `review_acknowledgment: "failed"`; repair that review's acknowledgment rather than repeating the review run.
+
+### Advisory invocation heartbeat (#1589)
+
+Once the orchestrator has resolved repository, head, reviewer and runtime bounds, it publishes `p4b-heartbeat/v1` to `~/.local/state/mergepath/phase-4b-runs/<P4B_ACCT_RUN_ID>.json`. `P4B_HEARTBEAT_DIR` overrides only the storage directory. The existing invocation ID is reused unchanged. Temporary files and atomic rename keep readers from observing partial JSON; storage, encoding, process-probe and retention failures are ignored. This package does not change a verdict, exit code, timeout, fence, cleanup owner or GitHub operation. Missing telemetry is unavailable evidence.
+
+The record carries process/repository/PR/head/reviewer/direction/checkout identity, UTC invocation/stage times and epoch seconds, `stage` and its reached `stages[]` history. Stages are `barrier`, `adapter`, `posting` and `done`; early refusals record only the stages reached. `adapter_timeout_seconds` is the effective resolved outer bound. `adapter_started_at_epoch` and `adapter_elapsed_seconds` come from the existing adapter-only accounting clock and stay null before dispatch. A live near-timeout display derives elapsed from the adapter start, not from the barrier start or illustrative design values. Exit `4` alone does not prove a timeout; use the adapter exit evidence and effective bound. No periodic worker or additional provider request is introduced.
+
+The EXIT handler first retains the original temporary-file cleanup, then records the actual exit code and `done`. `adapter_verdict` reports a parsed adapter result; final `verdict`, `token_count` and `findings_count` are populated only when the orchestrator emitted its final summary. `review_posted` reports the existing confirmed POST result, including acknowledgment failures that exit `7` after posting. These fields are observations, not present merge clearance. The governing request generation and final feedback-accounting read order remain separate and unchanged.
+
+`p4b_heartbeat_status <path>` returns `done`, `running`, `crashed` or `unknown`. A non-done record with a vanished owner is crashed; `ps` start-time identity prevents a reused PID from appearing live. Unreadable records/probes or missing process-start evidence remain unknown. SIGKILL can leave the last reached stage because it bypasses EXIT. Retention runs at invocation start: `P4B_HEARTBEAT_RETENTION_DAYS` defaults to `7`, accepts integer days `1..3650`, and prunes only completed/crashed records whose last publication is older than that duration at minute resolution. Invalid retention disables pruning; current, live and indeterminate records remain.
+
+Accounting v1 loops gain optional nullable `run_id` and `started_at_epoch`. Genuine IDs match the heartbeat; the existing loop-log envelope timestamp is unchanged and is copied into the loop, so approval bodies carry adapter-start evidence. Legacy records and required fields remain valid, totals/archives retain their prior semantics, and `pid-$$` pending ownership never becomes a global history identity. A later history consumer must combine repository plus genuine ID across live logs, archives, approval `loops[]` and heartbeat lifecycle observations; approval totals are cross-checks, legacy locator rows remain visibly separate, and conflicting terminal observations require a diagnostic. Approval generation time never substitutes for loop start.
+
+`tests/test_phase_4b_automation.sh --rate-limit-only` executes bounded production-barrier and provider-predicate controls for bare hourly/included-review quota refusals, spent-ceiling and disabled Codex, late waivers, masked findings and truthful body narration (about twelve seconds including real quota probes; use an outer 30-second timeout). It includes `tests/test_coderabbit_wait_status_probe.sh --phase4b-quota-only`, which runs the production probe with and without a head review object over heading-only and marker-bearing quota notices, masked findings, quoted/fenced examples and unknown wording. It dispatches no adapters and performs no network or credential operations. `tests/test_coderabbit_wait_status_probe.sh --status-refusal-only` adds the trusted current-SHA status-only refusal controls (about 25 seconds; use an outer 45-second timeout). The exact `success` / `Review rate limited` status is refusal evidence after one bounded publication resample and all-surface masking; an accepted clean head report keeps its existing priority, newer active/pause/run/trigger evidence holds, and trust=false adds no reads. This path grants the adapter an independent review opportunity under the barrier rules, never CodeRabbit review clearance. `--marker-led-heading-only` covers the supported warning after a leading summary marker (about 15 seconds, outer 35-second timeout). `--status-active-only` covers later refusals replacing stale progress while equal/newer progress and durable pauses hold (about 20 seconds, outer 45-second timeout). Both modes run real hermetic probes with masking and reader-failure controls.
+
+`tests/test_phase_4b_automation.sh --heartbeat-only` runs bounded real-orchestrator fixtures for approval, changes requested, refusals `4/6/7/8/10`, blocked storage, killed owners and request-generation races (expected to take about 80 seconds; each run capped at 30 seconds and adapter calls at three seconds). `tests/test_phase_4b_accounting.sh --identity-only` runs the subsecond producer/schema/legacy/totals/archive contract; adding `--fixtures /absolute/1589-identity-fixtures.json` exports mixed/duplicate/lifecycle/conflict/approval fixtures for #1590. The full accounting suite also runs this contract. The specification is `specs/phase_4b_heartbeat.md` in the mergepath repository, which does not propagate specs to consumers: <https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_heartbeat.md>.
+
+## How it plugs in (no merge-gate changes)
+
+The orchestrator posts an `APPROVED` review on the current HEAD under a
+non-author reviewer identity. That is exactly the **Phase 4b substitute**
+clearance the existing merge gate already accepts
+(`scripts/codex-review-check.sh` gate (c), `codex.allow_phase_4b_substitute`,
+#218), so `auto-clear-blocking-labels.yml` and `merge-clearance-gate.yml`
+clear with no changes.
+
+```
+phase-4b-classifier.sh (is 4b needed?) ─▶ phase-4b-review.sh
+                                              │ select reviewer ≠ author
+                                              ▼
+                         review-via-{codex,claude}.sh  (read-only reasoning)
+                                              │ normalized verdict JSON
+                                              ▼
+                         gh-as-reviewer.sh ── APPROVED/CHANGES_REQUESTED on HEAD
+                                              ▼
+                         codex-review-check.sh gate (c)  →  auto-clear  →  merge
+```
+
+## Dependencies
+
+- **Runtime:** `bash` (3.2+), `jq`, `node`, `gh`, `git`, and the reviewer CLI
+  (`codex` and/or `claude`) on `PATH`. `node` runs the shared PR-body contract
+  parser (`scripts/lib/pr-body-contract.mjs`), which the identity fence invokes
+  on **every** enabled run — including callers that pass `--author`, which
+  before #1143 skipped the body read and so never reached it. The orchestrator
+  probes `node --version` beside its `jq` check, after the disabled/mode gates,
+  so a host missing it gets a message naming the dependency rather than a
+  parser error; the default disabled path still needs neither.
+- **Reasoning-plane auth (per direction) — subscription plan only:** the
+  adapters verify the persisted CLI auth mode before launch and run the
+  reviewer CLI under a tightly allowlisted child environment. Codex must report
+  `auth_mode=chatgpt`; Claude must report `apiProvider=firstParty` with either
+  `authMethod=claude.ai` plus a `subscriptionType`, or
+  `authMethod=oauth_token` for a headless Claude Code subscription token.
+  Reasoning therefore bills against the operator's **individual plan**, never
+  the metered API. API-key env vars, GitHub tokens, deploy/cloud credentials,
+  and SSH-agent state are not inherited by the child CLI.
+  Log in once per direction: Codex via `codex login` (ChatGPT account);
+  Claude via its subscription login or `claude setup-token`
+  (`CLAUDE_CODE_OAUTH_TOKEN`, which is preserved). If the CLI is not
+  plan-logged-in, the read-only call fails and the orchestrator falls back to
+  the manual handoff (fail-closed) — it never uses the API.
+- **Child-process credential isolation:** the reviewer CLI child process is
+  launched with an allowlisted environment (`PATH`, `HOME`, locale/tmp basics,
+  plus `CODEX_HOME` or `CLAUDE_CODE_OAUTH_TOKEN` only when needed). It does not
+  inherit GitHub tokens, pay-per-token API keys, deploy/cloud credentials, or
+  SSH agent state from the parent session. Only the parent orchestrator keeps
+  the reviewer PAT, and only for the final `gh-as-reviewer.sh` write after the
+  head SHA is re-read. The write uses the pull-review API with `commit_id` set
+  to the reviewed SHA and verifies the created review response is pinned to
+  that SHA.
+- **Tool/file-access isolation:** Codex runs from an empty scratch review root
+  with scratch `HOME`/`CODEX_HOME`; the copied Codex auth file lives outside the
+  review root. Claude runs with a compact structured-output prompt, a
+  text-only system prompt, `--effort medium`, `--tools ""`, `--safe-mode`,
+  disabled slash commands, and no session persistence. The diff is supplied on
+  stdin in both directions, so neither reviewer needs repo or home-directory
+  read tools.
+- **Timeouts + effort (configurable, #589):** the reviewer CLI timeout and
+  effort are read per-adapter from `phase_4b_automation` so Codex and Claude can
+  be tuned without editing the adapter scripts. The orchestrator resolves them
+  (`p4b_resolve_adapter_timeout` / `p4b_resolve_adapter_effort`) and passes them
+  down via `P4B_REVIEW_CLI_TIMEOUT_SECONDS` and `P4B_{CLAUDE,CODEX}_EFFORT`.
+  - **Timeout:** `adapter_timeout_seconds` (shared) with optional
+    `codex_timeout_seconds` / `claude_timeout_seconds` overrides. Must be an
+    integer in `[1, 3600]`; absent ⇒ `900`. A non-integer or out-of-range value
+    is rejected **fail-closed** (the orchestrator exits `3`) so a typo can never
+    effectively unbound the CLI. `P4B_ADAPTER_TIMEOUT_SECONDS` /
+    `P4B_REVIEW_CLI_TIMEOUT_SECONDS` still override at runtime for tests/manual
+    runs. A timeout exits through the same fail-closed manual-handoff path as any
+    other adapter error.
+  - **Effort:** `claude_effort` (`low|medium|high|xhigh|max`, default `medium`,
+    → `claude --effort`) and `codex_effort` (`minimal|low|medium|high|xhigh`,
+    `xhigh` model-dependent, default empty = Codex CLI default, → `codex -c
+    model_reasoning_effort`, validated against codex-cli 0.137; `--strict-config`
+    is not used, so an unrecognized key on a future CLI is a harmless no-op). An
+    invalid value is rejected fail-closed.
+- **Review metadata:** posted reviews include reviewed head SHA, reviewer
+  identity, adapter, adapter run count, timeout, token usage when exposed by
+  the CLI, and an explicit `not exposed` marker for model-internal turn count.
+  CLI token counters are best-effort because reviewer CLI stderr/envelope
+  formats can change; when parsing fails the adapters safely emit `usage: null`.
+- **Feedback-policy approval gate:** the verdict validator reads
+  `feedback_policy` when present (#574). `APPROVED` may not carry findings in
+  any policy-required severity tier; absent `feedback_policy` defaults to
+  P0/P1 required and P2/P3 discretionary. `mode: address-all` makes every
+  finding block an automated approval. Separately, an `APPROVED` verdict that
+  carries discretionary findings triggers the policy step-9 executor (#672):
+  the orchestrator files one `post-review` + `observation` issue per finding
+  (author identity, assigned to it) and posts the approval with the issue
+  references appended — observations become issues BEFORE the approval clears
+  the merge gate. Any filing failure refuses the approval fail-closed (the
+  pre-#672 behavior); `phase_4b_automation.post_review_issues: false` opts a
+  repo back into the plain refusal.
+- **Attribution-plane auth:** the selected reviewer's PAT is resolved through
+  `scripts/gh-as-reviewer.sh`. The orchestrator sets
+  `GH_AS_REVIEWER_IDENTITY` and deliberately clears a stale
+  `OP_PREFLIGHT_REVIEWER_PAT` from the authoring agent session before the
+  wrapper runs, so the wrapper verifies the selected reviewer identity instead
+  of hard-failing on the current agent's cached reviewer PAT.
+- **Config:** the `phase_4b_automation:` block in
+  `.github/review-policy.yml` (ships **disabled**, so behavior is unchanged
+  until a repo opts in).
+
+## Enabling
+
+Before flipping the switch, capture the enablement evidence (#586) from the
+environment that will post reviews, on plan auth, with no API-key env vars set:
+
+```bash
+# Markdown for a PR comment, or --json for machine checks. Exits 1 if BLOCKED
+# (an API key is set, or no direction has a plan-authed CLI). Add
+# --diff-file <patch> (or --pr N --repo owner/repo) to include a live dry-run.
+scripts/phase-4b/collect-enablement-evidence.sh
+```
+
+It records `codex --version` / `claude --version`, each adapter's plan-auth
+status, the disallowed-API-key scan, the resolved per-adapter timeout/effort,
+and (optionally) a successful adapter dry-run — the exact evidence the
+enablement PR should paste. Then flip the switch:
+
+```yaml
+# .github/review-policy.yml
+phase_4b_automation:
+  enabled: true
+  mode: local
+```
+
+While disabled (default), `phase-4b-review.sh` exits `5` and the caller
+uses today's manual handoff (`post-phase-4b-handoff.sh`). The handoff renderer
+runs complete-history feedback accounting before emitting the reviewer prompt;
+it exits `4` with no handoff when an earlier finding is unaccounted (#1000).
+Automated-mode fallbacks run that accounting before announcing or rendering a manual handoff; a miss becomes orchestrator exit `7`, not fallback exit `4`.
+
+`max_review_rounds` is enforced (#2663): each invocation reserves a slot in the per-PR Git-ref round ledger before any adapter run, and a PR whose completed and in-flight rounds have reached the governing cap stops for an owner decision. The contract, including what frees a slot and what never does, is [the round-cap spec](https://github.com/nathanjohnpayne/mergepath/blob/main/specs/phase_4b_round_cap.md). Past a spent cap the only further round is `--owner-authorization <comment-id>`, which names the owner's scoped authorization comment and consumes it through the ledger (#2968). A review carrying the automated header that no ledger reservation accounts for is refused by the comment guard and does not clear the merge gate; see the spec's provenance section.
+
+## Try it (dry-run, offline, with fake CLIs)
+
+Save this as a file and run it (`bash try-it.sh`) rather than pasting it into a
+shell — it uses strict mode and exits on failure by design.
+
+```bash
+#!/usr/bin/env bash
+# A recipe whose whole claim is "offline" has to FAIL CLOSED when its offline
+# setup fails. Without the strict-mode preamble, a failed `mkdir`/`cat`/`chmod`
+# below would leave PATH pointing at a directory that does not exist, the real
+# `gh` would resolve, and the run would quietly perform a LIVE PR-body read.
+set -euo pipefail
+
+# The identity fence reads the PR body from the API on every run (#1143), so
+# an offline recipe has to serve one. This fake `gh` answers the body read and
+# returns a fixed head for everything else; nothing leaves the machine.
+# A private mktemp -d, not a predictable /tmp path: a leftover from an earlier
+# run, or another user's file at the same name, is exactly how the setup fails.
+P4B_OFFLINE="$(mktemp -d "${TMPDIR:-/tmp}/p4b-offline.XXXXXX")"
+trap 'rm -rf "$P4B_OFFLINE"' EXIT
+mkdir -p "$P4B_OFFLINE/bin"
+cat > "$P4B_OFFLINE/bin/gh" <<'SH'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    *'.body'*) printf 'Authoring-Agent: claude\n\n## Self-Review\n\n- ok.\n'; exit 0 ;;
+  esac
+done
+printf 'deadbeef\n'
+SH
+chmod +x "$P4B_OFFLINE/bin/gh"
+export PATH="$P4B_OFFLINE/bin:$PATH"
+
+# Verify rather than assume. Strict mode catches a setup step that RETURNS
+# non-zero; it does not catch one that succeeds into the wrong state (a fake
+# written but left non-executable, a PATH that does not contain it). Proving
+# which `gh` resolves covers both, and is the only check that actually states
+# the guarantee this recipe makes.
+[ "$(command -v gh)" = "$P4B_OFFLINE/bin/gh" ] || {
+  echo "offline setup failed; refusing to run against the real gh" >&2
+  exit 1
+}
+
+printf 'verdict' > "$P4B_OFFLINE/diff.txt"
+CODEX_BIN=/path/to/fake-codex \
+  MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD=true \
+  scripts/phase-4b-review.sh 123 --repo nathanjohnpayne/mergepath \
+    --author claude --head deadbeef --diff-file "$P4B_OFFLINE/diff.txt" --dry-run --offline-diff
+```
+
+`--offline-diff` is a preview-only path: it requires `--dry-run`, an explicit regular diff file and a display head. It freezes those bytes without a live tuple, Git fetch or transition query; its verdict has no postable input binding. The normal path still captures exact PR objects.
+
+`--dry-run` reads and validates the PR body, then performs selection + adapter
+dispatch + verdict validation, and prints the intended action without posting.
+Its final JSON adds `validated_verdict` for a dry run: the complete,
+schema-validated adapter verdict, including its summary, findings, and
+normalized usage. This lets a caller classify the result before any publisher
+acts. Successful real-run JSON retains its existing summary shape. A real run
+that cannot publish also includes the exact raw `validated_verdict` and its
+retained evidence path (or an explicit retention error); see
+[Unpublished verdict evidence](#unpublished-verdict-evidence-2790).
+The offline recipe explicitly replaces the live review-feedback accounting read
+with `true`; real dry-runs keep that gate enabled so they cannot spend a
+reviewer round while older feedback is unaccounted. Adapter CLIs are injectable
+via `CODEX_BIN` / `CLAUDE_BIN`, which is how
+`tests/test_phase_4b_automation.sh` exercises the package without network or
+real model calls.
+
+This recipe fakes `gh` and the reviewer CLI and nothing else. In particular it
+needs a **real** `node`, because the identity fence runs the shared contract
+parser under it. That is deliberate: `gh` is faked because it is the network
+boundary, and the point of faking it is to keep the run offline. `node` is a
+local execution dependency — the parser reads stdin and writes stdout, reaching
+nothing — so faking it would remove the real contract check the recipe exists to
+exercise, and would make a dry-run rehearse a different program than a real run.
+`jq` and `bash` are real here for the same reason.
+
+`--author` is a cross-check, not an override (#1143): it must name the same
+agent the body declares, so the fake above serves `claude` to match the
+`--author claude` in the command. Change one and you must change the other, or
+the run refuses with exit `3` — which is the flag behaving as designed rather
+than the recipe being broken. Dropping `--author` entirely also works; the body
+is what supplies the identity.
+
+The #814 same-head barrier is **skipped** under `--dry-run`, which is part of
+what keeps this recipe offline. The barrier guards the review POST and a
+dry-run never posts, so there is no ordering hazard for it to prevent — and
+both provider probes it would otherwise run are `gh`-backed, so running them
+would require network and credentials here. A real run always evaluates it.
+The identity fence is `gh`-backed too and is **not** skipped on a dry-run,
+which is why this recipe injects a fake `gh` rather than relying on the
+orchestrator needing none: reading the body is the point of that fence, and a
+dry-run that skipped it would rehearse a different program than the real one.
+
+For Codex, “no current-head signal” is not sufficient to open the barrier: it ordinarily remains `not-yet`. The #1085 exception is a durable Phase 4a timeout determination written by `codex-review-request.sh` to the PR timeline after a confirmed author-owned trigger exhausts its bounded wait. The marker is versioned, pinned to the full head SHA, bound to that trigger comment, and trusted only from `author_identity`; it remains current only while that trigger is the latest exact author-owned `@codex review` request in the complete timeline. A newer exact request supersedes the old timeout and keeps Phase 4b pending until that new attempt reaches its own terminal result. The full provider barrier runs before the adapter. After the adapter returns schema-valid output, the orchestrator re-reads the paginated timeline and live head before interpreting the verdict or performing its first approval-side effect, then repeats that targeted timeout-generation read immediately before the review POST; the final read corrects provisional accounting and closes this run's filed follow-ups before holding or falling back. A request arriving during either external-review window therefore cannot inherit an older waiver. Stale markers remain pending, while malformed/unreadable evidence and head drift escalate fail-closed. Provider-authored usage-limit/not-connected comments make `codex-review-request.sh` exit `4` with `blocked_reason`; the later `codex-review-check.sh --diagnostic-signal-only` probe maps that evidence to its separate exit-`2` Phase 4b waiver.
+
+## Identity fences (#1143)
+
+The PR body is the record of authorship, and the orchestrator reads and
+validates it against the shared contract (`scripts/lib/pr-body-contract.sh`) on
+**every** run — the same contract the required Self-Review gate enforces.
+`--author` is a cross-check against the `Authoring-Agent:` the body declares,
+never an override: a disagreement exits `3`, and there is no opt-out.
+
+That up-front read is not sufficient on its own, because the adapter run after
+it can last the configured timeout and **editing a PR body moves no sha** — so
+a mid-run identity change is invisible to every head-drift check. A body edited
+to declare the agent the run picked as *reviewer* would otherwise collect a
+cross-agent approval from its own authoring agent. The body and its author are
+therefore revalidated at both approval-side-effect boundaries: immediately
+before the step-9 issue filing, and immediately again before the review POST.
+
+Both fences require the live body to still satisfy the contract **and** to
+still declare the agent the run was planned against. A changed agent, a body
+that stopped validating, and an unreadable read all refuse via
+`fall_back_to_manual`; the pre-POST fence closes this run's filed follow-up
+issues as superseded first, exactly as the head-drift check beside it does. An
+edit that leaves the identity intact — added prose, a fixed typo — is not drift
+and does not refuse.
+
+## Exit codes (orchestrator)
+
+| Code | Meaning |
+|------|---------|
+| 0 | APPROVED — review posted (or would, under `--dry-run`) |
+| 1 | CHANGES_REQUESTED — posted; author addresses findings, then re-run |
+| 3 | usage/configuration error, missing jq or immutable-input integrity refusal; no manual handoff |
+| 4 | fell back to the manual handoff (`fall_back_to_manual`): unavailable reviewer CLI/schema/plan login, timeout or invalid verdict; also ordinary CodeRabbit probe-head drift outside a pending final-request wait (`p4b_same_head_barrier` via `run_same_head_barrier`), unsafe later timeout-generation revalidation (`revalidate_phase4a_timeout_generation`), and PR-body authoring-agent drift at the body fences/`post_review`. A newer pending timeout generation holds with `exit 6`. Immutable-input/head/base integrity refusals remain `exit 3`. |
+| 5 | automation disabled or `mode != local` — caller uses the manual handoff |
+| 6 | **held** (#814) — an enabled external provider has not reported on the reviewed head and no valid same-head terminal determination waives it. Nothing was posted and no handoff was rendered. An early hold records no loop; if a timeout generation changes only at the final pre-POST fence, its already-provisional loop is corrected to `not-posted` / fail-closed and any issues filed by that run are closed as superseded. Wait the `retry_after` seconds in the emitted JSON and re-run the same command, **from the same checkout**. Deliberately not `4`: every consumer of `4` reads it as a reviewer that will not answer, and `scripts/wave-audit.sh` proceeds fail-open on it. The wait is bounded by `coderabbit.max_wait_seconds` and escalates to `4` when exhausted — but elapsed time rides an advisory marker in `.mergepath/`, so an unwritable state dir or retries from different checkouts leave it at zero and the hold repeats without escalating. Not every hold clears by waiting either: `paused`, draft, and non-base-branch all read as not-yet and need the cause resolved. A **rate-limited** CodeRabbit is no longer a hold on its own account (#1178): the barrier cannot re-ask it and `--probe` cannot reach the polling retry, so the arm reports `coderabbit: "rate-limited"` and resolves against Codex — the barrier OPENS when the Codex arm is reported, waived or disabled (#2120), because the adapter itself performs the independent external review (the run then exits on its verdict, so 0 or 1); HOLDS on this same exit 6 while Codex is `not-yet`, since that wait is on Codex and does clear by waiting (an exhausted bound then escalates naming the refusal, not the clock); Codex human stops, unreadable budgets and escalation still stop on their own merits. The review body records the bare refusal without inventing a Codex report. Recognized included-review quota notices already emit `rate_limit` and receive identical treatment; unknown quota wording is not promoted to a bare refusal. |
+| 7 | **feedback unaccounted** (#1000) — no manual handoff is rendered. The exit can mean the pre-dispatch accounting gate found an undispositioned finding, so no adapter ran; a fallback after adapter dispatch was stopped by its accounting gate before rendering; the handoff renderer's own accounting gate refused; the approval writer-boundary accounting check refused an `APPROVED` result before POST; or a posted approval's #1261 acknowledgment failed. If the run-summary JSON says `review_posted: true` and `review_acknowledgment: "failed"`, repair that approval's acknowledgment without repeating the review. Pre-dispatch and other early refusals may emit only accounting payload and error output; use that output to identify and disposition the finding. Then rerun the appropriate step. Do not treat every exit 7 as an adapter run or route it directly to manual fallback. |
+| 8 | **human tiebreaker required** (#1757; #1305, narrowed by #1560 slice 3): a deterministic egregious-case tripwire matched (`barrier.tripwire`), or the governing Codex request ceiling is spent and a human stop holds, named in `barrier.human_stops.stops`: `blocking-budget`, `runaway`, `untested-rebuttal` or `disagreement`. A spent ceiling with no human stop waives the Codex arm and the adapter runs instead, unless `codex.allow_phase_4b_substitute` is false, which escalates to the manual handoff (exit 4). No Phase 4b handoff was rendered. Wait for an explicit human decision. |
+| 10 | **request-budget authority error** (`stop_for_barrier_error`) — unreadable governing/request evidence or drift in the Codex reported-signal live-head check, initial timeout evidence, request-cap evaluation, exhausted-ceiling/final-request terminal resampling, or CodeRabbit probe head during a pending final-request wait (`p4b_same_head_barrier`, mapped by `run_same_head_barrier`). Also covers unreadable/changed authorized request generations (`capture_authorized_request_generation`, `refuse_approval_if_request_generation_moved`) and changed/unreadable available-budget or spent-ceiling tuple, policy, budget, generation or human-stop evidence (`revalidate_codex_request_budget_authority`, `revalidate_request_ceiling_authority`). These fences run before dispatch and at later publication/manual-handoff boundaries as applicable; late refusal corrects provisional accounting and closes this run’s filed issues. Actual human stops remain `exit 8` and a fresh pending final request can hold with `exit 6`. No review or manual handoff is published. Repair the read or rerun against the current head, base policy and request timeline. |
+
+### Unpublished verdict evidence (#2790)
+
+A validated adapter result is kept separately from its rendered review. Reserved Codex command quotes in adapter-authored presentation receive a zero-width break after `@`, including inside fences, before the unchanged strict payload guard runs. The exact raw findings stay available even when presentation changes.
+
+On publication refusal, terminal JSON carries `validated_verdict` and `validated_verdict_path`; stderr prints the retained private file under the accounting state directory's `unposted-verdicts/`. A retention failure is explicit (`validated_verdict_path: null`, `validated_verdict_retention_error`) and leaves the findings in terminal JSON. Successful publication removes that local copy. A local guard refusal precedes transport and lets only the owning writer release its unspent reservation. Any wrapper/transport attempt keeps the reservation occupied; reconciliation can adopt only the exact unique run/head/reviewer review, and never reposts it.

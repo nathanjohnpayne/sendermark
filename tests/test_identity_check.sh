@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+# tests/test_identity_check.sh
+#
+# Unit tests for scripts/identity-check.sh — the pre-action identity
+# assertion helper that callers run at the top of every WRITE path to
+# fail-close on identity drift. See #284.
+#
+# Strategy: PATH-shim `gh` with a stub that:
+#   - returns a configurable string for `gh config get -h github.com user`
+#     (the stored-account read used by --expect-author /
+#     --expect-reviewer / --expect-external)
+#   - returns a configurable string for `gh api user --jq .login` (the
+#     PAT-identity read used by --expect-token-identity)
+#
+# Bash 3.2 portable. Runs from any test runner (e.g. scripts/ci/) and
+# is a useful local debugging entry point.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/scripts/identity-check.sh"
+
+[[ -x "$SCRIPT" ]] || { echo "missing or non-executable $SCRIPT" >&2; exit 1; }
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/identity-check-test.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+PASS=0
+FAIL=0
+# The write mode reads these; an operator's own values must not leak in.
+unset GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+# hosts.yml is read too; point it at an empty dir unless a case sets its own.
+export GH_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/idcheck-ghcfg.XXXXXX")"
+pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+# Build a PATH-shim `gh` stub.
+#   STUB_ACTIVE_USER   what `gh config get -h github.com user` returns
+#   STUB_TOKEN_LOGIN   what `gh api user --jq .login` returns
+#   STUB_TOKEN_RC      exit code for `gh api user` (default 0)
+STUB_DIR="$WORKDIR/stub-bin"
+mkdir -p "$STUB_DIR"
+cat >"$STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "config get")
+    [ -n "${STUB_ACTIVE_USER:-}" ] && echo "$STUB_ACTIVE_USER"
+    exit 0
+    ;;
+  "api user")
+    [ -n "${STUB_API_LOG:-}" ] && echo "$*" >>"$STUB_API_LOG"
+    rc="${STUB_TOKEN_RC:-0}"
+    if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+    # gh's host resolution: with a single GHES host in hosts.yml and no
+    # --hostname, the request goes there and its login answers.
+    case " $* " in
+      *" --hostname github.com "*) ;;
+      *) if [ -n "${STUB_SOLE_GHES_LOGIN:-}" ]; then echo "$STUB_SOLE_GHES_LOGIN"; exit 0; fi ;;
+    esac
+    if [ "${GH_TOKEN:-}" = gho_diagnostic_fallback ]; then
+      echo "${STUB_FALLBACK_LOGIN:-}"
+    else
+      echo "${STUB_TOKEN_LOGIN:-}"
+    fi
+    exit 0
+    ;;
+  "auth token")
+    printf '%s\n' gho_diagnostic_fallback
+    exit 0
+    ;;
+  "api graphql")
+    # The viewer read --expect-thread-resolution-app makes (#2726): an
+    # installation token has no `GET /user`, so its identity is the viewer.
+    [ -n "${STUB_API_LOG:-}" ] && echo "$*" >>"$STUB_API_LOG"
+    rc="${STUB_VIEWER_RC:-0}"
+    if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+    echo "${STUB_VIEWER_LOGIN:-}"
+    exit 0
+    ;;
+  "api -i")
+    # `gh api -i user`: the headers --expect-write-identity reads for a
+    # legacy unprefixed token (#1057).
+    [ -n "${STUB_API_LOG:-}" ] && echo "$*" >>"$STUB_API_LOG"
+    [ "${STUB_HEADERS_EMPTY:-0}" != 1 ] || exit "${STUB_HEADERS_RC:-0}"
+    printf 'HTTP/2.0 200 OK\r\n'
+    [ -n "${STUB_SCOPES:-}" ] && printf 'X-Oauth-Scopes: %s\r\n' "$STUB_SCOPES"
+    printf '\r\n{"login":"%s"}\n' "${STUB_TOKEN_LOGIN:-}"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+STUB
+chmod +x "$STUB_DIR/gh"
+
+# Run the script with the stubbed PATH.
+run_check() {
+  PATH="$STUB_DIR:$PATH" "$SCRIPT" "$@"
+}
+
+# -----------------------------------------------------------------------
+# Test 1: --expect-author with matching stored account → exit 0
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="nathanjohnpayne" run_check --expect-author 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
+  pass "--expect-author match: exit 0, silent"
+else
+  fail "--expect-author match: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# Test 2: --expect-author with WRONG stored account → exit 2 + remediation
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="nathanpayne-claude" run_check --expect-author 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "--expect-author mismatch: exit $rc, expected 2; output: $out"
+elif ! grep -qi "expected 'nathanjohnpayne'" <<<"$out"; then
+  fail "--expect-author mismatch: missing 'expected nathanjohnpayne' in output: $out"
+elif ! grep -qi "use the token wrapper for guarded writes" <<<"$out"; then
+  fail "--expect-author mismatch: missing remediation hint; output: $out"
+else
+  pass "--expect-author mismatch: exit 2 with remediation"
+fi
+
+# -----------------------------------------------------------------------
+# Test 3: --expect-author with IDENTITY_CHECK_EXPECTED_AUTHOR override
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="custom-author" IDENTITY_CHECK_EXPECTED_AUTHOR="custom-author" \
+  run_check --expect-author 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "--expect-author with override: respects IDENTITY_CHECK_EXPECTED_AUTHOR"
+else
+  fail "--expect-author with override: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# Test 4: --expect-reviewer with MERGEPATH_AGENT=claude + matching active
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="nathanpayne-claude" MERGEPATH_AGENT="claude" \
+  run_check --expect-reviewer 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "--expect-reviewer match (MERGEPATH_AGENT=claude): exit 0"
+else
+  fail "--expect-reviewer match: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# Test 5: --expect-reviewer with MERGEPATH_AGENT=cursor but active=claude
+# → mismatch, exit 2
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="nathanpayne-claude" MERGEPATH_AGENT="cursor" \
+  run_check --expect-reviewer 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "--expect-reviewer (cursor expected, claude active): exit $rc, expected 2; output: $out"
+elif ! grep -qi "expected 'nathanpayne-cursor'" <<<"$out"; then
+  fail "--expect-reviewer (cursor expected, claude active): missing expected identity; output: $out"
+else
+  pass "--expect-reviewer cross-agent mismatch: exit 2"
+fi
+
+# -----------------------------------------------------------------------
+# Test 6: --expect-reviewer with MERGEPATH_AGENT UNSET → warns + falls
+# back to claude
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="nathanpayne-claude" \
+  env -u MERGEPATH_AGENT "$SCRIPT" --expect-reviewer 2>&1)
+rc=$?
+set -e
+# Stub PATH wasn't passed here because we used `env -u` directly. Redo
+# with both PATH and the unset.
+set +e
+out=$(PATH="$STUB_DIR:$PATH" STUB_ACTIVE_USER="nathanpayne-claude" \
+  env -u MERGEPATH_AGENT bash -c 'PATH="'"$STUB_DIR"':$PATH" STUB_ACTIVE_USER="nathanpayne-claude" "'"$SCRIPT"'" --expect-reviewer' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  fail "--expect-reviewer missing MERGEPATH_AGENT: exit $rc, expected 0 (fallback to claude); output: $out"
+elif ! grep -qi "MERGEPATH_AGENT is unset" <<<"$out"; then
+  fail "--expect-reviewer missing MERGEPATH_AGENT: missing warning; output: $out"
+else
+  pass "--expect-reviewer missing MERGEPATH_AGENT: warns + falls back to claude"
+fi
+
+# -----------------------------------------------------------------------
+# Test 7: --expect-external with explicit agent + matching active
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="nathanpayne-codex" \
+  run_check --expect-external codex 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "--expect-external codex (active=nathanpayne-codex): exit 0"
+else
+  fail "--expect-external codex match: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# Test 8: --expect-external with mismatched agent → exit 2
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="nathanpayne-claude" \
+  run_check --expect-external codex 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "--expect-external codex (active=claude): exit $rc, expected 2"
+elif ! grep -qi "expected 'nathanpayne-codex'" <<<"$out"; then
+  fail "--expect-external codex (active=claude): missing expected identity; output: $out"
+else
+  pass "--expect-external codex mismatch: exit 2"
+fi
+
+# -----------------------------------------------------------------------
+# Test 9: --expect-external with no agent argument → exit 1
+# -----------------------------------------------------------------------
+set +e
+out=$(run_check --expect-external 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 1 ]; then
+  pass "--expect-external no arg: exit 1 (bad invocation)"
+else
+  fail "--expect-external no arg: exit $rc, expected 1"
+fi
+
+# -----------------------------------------------------------------------
+# Test 10: --expect-token-identity match (token resolves to login)
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_TOKEN_LOGIN="nathanpayne-claude" GH_TOKEN="fake-pat" \
+  run_check --expect-token-identity nathanpayne-claude 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "--expect-token-identity match: exit 0"
+else
+  fail "--expect-token-identity match: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# Test 11: --expect-token-identity mismatch (token resolves to wrong login)
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_TOKEN_LOGIN="nathanjohnpayne" GH_TOKEN="fake-pat" \
+  run_check --expect-token-identity nathanpayne-claude 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 2 ]; then
+  fail "--expect-token-identity mismatch: exit $rc, expected 2; output: $out"
+elif ! grep -qi "GH_TOKEN resolves to identity 'nathanjohnpayne'" <<<"$out"; then
+  fail "--expect-token-identity mismatch: missing actual identity; output: $out"
+elif ! grep -qi "graphql write — PAT-attributed" <<<"$out"; then
+  fail "--expect-token-identity mismatch: missing matrix pointer; output: $out"
+else
+  pass "--expect-token-identity mismatch: exit 2 with matrix pointer"
+fi
+
+# -----------------------------------------------------------------------
+# Test 12: --expect-token-identity with NO GH_TOKEN set → exit 3
+# (cannot verify, fail closed)
+# -----------------------------------------------------------------------
+set +e
+out=$(env -u GH_TOKEN PATH="$STUB_DIR:$PATH" \
+  "$SCRIPT" --expect-token-identity nathanpayne-claude 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "--expect-token-identity no GH_TOKEN: exit $rc, expected 3; output: $out"
+elif ! grep -qi "GH_TOKEN is empty" <<<"$out"; then
+  fail "--expect-token-identity no GH_TOKEN: missing diagnostic; output: $out"
+else
+  pass "--expect-token-identity no GH_TOKEN: exit 3 (fail closed)"
+fi
+
+# -----------------------------------------------------------------------
+# Test 13: --expect-token-identity with gh api user failure → exit 3
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_TOKEN_RC=1 GH_TOKEN="bad-pat" \
+  run_check --expect-token-identity nathanpayne-claude 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "--expect-token-identity api failure: exit $rc, expected 3; output: $out"
+elif ! grep -qi "gh api user.*failed" <<<"$out"; then
+  fail "--expect-token-identity api failure: missing diagnostic; output: $out"
+else
+  pass "--expect-token-identity api failure: exit 3 (fail closed)"
+fi
+
+# -----------------------------------------------------------------------
+# Test 14: keyring read failure (empty STUB_ACTIVE_USER) → exit 3
+# -----------------------------------------------------------------------
+set +e
+out=$(STUB_ACTIVE_USER="" run_check --expect-author 2>&1)
+rc=$?
+set -e
+if [ "$rc" -ne 3 ]; then
+  fail "keyring read failure: exit $rc, expected 3; output: $out"
+elif ! grep -qi "returned empty" <<<"$out"; then
+  fail "keyring read failure: missing diagnostic; output: $out"
+else
+  pass "keyring read failure: exit 3 (fail closed)"
+fi
+
+# -----------------------------------------------------------------------
+# Test 15: no mode → exit 1
+# -----------------------------------------------------------------------
+set +e
+out=$(run_check 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -qi "no mode specified" <<<"$out"; then
+  pass "no mode: exit 1"
+else
+  fail "no mode: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# Test 16: conflicting modes → exit 1
+# -----------------------------------------------------------------------
+set +e
+out=$(run_check --expect-author --expect-reviewer 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 1 ] && grep -qi "conflicting modes" <<<"$out"; then
+  pass "conflicting modes: exit 1"
+else
+  fail "conflicting modes: exit $rc, output: $out"
+fi
+
+# -----------------------------------------------------------------------
+# #1057: --expect-write-identity. A token must READ as the login AND be a
+# user-held credential. The class is decided from the token before any API
+# call, because GET /user is exactly what a broker answers truthfully for the
+# wrong writer: the Claude cloud placeholder reads as the human.
+# -----------------------------------------------------------------------
+write_case() { # <label> <expected rc> <token> [env assignments...]
+  local label="$1" want="$2" token="$3" out rc
+  shift 3
+  : >"$WORKDIR/api.log"
+  set +e
+  out=$(env "$@" STUB_API_LOG="$WORKDIR/api.log" GH_TOKEN="$token" \
+    PATH="$STUB_DIR:$PATH" "$SCRIPT" --expect-write-identity nathanjohnpayne 2>&1)
+  rc=$?
+  set -e
+  WRITE_OUT="$out"
+  if [ "$rc" -eq "$want" ]; then
+    pass "--expect-write-identity $label: exit $rc"
+  else
+    fail "--expect-write-identity $label: exit $rc, expected $want; output: $out"
+  fi
+}
+
+write_case "ghp_ PAT reading as the login" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "fine-grained PAT reading as the login" 0 github_pat_x STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "gh login token reading as the login" 0 gho_x STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "user-held PAT reading as another login" 2 ghp_x STUB_TOKEN_LOGIN=nathanpayne-claude
+
+write_case "cloud placeholder that reads as the login" 3 proxy-injected STUB_TOKEN_LOGIN=nathanjohnpayne
+if [ -s "$WORKDIR/api.log" ]; then
+  fail "--expect-write-identity placeholder: GET /user was called before the class refused it"
+elif ! grep -q "credential class is 'brokered'" <<<"$WRITE_OUT"; then
+  fail "--expect-write-identity placeholder: diagnostic does not name the class; output: $WRITE_OUT"
+else
+  pass "--expect-write-identity placeholder: refused on class, before any API call"
+fi
+
+write_case "app installation token that reads as the login" 3 ghs_x STUB_TOKEN_LOGIN=nathanjohnpayne
+
+# Codex on #1541: a GH_HOST elsewhere would verify, and then write, against
+# another server, so it is refused before GET /user; github.com in any case is
+# fine. A separate Enterprise login is not refused: gh uses it only for an
+# Enterprise Server target, and the wrappers overwrite it with a sentinel.
+write_case "separate GH_ENTERPRISE_TOKEN" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_ENTERPRISE_TOKEN=ghp_other GITHUB_ENTERPRISE_TOKEN=gho_other
+write_case "GH_HOST on an Enterprise Server" 3 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=ghe.example.com
+if [ -s "$WORKDIR/api.log" ]; then
+  fail "--expect-write-identity GH_HOST: GET /user was called before the refusal"
+else
+  pass "--expect-write-identity GH_HOST: refused before any API call"
+fi
+write_case "GH_HOST=GitHub.com" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_HOST=GitHub.com
+
+# #1541: hosts.yml is deliberately not parsed (four YAML forms defeated a
+# parser in review). A sole GHES host is handled where the writes happen: the
+# check pins its own requests to github.com, the wrappers give other hosts a
+# non-credential sentinel, and unwrapped callers pin GH_HOST=github.com.
+mkdir -p "$WORKDIR/ghcfg-ghe"
+printf '  ghe.example.com:\n    user: someone-else\n' >"$WORKDIR/ghcfg-ghe/hosts.yml"
+write_case "hosts.yml is not consulted (sole GHES host present)" 0 ghp_x STUB_TOKEN_LOGIN=nathanjohnpayne GH_CONFIG_DIR="$WORKDIR/ghcfg-ghe"
+if grep -q -- '--hostname github.com' "$WORKDIR/api.log"; then
+  pass "--expect-write-identity: its identity request is pinned to github.com regardless of hosts.yml"
+else
+  fail "identity request not pinned: $(cat "$WORKDIR/api.log")"
+fi
+
+# Phase 4b P1 on #1541: an unset GH_HOST does not mean github.com. With a
+# single GHES host configured, a bare `gh api user` answers with THAT login.
+# Both write-mode requests are pinned to github.com, so a github.com PAT
+# owned by someone else cannot borrow a matching Enterprise login.
+write_case "single GHES host whose login matches" 2 ghp_x STUB_TOKEN_LOGIN=someone-else STUB_SOLE_GHES_LOGIN=nathanjohnpayne
+write_case "legacy hex token, both requests pinned" 0 0123456789abcdef0123456789abcdef01234567 STUB_TOKEN_LOGIN=nathanjohnpayne STUB_SCOPES=repo
+if [ "$(grep -c -- '--hostname github.com' "$WORKDIR/api.log")" -eq 2 ] && [ "$(wc -l <"$WORKDIR/api.log" | tr -d ' ')" -eq 2 ]; then
+  pass "--expect-write-identity: the header and login requests both target github.com"
+else
+  fail "--expect-write-identity host pinning: $(cat "$WORKDIR/api.log")"
+fi
+write_case "opaque token that reads as the login" 3 some-token STUB_TOKEN_LOGIN=nathanjohnpayne
+write_case "opaque token with the opt-in" 0 some-token STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+if grep -q "WARNING" <<<"$WRITE_OUT"; then
+  pass "--expect-write-identity opt-in: accepted with a stderr warning"
+else
+  fail "--expect-write-identity opt-in: no warning; output: $WRITE_OUT"
+fi
+write_case "placeholder with the opt-in" 3 proxy-injected STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+write_case "app token with the opt-in" 3 ghs_x STUB_TOKEN_LOGIN=nathanjohnpayne MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+
+HEX40=0123456789abcdef0123456789abcdef01234567
+write_case "legacy hex token with X-OAuth-Scopes" 0 "$HEX40" STUB_TOKEN_LOGIN=nathanjohnpayne STUB_SCOPES=repo
+write_case "legacy hex token without X-OAuth-Scopes" 3 "$HEX40" STUB_TOKEN_LOGIN=nathanjohnpayne
+
+set +e
+out=$(env -u GH_TOKEN PATH="$STUB_DIR:$PATH" "$SCRIPT" --expect-write-identity nathanjohnpayne 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 3 ]; then
+  pass "--expect-write-identity with no GH_TOKEN: exit 3"
+else
+  fail "--expect-write-identity with no GH_TOKEN: exit $rc; output: $out"
+fi
+
+# The read-only mode is unchanged: the same placeholder still READS as the
+# login, which is exactly why reads and writes need different modes.
+set +e
+out=$(STUB_TOKEN_LOGIN=nathanjohnpayne GH_TOKEN=proxy-injected run_check --expect-token-identity nathanjohnpayne 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "--expect-token-identity still answers the read question for the placeholder (exit 0)"
+else
+  fail "--expect-token-identity placeholder read: exit $rc; output: $out"
+fi
+
+# #1544: run the actual shared resolver and identity checker together. The
+# successful ambient path must replay warnings without stdout/token material;
+# rejected candidates keep their checker diagnostics private during fallback.
+for expected in nathanjohnpayne nathanpayne-claude; do
+  for scenario in recognised opt-in rejected mismatch empty-headers; do
+    fixture_token=opaque-diagnostic-fixture; selected_token="$fixture_token"
+    login="$expected"; opt_in=1; empty_headers=0
+    case "$scenario" in
+      recognised) fixture_token=ghp_diagnostic_fixture; selected_token="$fixture_token" ;;
+      rejected) opt_in=0; selected_token=gho_diagnostic_fallback ;;
+      mismatch) login=someone-else; selected_token=gho_diagnostic_fallback ;;
+      empty-headers) fixture_token="$HEX40"; selected_token="$fixture_token"; empty_headers=1 ;;
+    esac
+    rc=0
+    # Positional parameters expand in the child Bash after sourcing the helper.
+    # shellcheck disable=SC2016
+    env GH_TOKEN="$fixture_token" STUB_TOKEN_LOGIN="$login" STUB_FALLBACK_LOGIN="$expected" \
+      MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN="$opt_in" STUB_HEADERS_EMPTY="$empty_headers" \
+      PATH="$STUB_DIR:$PATH" bash -c '
+        . "$1"
+        gh_resolve_token_for_identity "$2" "" diagnostic-fixture || exit $?
+        [ "$GH_RESOLVED_TOKEN" = "$3" ]
+      ' _ "$ROOT/scripts/lib/gh-token-resolver.sh" "$expected" "$selected_token" \
+      >"$WORKDIR/resolver.out" 2>"$WORKDIR/resolver.err" || rc=$?
+    diagnostic_ok=0
+    case "$scenario" in
+      recognised) [ ! -s "$WORKDIR/resolver.err" ] && diagnostic_ok=1 ;;
+      opt-in) grep -Fq 'WARNING GH_TOKEN is not a recognised user-held credential form' "$WORKDIR/resolver.err" && diagnostic_ok=1 ;;
+      rejected|mismatch)
+        if grep -Fq 'ambient GH_TOKEN did not verify' "$WORKDIR/resolver.err" \
+           && ! grep -Eq 'identity-check: (WARNING|BLOCKED)' "$WORKDIR/resolver.err"; then diagnostic_ok=1; fi ;;
+      empty-headers)
+        if grep -Fq 'legacy token response headers are empty' "$WORKDIR/resolver.err" \
+           && grep -Fq 'WARNING GH_TOKEN is not a recognised user-held credential form' "$WORKDIR/resolver.err"; then diagnostic_ok=1; fi ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ "$diagnostic_ok" -eq 1 ] && [ ! -s "$WORKDIR/resolver.out" ] \
+       && ! grep -Fq -- "$fixture_token" "$WORKDIR/resolver.err" \
+       && ! grep -Fq -- "$selected_token" "$WORKDIR/resolver.err"; then
+      pass "#1544 $expected $scenario preserves resolver diagnostics, selection and stdout"
+    else
+      fail "#1544 $expected $scenario: rc=$rc or diagnostic/selection/output mismatch"
+    fi
+  done
+done
+
+# Empty 40-hex header capture is observable for both successful-empty and
+# failed probes. Classification and the explicit override decision stay intact.
+for header_rc in 0 1; do
+  for opt_in in 0 1; do
+    wanted=3; [ "$opt_in" != 1 ] || wanted=0
+    rc=0
+    env GH_TOKEN="$HEX40" STUB_TOKEN_LOGIN=nathanjohnpayne STUB_HEADERS_EMPTY=1 \
+      STUB_HEADERS_RC="$header_rc" MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN="$opt_in" \
+      PATH="$STUB_DIR:$PATH" "$SCRIPT" --expect-write-identity nathanjohnpayne \
+      >"$WORKDIR/header.out" 2>"$WORKDIR/header.err" || rc=$?
+    if [ "$rc" -eq "$wanted" ] && [ ! -s "$WORKDIR/header.out" ] \
+       && grep -Fq 'legacy token response headers are empty' "$WORKDIR/header.err" \
+       && ! grep -Fq -- "$HEX40" "$WORKDIR/header.err"; then
+      pass "#1544 empty headers rc=$header_rc opt-in=$opt_in note preserves existing decision"
+    else
+      fail "#1544 empty headers rc=$header_rc opt-in=$opt_in lost note or changed decision/stdout"
+    fi
+  done
+done
+
+# -----------------------------------------------------------------------
+# #2726: --expect-thread-resolution-app, the bounded CI-app mode. It accepts
+# exactly ONE GitHub App identity, the login the checker's own checkout
+# declares as thread_resolution_ci_app_identity, and only from a token whose
+# FORM proves it is an installation token. The checker reads the policy next
+# to itself, so each case runs a copy of the real checker in a fixture tree.
+# -----------------------------------------------------------------------
+APP='mergepath-ci[bot]'
+APP_TREE="$WORKDIR/app-tree"
+mkdir -p "$APP_TREE/scripts/lib" "$APP_TREE/.github"
+cp "$SCRIPT" "$APP_TREE/scripts/identity-check.sh"
+cp "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/reviewers-helpers.sh" "$APP_TREE/scripts/lib/"
+APP_POLICY="$APP_TREE/.github/review-policy.yml"
+
+# app_policy <thread_resolution_ci_app_identity line, or empty for absent>
+#            [extra non_reviewer_identities item] [extra available_reviewers item]
+app_policy() {
+  {
+    printf 'available_reviewers:\n  - nathanpayne-claude\n  - nathanpayne-codex\n'
+    [ -z "${3:-}" ] || printf '  - %s\n' "$3"
+    printf 'non_reviewer_identities:\n  - nathanpayne-robot\n'
+    [ -z "${2:-}" ] || printf '  - %s\n' "$2"
+    [ -z "$1" ] || printf '%s\n' "$1"
+  } >"$APP_POLICY"
+}
+APP_OK_LINE="thread_resolution_ci_app_identity: \"$APP\"  # the CI app (#2727)"
+
+app_case() { # <label> <expected rc> <token> [env assignments...]
+  local label="$1" want="$2" token="$3" out rc
+  shift 3
+  : >"$WORKDIR/api.log"
+  set +e
+  out=$(env "$@" STUB_API_LOG="$WORKDIR/api.log" GH_TOKEN="$token" \
+    PATH="$STUB_DIR:$PATH" "$APP_TREE/scripts/identity-check.sh" --expect-thread-resolution-app 2>&1)
+  rc=$?
+  set -e
+  APP_OUT="$out"
+  if [ "$rc" -eq "$want" ]; then
+    pass "--expect-thread-resolution-app $label: exit $rc"
+  else
+    fail "--expect-thread-resolution-app $label: exit $rc, expected $want; output: $out"
+  fi
+}
+no_api_call() { # <label>
+  if [ -s "$WORKDIR/api.log" ]; then
+    fail "--expect-thread-resolution-app $1: an API call was made before the refusal: $(cat "$WORKDIR/api.log")"
+  else
+    pass "--expect-thread-resolution-app $1: refused before any API call"
+  fi
+}
+
+# The configured app is accepted, silently, and its one read is pinned to
+# github.com. GraphQL may report a bot's login without the [bot] suffix; the
+# token class already proves the actor is an app, whose slug is unique.
+app_policy "$APP_OK_LINE" "$APP"
+app_case "configured app, viewer reads as its login" 0 ghs_x STUB_VIEWER_LOGIN="$APP"
+if [ -z "$APP_OUT" ] && grep -q -- '--hostname github.com' "$WORKDIR/api.log"; then
+  pass "--expect-thread-resolution-app: silent on success, viewer read pinned to github.com"
+else
+  fail "--expect-thread-resolution-app success: output '$APP_OUT', calls: $(cat "$WORKDIR/api.log")"
+fi
+app_case "configured app, viewer reads as the bare slug" 0 ghs_x STUB_VIEWER_LOGIN=mergepath-ci
+
+# Any other app or bot identity is rejected, including one whose name merely
+# contains the configured slug.
+app_case "another app's installation token" 2 ghs_x STUB_VIEWER_LOGIN='other-app[bot]'
+app_case "a suffix-extended app login" 2 ghs_x STUB_VIEWER_LOGIN='mergepath-ci-evil[bot]'
+app_case "the shared Actions bot" 2 ghs_x STUB_VIEWER_LOGIN='github-actions[bot]'
+app_case "viewer read fails" 3 ghs_x STUB_VIEWER_LOGIN="$APP" STUB_VIEWER_RC=1
+app_case "viewer read returns nothing" 3 ghs_x STUB_VIEWER_LOGIN=
+
+# Only an installation token qualifies. A user-held token is the reviewer-PAT
+# path and keeps --expect-write-identity; the cloud placeholder and opaque
+# tokens prove nothing. All refused on form, before any call.
+app_case "user PAT reading as the app" 3 ghp_x STUB_VIEWER_LOGIN="$APP"
+no_api_call "user PAT"
+app_case "app user-to-server token (user-held, not installed)" 3 ghu_x STUB_VIEWER_LOGIN="$APP"
+app_case "cloud placeholder" 3 proxy-injected STUB_VIEWER_LOGIN="$APP"
+app_case "opaque token, even with the unidentifiable opt-in" 3 some-token STUB_VIEWER_LOGIN="$APP" MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+app_case "GH_HOST on an Enterprise Server" 3 ghs_x STUB_VIEWER_LOGIN="$APP" GH_HOST=ghe.example.com
+no_api_call "GH_HOST elsewhere"
+set +e
+out=$(env -u GH_TOKEN PATH="$STUB_DIR:$PATH" "$APP_TREE/scripts/identity-check.sh" --expect-thread-resolution-app 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 3 ]; then
+  pass "--expect-thread-resolution-app with no GH_TOKEN: exit 3"
+else
+  fail "--expect-thread-resolution-app with no GH_TOKEN: exit $rc; output: $out"
+fi
+
+# Unconfigured is inert: absent, empty or null keys accept no app at all.
+for line in "" 'thread_resolution_ci_app_identity:' 'thread_resolution_ci_app_identity: ""' 'thread_resolution_ci_app_identity: ~'; do
+  app_policy "$line" "$APP"
+  app_case "unconfigured (${line:-key absent})" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+  no_api_call "unconfigured (${line:-key absent})"
+done
+if grep -q "thread_resolution_ci_app_identity is not configured" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app unconfigured: diagnostic names the key"
+else
+  fail "--expect-thread-resolution-app unconfigured: diagnostic does not name the key; output: $APP_OUT"
+fi
+
+# A configured value is validated where it is read, and an invalid one fails
+# closed rather than falling back to any other identity.
+app_policy "$APP_OK_LINE"
+app_case "configured app missing from non_reviewer_identities" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+if grep -q "non_reviewer_identities" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the missing non_reviewer_identities declaration"
+else
+  fail "--expect-thread-resolution-app missing declaration: diagnostic: $APP_OUT"
+fi
+app_policy "$APP_OK_LINE" "$APP" "$APP"
+app_case "configured app also listed in available_reviewers" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+if grep -q "available_reviewers" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the forbidden available_reviewers listing"
+else
+  fail "--expect-thread-resolution-app reviewer listing: diagnostic: $APP_OUT"
+fi
+# The shape check is the ONLY refusal in these two cases: each value is
+# declared in non_reviewer_identities and absent from available_reviewers, so a
+# dropped or weakened <app-slug>[bot] check would accept it.
+app_policy 'thread_resolution_ci_app_identity: nathanpayne-robot'
+app_case "configured value is a user login, not an app" 3 ghs_x STUB_VIEWER_LOGIN=nathanpayne-robot
+if grep -q "not a GitHub App bot login" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: a declared non-reviewer user login is refused by the app-login shape check"
+else
+  fail "--expect-thread-resolution-app user login: diagnostic: $APP_OUT"
+fi
+for bot in 'github-actions[bot]' 'coderabbitai[bot]' 'chatgpt-codex-connector[bot]' 'dependabot[bot]' 'github-advanced-security[bot]'; do
+  app_policy "thread_resolution_ci_app_identity: \"$bot\"" "$bot"
+  app_case "configured value is the shared or reviewing bot $bot" 3 ghs_x STUB_VIEWER_LOGIN="$bot"
+done
+app_policy 'thread_resolution_ci_app_identity: [mergepath-ci[bot]]' '"[mergepath-ci[bot]]"'
+app_case "configured value is a flow list" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+if grep -q "not a GitHub App bot login" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: a flow-list value is refused by the app-login shape check"
+else
+  fail "--expect-thread-resolution-app flow-list value: diagnostic: $APP_OUT"
+fi
+app_policy "$APP_OK_LINE" ""
+printf 'non_reviewer_identities: [%s]\n' "$APP" >"$APP_POLICY.tmp"
+grep -v -e '^non_reviewer_identities:' -e '^  - nathanpayne-robot' "$APP_POLICY" >>"$APP_POLICY.tmp"
+mv "$APP_POLICY.tmp" "$APP_POLICY"
+app_case "non_reviewer_identities as an unparseable flow list" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+# The membership test alone would also refuse here, as "not declared"; the
+# guard's job is to say the list cannot be parsed, not that it is missing.
+if grep -q "non_reviewer_identities in .* inline value" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the unparseable non_reviewer_identities list"
+else
+  fail "--expect-thread-resolution-app flow non_reviewer_identities: diagnostic: $APP_OUT"
+fi
+# available_reviewers as a flow list naming the app: the bash reader sees an
+# empty list, but the workflows' YAML readers give the app reviewer standing,
+# so the validator refuses what it cannot parse.
+{
+  printf 'available_reviewers: [nathanpayne-claude, "%s"]\n' "$APP"
+  printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$APP"
+  printf '%s\n' "$APP_OK_LINE"
+} >"$APP_POLICY"
+app_case "available_reviewers as a flow list naming the app" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+no_api_call "available_reviewers as a flow list"
+if grep -q "available_reviewers in .* inline value" <<<"$APP_OUT"; then
+  pass "--expect-thread-resolution-app: names the unparseable available_reviewers list"
+else
+  fail "--expect-thread-resolution-app flow available_reviewers: diagnostic: $APP_OUT"
+fi
+# The empty flow list is the documented inert form and parses: still accepted.
+{
+  printf 'available_reviewers: []\n'
+  printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$APP"
+  printf '%s\n' "$APP_OK_LINE"
+} >"$APP_POLICY"
+app_case "available_reviewers as an empty flow list" 0 ghs_x STUB_VIEWER_LOGIN="$APP"
+
+# The mode takes no login argument: the identity comes only from the policy.
+app_policy "$APP_OK_LINE" "$APP"
+set +e
+out=$(GH_TOKEN=ghs_x STUB_VIEWER_LOGIN='other-app[bot]' PATH="$STUB_DIR:$PATH" \
+  "$APP_TREE/scripts/identity-check.sh" --expect-thread-resolution-app 'other-app[bot]' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 1 ]; then
+  pass "--expect-thread-resolution-app refuses a caller-supplied login (exit 1)"
+else
+  fail "--expect-thread-resolution-app with a login argument: exit $rc; output: $out"
+fi
+
+# Configuring the app widens nothing else. --expect-write-identity, which every
+# other write path (the gh-as-* wrappers, the token resolver) uses, still
+# refuses the app's installation token, and the reviewer-PAT path is unchanged.
+tree_write() { # <expected rc> <login> <token> [env...]
+  local want="$1" login="$2" token="$3" out rc
+  shift 3
+  set +e
+  out=$(env "$@" GH_TOKEN="$token" PATH="$STUB_DIR:$PATH" \
+    "$APP_TREE/scripts/identity-check.sh" --expect-write-identity "$login" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq "$want" ]; then
+    pass "configured app tree: --expect-write-identity $login with ${token%%_*}_ token: exit $rc"
+  else
+    fail "configured app tree: --expect-write-identity $login: exit $rc, expected $want; output: $out"
+  fi
+}
+tree_write 3 "$APP" ghs_x STUB_TOKEN_LOGIN="$APP" STUB_VIEWER_LOGIN="$APP"
+tree_write 3 "$APP" ghs_x STUB_TOKEN_LOGIN="$APP" MERGEPATH_ALLOW_UNIDENTIFIABLE_WRITE_TOKEN=1
+tree_write 0 nathanpayne-claude ghp_x STUB_TOKEN_LOGIN=nathanpayne-claude
+tree_write 2 nathanpayne-claude ghp_x STUB_TOKEN_LOGIN=nathanpayne-codex
+
+# Fail closed without the policy reader: the mode cannot establish which app
+# is configured, so it accepts none.
+rm "$APP_TREE/scripts/lib/reviewers-helpers.sh"
+app_case "policy reader missing" 3 ghs_x STUB_VIEWER_LOGIN="$APP"
+cp "$ROOT/scripts/lib/reviewers-helpers.sh" "$APP_TREE/scripts/lib/"
+
+# -----------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------
+echo ""
+echo "test_identity_check: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
+fi
+exit 0

@@ -1,0 +1,353 @@
+[DRY-RUN] remove stale hub-only doc docs/agents/high-priority-scope-discipline.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/high-priority-scope-discipline.md
+[DRY-RUN] remove stale hub-only doc docs/agents/dependabot-reviewer-environment.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/dependabot-reviewer-environment.md
+[DRY-RUN] remove stale hub-only doc docs/agents/tracker-unblock-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/tracker-unblock-runbook.md
+[DRY-RUN] remove stale hub-only doc docs/agents/bootstrap-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/bootstrap-runbook.md
+[DRY-RUN] remove stale hub-only doc docs/agents/propagation-ordering.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/propagation-ordering.md
+[DRY-RUN] remove stale hub-only doc docs/agents/templated-propagation.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/templated-propagation.md
+[DRY-RUN] remove stale hub-only doc docs/agents/coderabbit-audit.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/coderabbit-audit.md
+[DRY-RUN] rsync /Users/nathanpayne/GitHub/mergepath -> /Users/nathanpayne/GitHub/sendermark: rsync -a --exclude=.git/ --exclude=.DS_Store --exclude=dist/ --exclude=mergepath/ --exclude=packaging/ --exclude=.mergepath-sync.yml --exclude=scripts/sync-to-downstream.sh --exclude=tests/test_sync_to_downstream.sh --exclude=scripts/lib/sync-audit-json.sh --exclude=tests/test_sync_audit_json.sh --exclude=specs/sync_audit_json.md --exclude=.github/workflows/weekly-drift-audit.yml --exclude=.mergepath-project-docs.yml --exclude=docs/projects/ --exclude=scripts/project-doc-sync.sh --exclude=tests/test_project_doc_sync.sh --exclude=.github/templates/required-workflows/ --exclude=scripts/build/materialize-merge-queue-policy-source.sh --exclude=.github/chainguard/ --exclude=.claude/worktrees/ --exclude=.claude/settings.local.json --exclude=.claude/launch.json --exclude=specs/mergepath_playground.md --exclude=plans/mergepath-playground.md --exclude=specs/bootstrap_consumer_identity.md --exclude=specs/bootstrap_label_seeding.md --exclude=specs/bootstrap_source_attribution.md --exclude=specs/sync_test_closure.md --exclude=specs/project_doc_sync.md --exclude=scripts/policy-sim.sh --exclude=scripts/wave-audit.sh --exclude=tests/test_wave_audit.sh --exclude=scripts/audit-canonical-mirrors.sh --exclude=tests/test_audit_canonical_mirrors.sh --exclude=.github/workflows/branch-protection-audit.yml --exclude=scripts/audit-branch-protection.sh --exclude=scripts/audit-credential-isolation.py --exclude=tests/test_audit_branch_protection.sh --exclude=tests/test_audit_branch_protection_workflow.sh --exclude=tests/test_credential_isolation.py --exclude=specs/credential_isolation.md --exclude=scripts/sync-labels.sh --exclude=tests/test_sync_labels.sh --exclude=BRAND.md --exclude=docs/agents/repository-overview.md --exclude=CONTEXT.md --exclude=bugs/screenshots/ --exclude=.github/screenshots/ --exclude=.bootstrap-log --exclude=.bootstrap-state --exclude=docs/agents/high-priority-scope-discipline.md --exclude=docs/agents/dependabot-reviewer-environment.md --exclude=docs/agents/tracker-unblock-runbook.md --exclude=docs/agents/bootstrap-runbook.md --exclude=docs/agents/propagation-ordering.md --exclude=docs/agents/templated-propagation.md --exclude=docs/agents/coderabbit-audit.md /Users/nathanpayne/GitHub/mergepath/ /Users/nathanpayne/GitHub/sendermark/
+[DRY-RUN] git init /Users/nathanpayne/GitHub/sendermark: git -C /Users/nathanpayne/GitHub/sendermark init -q -b main
+[DRY-RUN] stage initial files: git -C /Users/nathanpayne/GitHub/sendermark add -A
+[DRY-RUN] initial commit: git -C /Users/nathanpayne/GitHub/sendermark -c commit.gpgsign=false commit -q -m $'Initial commit (bootstrapped from mergepath@5e7ee18)\n\nSource: https://github.com/nathanjohnpayne/mergepath/commit/5e7ee18b5cbe3df8070787236cb421bf3f53baae'
+[DRY-RUN] create remote: gh repo create nathanjohnpayne/sendermark --private --description Keeps\ company\ contact\ cards\ current\ on\ the\ Mac:\ logos\ from\ Logo.dev\ and\ the\ numbers\ each\ company\ texts\ from. --source=/Users/nathanpayne/GitHub/sendermark
+[DRY-RUN] push bootstrap commit to nathanjohnpayne/sendermark: env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= git -c credential.helper= -c credential.helper=\!gh\ auth\ git-credential -C /Users/nathanpayne/GitHub/sendermark push -u origin HEAD
+[DRY-RUN] label create: needs-external-review: gh label create needs-external-review --repo nathanjohnpayne/sendermark --color bf0606 --description External\ review\ required\ before\ merge --force
+[DRY-RUN] label create: needs-human-review: gh label create needs-human-review --repo nathanjohnpayne/sendermark --color 7057ff --description Awaiting\ human\ triage\ or\ decision --force
+[DRY-RUN] label create: policy-violation: gh label create policy-violation --repo nathanjohnpayne/sendermark --color b60205 --description Blocked\ by\ review-policy.yml\ violation --force
+[DRY-RUN] label create: human-hold: gh label create human-hold --repo nathanjohnpayne/sendermark --color 000000 --description Hard\ merge\ freeze\ -\ human-remove-only\;\ supersedes\ all\ gates --force
+[DRY-RUN] label create: needs-local-agent: gh label create needs-local-agent --repo nathanjohnpayne/sendermark --color fbca04 --description A\ cloud/limited\ session\ parked\ this\ step\;\ a\ session\ with\ the\ named\ capability\ resumes\ it --force
+[DRY-RUN] label create: human-action: gh label create human-action --repo nathanjohnpayne/sendermark --color 0e8a16 --description Requires\ human\ attention --force
+[DRY-RUN] label create: decision-needed: gh label create decision-needed --repo nathanjohnpayne/sendermark --color e99695 --description Needs\ a\ human\ decision\ before\ work\ proceeds\ \(issue\ triage\,\ not\ a\ PR\ merge\ gate\) --force
+[DRY-RUN] label create: agent-action: gh label create agent-action --repo nathanjohnpayne/sendermark --color 1d76db --description Agent\ task\ —\ not\ blocked\ on\ human --force
+[DRY-RUN] label create: size:S: gh label create size:S --repo nathanjohnpayne/sendermark --color c2e0c6 --description Small:\ one\ or\ a\ few\ files\,\ straightforward\ verification.\ Calibrated\ to\ nathanpaynedotcom#942/#849. --force
+[DRY-RUN] label create: size:M: gh label create size:M --repo nathanjohnpayne/sendermark --color fef2c0 --description Medium:\ real\ design\ choice\ plus\ tests\ across\ a\ subsystem.\ Calibrated\ to\ nathanpaynedotcom#881/#825. --force
+[DRY-RUN] label create: size:L: gh label create size:L --repo nathanjohnpayne/sendermark --color f9d0c4 --description Large:\ crosses\ subsystems\ or\ changes\ a\ depended-on\ contract.\ Calibrated\ to\ nathanpaynedotcom#900. --force
+[DRY-RUN] label create: priority:critical: gh label create priority:critical --repo nathanjohnpayne/sendermark --color B60205 --description Broken\ now\ on\ the\ merge\ path\,\ dated\ evidence\,\ no\ workaround.\ Expect\ this\ to\ be\ empty. --force
+[DRY-RUN] label create: priority:high: gh label create priority:high --repo nathanjohnpayne/sendermark --color D93F0B --description Actionable\ now\;\ delay\ has\ demonstrated\ material\ cost.\ Cite\ evidence\ in\ the\ issue. --force
+[DRY-RUN] label create: priority:normal: gh label create priority:normal --repo nathanjohnpayne/sendermark --color 8B949E --description Default.\ Worth\ doing\;\ no\ observed\ live\ impact\,\ or\ it\ fails\ in\ the\ safe\ direction. --force
+[DRY-RUN] label create: priority:low: gh label create priority:low --repo nathanjohnpayne/sendermark --color D4D8DD --description Would\ not\ be\ missed.\ A\ candidate\ for\ closure\ at\ the\ next\ audit\ if\ still\ untouched. --force
+[DRY-RUN] label create: status:blocked: gh label create status:blocked --repo nathanjohnpayne/sendermark --color 6E7781 --description Cannot\ proceed\ until\ something\ outside\ this\ issue\ happens.\ Name\ what\,\ in\ the\ issue. --force
+[DRY-RUN] invite collaborator: nathanpayne-claude (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-claude -f permission=write
+[DRY-RUN] invite collaborator: nathanpayne-cursor (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-cursor -f permission=write
+[DRY-RUN] invite collaborator: nathanpayne-codex (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-codex -f permission=write
+[DRY-RUN] yq -i '.coderabbit.enabled = false' /Users/nathanpayne/GitHub/sendermark/.github/review-policy.yml: yq -i .coderabbit.enabled\ =\ false /Users/nathanpayne/GitHub/sendermark/.github/review-policy.yml
+[DRY-RUN] rm /Users/nathanpayne/GitHub/sendermark/.coderabbit.yml: rm -f /Users/nathanpayne/GitHub/sendermark/.coderabbit.yml
+[DRY-RUN] git add review-policy.yml + .coderabbit.yml: git -C /Users/nathanpayne/GitHub/sendermark add .github/review-policy.yml .coderabbit.yml
+[DRY-RUN] commit CodeRabbit-disable: git -C /Users/nathanpayne/GitHub/sendermark -c commit.gpgsign=false commit -q -m config:\ disable\ CodeRabbit\ \(private\ repo\,\ free\ tier\ is\ public-only\)
+[DRY-RUN] push origin main (CodeRabbit-disable): git -C /Users/nathanpayne/GitHub/sendermark push origin main
+[DRY-RUN] create Project v2: sendermark: gh project create --owner nathanjohnpayne --title sendermark --format json
+[DRY-RUN] Status field: Backlog/Ready/In progress/In review/Done: gh project field-create \<N\> --owner nathanjohnpayne --name Status --data-type SINGLE_SELECT --single-select-options Backlog\,Ready\,In\ progress\,In\ review\,Done
+[DRY-RUN] set board readme: gh project edit \<N\> --owner nathanjohnpayne --readme $'Keeps company contact cards current on the Mac: logos from Logo.dev and the numbers each company texts from.\n\n# Phase 0 — Foundations\nTODO: populate from the new repo\'s PRD / spec.\n\nGenerated by scripts/bootstrap-new-repo.sh (#156 sub-E).'
+[DRY-RUN] mkdir specs/: mkdir -p /Users/nathanpayne/GitHub/sendermark/specs
+[DRY-RUN] mkdir plans/: mkdir -p /Users/nathanpayne/GitHub/sendermark/plans
+[DRY-RUN] mkdir gh-projects/examples/sendermark/: mkdir -p /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark
+[DRY-RUN] write specs/sendermark.md (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/specs/sendermark.md TODO:\ write\ the\ implementation\ spec\ for\ this\ repo.\ Canonical\ PRDs\ live\ in\ nathanjohnpayne/docs/projects/\<project\>/prds/\ and\ are\ mirrored\ here\ via\ project-doc\ sync.
+[DRY-RUN] write plans/sendermark-sprint-0.md (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/plans/sendermark-sprint-0.md TODO:\ write\ the\ Sprint\ 0\ plan\ \(milestone\ breakdown\ /\ phasing\)\ for\ this\ repo.\ Wizard\ left\ this\ empty\ per\ #156\ deliberate-not-in-scope\ decision.
+[DRY-RUN] write scripts/gh-projects/examples/sendermark/create-issues.sh (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/create-issues.sh $'#!/usr/bin/env bash\n# scripts/gh-projects/examples/<repo>/create-issues.sh\n#\n# Phase 0 / Phase 1 issue-seeding skeleton for <repo>. Generated by\n# the Mergepath bootstrap wizard (#156 sub-E). Fill in the issue list\n# and run once after the repo is bootstrapped.\n#\n# Usage: bash scripts/gh-projects/examples/<repo>/create-issues.sh\n\nset -euo pipefail\n\n# TODO: populate with the Phase 0 / Phase 1 issues for <repo>.\n# Example shape:\n#   gh issue create --repo nathanjohnpayne/<repo> \\\n#     --title "Phase 0: scaffold" \\\n#     --label agent-action,size:S \\\n#     --body "..."\n'
+[DRY-RUN] chmod +x create-issues.sh: chmod +x /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/create-issues.sh
+[DRY-RUN] --- bootstrap summary (dry-run; not appended verbatim) ---
+[DRY-RUN] 
+[DRY-RUN] ==> Bootstrap complete: nathanjohnpayne/sendermark
+[DRY-RUN] 
+[DRY-RUN] REPO:        https://github.com/nathanjohnpayne/sendermark
+[DRY-RUN] PROJECT:     https://github.com/users/nathanjohnpayne/projects/<N>
+[DRY-RUN] LOCAL DIR:   /Users/nathanpayne/GitHub/sendermark
+[DRY-RUN] 
+[DRY-RUN] DONE:
+[DRY-RUN]   [done] Template mirror + name substitution
+[DRY-RUN]   [done] GitHub repo created (private) + 16 canonical labels attempted + reviewer invites + secrets
+[DRY-RUN]   [done] CodeRabbit + Codex App posture
+[DRY-RUN]   [done] Project v2 board configured (#<N>)
+[DRY-RUN]   [done] Empty implementation-spec / plan scaffolds written
+[DRY-RUN] 
+[DRY-RUN] SKIPPED:
+[DRY-RUN]   [skip] Firebase setup (firebase=none)
+[DRY-RUN] 
+[DRY-RUN] WARNINGS:
+[DRY-RUN]   - Population of .env.local from Firebase web console is manual.
+[DRY-RUN]   - Reviewer-identity collaborator invites must be accepted by each
+[DRY-RUN]     agent account at https://github.com/nathanjohnpayne/sendermark/invitations.
+[DRY-RUN] 
+[DRY-RUN] CROSS-REPO LOOP UPDATE:
+[DRY-RUN]   See template-mirror stage output above for the PR (if anchors
+[DRY-RUN]   were present). If anchors were absent, manually add 'sendermark'
+[DRY-RUN]   to the loop lists in mergepath's DEPLOYMENT.md +
+[DRY-RUN]   REVIEW_POLICY.md.
+[DRY-RUN]   NOTE: this loop-doc PR does NOT enroll 'sendermark' for ongoing
+[DRY-RUN]   sync. The one-time template rsync above and .mergepath-sync.yml
+[DRY-RUN]   consumer enrollment are SEPARATE steps — a repo registered only
+[DRY-RUN]   in the loop docs receives none of mergepath's post-bootstrap
+[DRY-RUN]   propagation. Enroll it as a consumer per NEXT STEPS below so the
+[DRY-RUN]   weekly propagation-drift sweep tracks it (see mergepath#741).
+[DRY-RUN] 
+[DRY-RUN] NEXT STEPS (human-action):
+[DRY-RUN]   1. Accept reviewer collaborator invites at:
+[DRY-RUN]      https://github.com/nathanjohnpayne/sendermark/invitations
+[DRY-RUN]      (sign in once per agent identity)
+[DRY-RUN]   2. Enroll 'sendermark' as a .mergepath-sync.yml consumer so it
+[DRY-RUN]      receives ongoing propagation (not just the one-time rsync):
+[DRY-RUN]      add it to the consumers: list with a facts: block verified
+[DRY-RUN]      against its own package.json (frameworks / testing / jsx_in_js
+[DRY-RUN]      / ESM-vs-CJS eslint variant), then run
+[DRY-RUN]      scripts/sync-to-downstream.sh --audit --repos sendermark and
+[DRY-RUN]      drive the first sync canary-first. See mergepath#741 and the
+[DRY-RUN]      .mergepath-sync.yml header.
+[DRY-RUN]   3. Write the repo-local implementation spec:
+[DRY-RUN]      /Users/nathanpayne/GitHub/sendermark/specs/sendermark.md
+[DRY-RUN]      Canonical PRDs live in nathanjohnpayne/docs/projects/sendermark/prds/
+[DRY-RUN]   4. Populate Phase 0 / Phase 1 issues via the create-issues.sh
+[DRY-RUN]      skeleton: /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/
+[DRY-RUN]   5. Set board #<N>'s built-in workflow targets
+[DRY-RUN]      (board ... > Workflows): Item added -> Backlog, Item reopened
+[DRY-RUN]      -> Ready, Pull request linked to issue -> In review, Item
+[DRY-RUN]      closed -> Done. The API cannot set these. See
+[DRY-RUN]      scripts/gh-projects/README.md § Status lanes.
+[DRY-RUN]   6. Set provider-level spend caps before pasting LLM API keys:
+[DRY-RUN]      - https://platform.openai.com/account/limits
+[DRY-RUN]      - https://console.anthropic.com/settings/limits
+[DRY-RUN]   7. Drive Sprint 0 PR #1 through the Phase 4 review flow.
+[DRY-RUN] 
+[DRY-RUN] DOC: docs/agents/bootstrap-runbook.md (in mergepath) explains every
+[DRY-RUN]      stage above and how to debug or resume on failure.
+[DRY-RUN] 
+[DRY-RUN] remove stale hub-only doc docs/agents/high-priority-scope-discipline.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/high-priority-scope-discipline.md
+[DRY-RUN] remove stale hub-only doc docs/agents/dependabot-reviewer-environment.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/dependabot-reviewer-environment.md
+[DRY-RUN] remove stale hub-only doc docs/agents/tracker-unblock-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/tracker-unblock-runbook.md
+[DRY-RUN] remove stale hub-only doc docs/agents/bootstrap-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/bootstrap-runbook.md
+[DRY-RUN] remove stale hub-only doc docs/agents/propagation-ordering.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/propagation-ordering.md
+[DRY-RUN] remove stale hub-only doc docs/agents/templated-propagation.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/templated-propagation.md
+[DRY-RUN] remove stale hub-only doc docs/agents/coderabbit-audit.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/coderabbit-audit.md
+[DRY-RUN] rsync /Users/nathanpayne/GitHub/mergepath -> /Users/nathanpayne/GitHub/sendermark: rsync -a --exclude=.git/ --exclude=.DS_Store --exclude=dist/ --exclude=mergepath/ --exclude=packaging/ --exclude=.mergepath-sync.yml --exclude=scripts/sync-to-downstream.sh --exclude=tests/test_sync_to_downstream.sh --exclude=scripts/lib/sync-audit-json.sh --exclude=tests/test_sync_audit_json.sh --exclude=specs/sync_audit_json.md --exclude=.github/workflows/weekly-drift-audit.yml --exclude=.mergepath-project-docs.yml --exclude=docs/projects/ --exclude=scripts/project-doc-sync.sh --exclude=tests/test_project_doc_sync.sh --exclude=.github/templates/required-workflows/ --exclude=scripts/build/materialize-merge-queue-policy-source.sh --exclude=.github/chainguard/ --exclude=.claude/worktrees/ --exclude=.claude/settings.local.json --exclude=.claude/launch.json --exclude=specs/mergepath_playground.md --exclude=plans/mergepath-playground.md --exclude=specs/bootstrap_consumer_identity.md --exclude=specs/bootstrap_label_seeding.md --exclude=specs/bootstrap_source_attribution.md --exclude=specs/sync_test_closure.md --exclude=specs/project_doc_sync.md --exclude=scripts/policy-sim.sh --exclude=scripts/wave-audit.sh --exclude=tests/test_wave_audit.sh --exclude=scripts/audit-canonical-mirrors.sh --exclude=tests/test_audit_canonical_mirrors.sh --exclude=.github/workflows/branch-protection-audit.yml --exclude=scripts/audit-branch-protection.sh --exclude=scripts/audit-credential-isolation.py --exclude=tests/test_audit_branch_protection.sh --exclude=tests/test_audit_branch_protection_workflow.sh --exclude=tests/test_credential_isolation.py --exclude=specs/credential_isolation.md --exclude=scripts/sync-labels.sh --exclude=tests/test_sync_labels.sh --exclude=BRAND.md --exclude=docs/agents/repository-overview.md --exclude=CONTEXT.md --exclude=bugs/screenshots/ --exclude=.github/screenshots/ --exclude=.bootstrap-log --exclude=.bootstrap-state --exclude=docs/agents/high-priority-scope-discipline.md --exclude=docs/agents/dependabot-reviewer-environment.md --exclude=docs/agents/tracker-unblock-runbook.md --exclude=docs/agents/bootstrap-runbook.md --exclude=docs/agents/propagation-ordering.md --exclude=docs/agents/templated-propagation.md --exclude=docs/agents/coderabbit-audit.md /Users/nathanpayne/GitHub/mergepath/ /Users/nathanpayne/GitHub/sendermark/
+[DRY-RUN] git init /Users/nathanpayne/GitHub/sendermark: git -C /Users/nathanpayne/GitHub/sendermark init -q -b main
+[DRY-RUN] stage initial files: git -C /Users/nathanpayne/GitHub/sendermark add -A
+[DRY-RUN] initial commit: git -C /Users/nathanpayne/GitHub/sendermark -c commit.gpgsign=false commit -q -m $'Initial commit (bootstrapped from mergepath@5e7ee18)\n\nSource: https://github.com/nathanjohnpayne/mergepath/commit/5e7ee18b5cbe3df8070787236cb421bf3f53baae'
+[DRY-RUN] create remote: gh repo create nathanjohnpayne/sendermark --private --description Keeps\ company\ contact\ cards\ current\ on\ the\ Mac:\ logos\ from\ Logo.dev\ and\ the\ numbers\ each\ company\ texts\ from. --source=/Users/nathanpayne/GitHub/sendermark
+[DRY-RUN] push bootstrap commit to nathanjohnpayne/sendermark: env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= git -c credential.helper= -c credential.helper=\!gh\ auth\ git-credential -C /Users/nathanpayne/GitHub/sendermark push -u origin HEAD
+[DRY-RUN] label create: needs-external-review: gh label create needs-external-review --repo nathanjohnpayne/sendermark --color bf0606 --description External\ review\ required\ before\ merge --force
+[DRY-RUN] label create: needs-human-review: gh label create needs-human-review --repo nathanjohnpayne/sendermark --color 7057ff --description Awaiting\ human\ triage\ or\ decision --force
+[DRY-RUN] label create: policy-violation: gh label create policy-violation --repo nathanjohnpayne/sendermark --color b60205 --description Blocked\ by\ review-policy.yml\ violation --force
+[DRY-RUN] label create: human-hold: gh label create human-hold --repo nathanjohnpayne/sendermark --color 000000 --description Hard\ merge\ freeze\ -\ human-remove-only\;\ supersedes\ all\ gates --force
+[DRY-RUN] label create: needs-local-agent: gh label create needs-local-agent --repo nathanjohnpayne/sendermark --color fbca04 --description A\ cloud/limited\ session\ parked\ this\ step\;\ a\ session\ with\ the\ named\ capability\ resumes\ it --force
+[DRY-RUN] label create: human-action: gh label create human-action --repo nathanjohnpayne/sendermark --color 0e8a16 --description Requires\ human\ attention --force
+[DRY-RUN] label create: decision-needed: gh label create decision-needed --repo nathanjohnpayne/sendermark --color e99695 --description Needs\ a\ human\ decision\ before\ work\ proceeds\ \(issue\ triage\,\ not\ a\ PR\ merge\ gate\) --force
+[DRY-RUN] label create: agent-action: gh label create agent-action --repo nathanjohnpayne/sendermark --color 1d76db --description Agent\ task\ —\ not\ blocked\ on\ human --force
+[DRY-RUN] label create: size:S: gh label create size:S --repo nathanjohnpayne/sendermark --color c2e0c6 --description Small:\ one\ or\ a\ few\ files\,\ straightforward\ verification.\ Calibrated\ to\ nathanpaynedotcom#942/#849. --force
+[DRY-RUN] label create: size:M: gh label create size:M --repo nathanjohnpayne/sendermark --color fef2c0 --description Medium:\ real\ design\ choice\ plus\ tests\ across\ a\ subsystem.\ Calibrated\ to\ nathanpaynedotcom#881/#825. --force
+[DRY-RUN] label create: size:L: gh label create size:L --repo nathanjohnpayne/sendermark --color f9d0c4 --description Large:\ crosses\ subsystems\ or\ changes\ a\ depended-on\ contract.\ Calibrated\ to\ nathanpaynedotcom#900. --force
+[DRY-RUN] label create: priority:critical: gh label create priority:critical --repo nathanjohnpayne/sendermark --color B60205 --description Broken\ now\ on\ the\ merge\ path\,\ dated\ evidence\,\ no\ workaround.\ Expect\ this\ to\ be\ empty. --force
+[DRY-RUN] label create: priority:high: gh label create priority:high --repo nathanjohnpayne/sendermark --color D93F0B --description Actionable\ now\;\ delay\ has\ demonstrated\ material\ cost.\ Cite\ evidence\ in\ the\ issue. --force
+[DRY-RUN] label create: priority:normal: gh label create priority:normal --repo nathanjohnpayne/sendermark --color 8B949E --description Default.\ Worth\ doing\;\ no\ observed\ live\ impact\,\ or\ it\ fails\ in\ the\ safe\ direction. --force
+[DRY-RUN] label create: priority:low: gh label create priority:low --repo nathanjohnpayne/sendermark --color D4D8DD --description Would\ not\ be\ missed.\ A\ candidate\ for\ closure\ at\ the\ next\ audit\ if\ still\ untouched. --force
+[DRY-RUN] label create: status:blocked: gh label create status:blocked --repo nathanjohnpayne/sendermark --color 6E7781 --description Cannot\ proceed\ until\ something\ outside\ this\ issue\ happens.\ Name\ what\,\ in\ the\ issue. --force
+[DRY-RUN] invite collaborator: nathanpayne-claude (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-claude -f permission=write
+[DRY-RUN] invite collaborator: nathanpayne-cursor (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-cursor -f permission=write
+[DRY-RUN] invite collaborator: nathanpayne-codex (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-codex -f permission=write
+[DRY-RUN] yq -i '.coderabbit.enabled = false' /Users/nathanpayne/GitHub/sendermark/.github/review-policy.yml: yq -i .coderabbit.enabled\ =\ false /Users/nathanpayne/GitHub/sendermark/.github/review-policy.yml
+[DRY-RUN] rm /Users/nathanpayne/GitHub/sendermark/.coderabbit.yml: rm -f /Users/nathanpayne/GitHub/sendermark/.coderabbit.yml
+[DRY-RUN] git add review-policy.yml + .coderabbit.yml: git -C /Users/nathanpayne/GitHub/sendermark add .github/review-policy.yml .coderabbit.yml
+[DRY-RUN] commit CodeRabbit-disable: git -C /Users/nathanpayne/GitHub/sendermark -c commit.gpgsign=false commit -q -m config:\ disable\ CodeRabbit\ \(private\ repo\,\ free\ tier\ is\ public-only\)
+[DRY-RUN] push origin main (CodeRabbit-disable): git -C /Users/nathanpayne/GitHub/sendermark push origin main
+[DRY-RUN] create Project v2: sendermark: gh project create --owner nathanjohnpayne --title sendermark --format json
+[DRY-RUN] Status field: Backlog/Ready/In progress/In review/Done: gh project field-create \<N\> --owner nathanjohnpayne --name Status --data-type SINGLE_SELECT --single-select-options Backlog\,Ready\,In\ progress\,In\ review\,Done
+[DRY-RUN] set board readme: gh project edit \<N\> --owner nathanjohnpayne --readme $'Keeps company contact cards current on the Mac: logos from Logo.dev and the numbers each company texts from.\n\n# Phase 0 — Foundations\nTODO: populate from the new repo\'s PRD / spec.\n\nGenerated by scripts/bootstrap-new-repo.sh (#156 sub-E).'
+[DRY-RUN] mkdir specs/: mkdir -p /Users/nathanpayne/GitHub/sendermark/specs
+[DRY-RUN] mkdir plans/: mkdir -p /Users/nathanpayne/GitHub/sendermark/plans
+[DRY-RUN] mkdir gh-projects/examples/sendermark/: mkdir -p /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark
+[DRY-RUN] write specs/sendermark.md (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/specs/sendermark.md TODO:\ write\ the\ implementation\ spec\ for\ this\ repo.\ Canonical\ PRDs\ live\ in\ nathanjohnpayne/docs/projects/\<project\>/prds/\ and\ are\ mirrored\ here\ via\ project-doc\ sync.
+[DRY-RUN] write plans/sendermark-sprint-0.md (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/plans/sendermark-sprint-0.md TODO:\ write\ the\ Sprint\ 0\ plan\ \(milestone\ breakdown\ /\ phasing\)\ for\ this\ repo.\ Wizard\ left\ this\ empty\ per\ #156\ deliberate-not-in-scope\ decision.
+[DRY-RUN] write scripts/gh-projects/examples/sendermark/create-issues.sh (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/create-issues.sh $'#!/usr/bin/env bash\n# scripts/gh-projects/examples/<repo>/create-issues.sh\n#\n# Phase 0 / Phase 1 issue-seeding skeleton for <repo>. Generated by\n# the Mergepath bootstrap wizard (#156 sub-E). Fill in the issue list\n# and run once after the repo is bootstrapped.\n#\n# Usage: bash scripts/gh-projects/examples/<repo>/create-issues.sh\n\nset -euo pipefail\n\n# TODO: populate with the Phase 0 / Phase 1 issues for <repo>.\n# Example shape:\n#   gh issue create --repo nathanjohnpayne/<repo> \\\n#     --title "Phase 0: scaffold" \\\n#     --label agent-action,size:S \\\n#     --body "..."\n'
+[DRY-RUN] chmod +x create-issues.sh: chmod +x /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/create-issues.sh
+[DRY-RUN] --- bootstrap summary (dry-run; not appended verbatim) ---
+[DRY-RUN] 
+[DRY-RUN] ==> Bootstrap complete: nathanjohnpayne/sendermark
+[DRY-RUN] 
+[DRY-RUN] REPO:        https://github.com/nathanjohnpayne/sendermark
+[DRY-RUN] PROJECT:     https://github.com/users/nathanjohnpayne/projects/<N>
+[DRY-RUN] LOCAL DIR:   /Users/nathanpayne/GitHub/sendermark
+[DRY-RUN] 
+[DRY-RUN] DONE:
+[DRY-RUN]   [done] Template mirror + name substitution
+[DRY-RUN]   [done] GitHub repo created (private) + 16 canonical labels attempted + reviewer invites + secrets
+[DRY-RUN]   [done] CodeRabbit + Codex App posture
+[DRY-RUN]   [done] Project v2 board configured (#<N>)
+[DRY-RUN]   [done] Empty implementation-spec / plan scaffolds written
+[DRY-RUN] 
+[DRY-RUN] SKIPPED:
+[DRY-RUN]   [skip] Firebase setup (firebase=none)
+[DRY-RUN] 
+[DRY-RUN] WARNINGS:
+[DRY-RUN]   - Population of .env.local from Firebase web console is manual.
+[DRY-RUN]   - Reviewer-identity collaborator invites must be accepted by each
+[DRY-RUN]     agent account at https://github.com/nathanjohnpayne/sendermark/invitations.
+[DRY-RUN] 
+[DRY-RUN] CROSS-REPO LOOP UPDATE:
+[DRY-RUN]   See template-mirror stage output above for the PR (if anchors
+[DRY-RUN]   were present). If anchors were absent, manually add 'sendermark'
+[DRY-RUN]   to the loop lists in mergepath's DEPLOYMENT.md +
+[DRY-RUN]   REVIEW_POLICY.md.
+[DRY-RUN]   NOTE: this loop-doc PR does NOT enroll 'sendermark' for ongoing
+[DRY-RUN]   sync. The one-time template rsync above and .mergepath-sync.yml
+[DRY-RUN]   consumer enrollment are SEPARATE steps — a repo registered only
+[DRY-RUN]   in the loop docs receives none of mergepath's post-bootstrap
+[DRY-RUN]   propagation. Enroll it as a consumer per NEXT STEPS below so the
+[DRY-RUN]   weekly propagation-drift sweep tracks it (see mergepath#741).
+[DRY-RUN] 
+[DRY-RUN] NEXT STEPS (human-action):
+[DRY-RUN]   1. Accept reviewer collaborator invites at:
+[DRY-RUN]      https://github.com/nathanjohnpayne/sendermark/invitations
+[DRY-RUN]      (sign in once per agent identity)
+[DRY-RUN]   2. Enroll 'sendermark' as a .mergepath-sync.yml consumer so it
+[DRY-RUN]      receives ongoing propagation (not just the one-time rsync):
+[DRY-RUN]      add it to the consumers: list with a facts: block verified
+[DRY-RUN]      against its own package.json (frameworks / testing / jsx_in_js
+[DRY-RUN]      / ESM-vs-CJS eslint variant), then run
+[DRY-RUN]      scripts/sync-to-downstream.sh --audit --repos sendermark and
+[DRY-RUN]      drive the first sync canary-first. See mergepath#741 and the
+[DRY-RUN]      .mergepath-sync.yml header.
+[DRY-RUN]   3. Write the repo-local implementation spec:
+[DRY-RUN]      /Users/nathanpayne/GitHub/sendermark/specs/sendermark.md
+[DRY-RUN]      Canonical PRDs live in nathanjohnpayne/docs/projects/sendermark/prds/
+[DRY-RUN]   4. Populate Phase 0 / Phase 1 issues via the create-issues.sh
+[DRY-RUN]      skeleton: /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/
+[DRY-RUN]   5. Set board #<N>'s built-in workflow targets
+[DRY-RUN]      (board ... > Workflows): Item added -> Backlog, Item reopened
+[DRY-RUN]      -> Ready, Pull request linked to issue -> In review, Item
+[DRY-RUN]      closed -> Done. The API cannot set these. See
+[DRY-RUN]      scripts/gh-projects/README.md § Status lanes.
+[DRY-RUN]   6. Set provider-level spend caps before pasting LLM API keys:
+[DRY-RUN]      - https://platform.openai.com/account/limits
+[DRY-RUN]      - https://console.anthropic.com/settings/limits
+[DRY-RUN]   7. Drive Sprint 0 PR #1 through the Phase 4 review flow.
+[DRY-RUN] 
+[DRY-RUN] DOC: docs/agents/bootstrap-runbook.md (in mergepath) explains every
+[DRY-RUN]      stage above and how to debug or resume on failure.
+[DRY-RUN] 
+[DRY-RUN] remove stale hub-only doc docs/agents/high-priority-scope-discipline.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/high-priority-scope-discipline.md
+[DRY-RUN] remove stale hub-only doc docs/agents/dependabot-reviewer-environment.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/dependabot-reviewer-environment.md
+[DRY-RUN] remove stale hub-only doc docs/agents/tracker-unblock-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/tracker-unblock-runbook.md
+[DRY-RUN] remove stale hub-only doc docs/agents/bootstrap-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/bootstrap-runbook.md
+[DRY-RUN] remove stale hub-only doc docs/agents/propagation-ordering.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/propagation-ordering.md
+[DRY-RUN] remove stale hub-only doc docs/agents/templated-propagation.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/templated-propagation.md
+[DRY-RUN] remove stale hub-only doc docs/agents/coderabbit-audit.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/coderabbit-audit.md
+[DRY-RUN] rsync /Users/nathanpayne/GitHub/mergepath -> /Users/nathanpayne/GitHub/sendermark: rsync -a --exclude=.git/ --exclude=.DS_Store --exclude=dist/ --exclude=mergepath/ --exclude=packaging/ --exclude=.mergepath-sync.yml --exclude=scripts/sync-to-downstream.sh --exclude=tests/test_sync_to_downstream.sh --exclude=scripts/lib/sync-audit-json.sh --exclude=tests/test_sync_audit_json.sh --exclude=specs/sync_audit_json.md --exclude=.github/workflows/weekly-drift-audit.yml --exclude=.mergepath-project-docs.yml --exclude=docs/projects/ --exclude=scripts/project-doc-sync.sh --exclude=tests/test_project_doc_sync.sh --exclude=.github/templates/required-workflows/ --exclude=scripts/build/materialize-merge-queue-policy-source.sh --exclude=.github/chainguard/ --exclude=.claude/worktrees/ --exclude=.claude/settings.local.json --exclude=.claude/launch.json --exclude=specs/mergepath_playground.md --exclude=plans/mergepath-playground.md --exclude=specs/bootstrap_consumer_identity.md --exclude=specs/bootstrap_label_seeding.md --exclude=specs/bootstrap_source_attribution.md --exclude=specs/sync_test_closure.md --exclude=specs/project_doc_sync.md --exclude=scripts/policy-sim.sh --exclude=scripts/wave-audit.sh --exclude=tests/test_wave_audit.sh --exclude=scripts/audit-canonical-mirrors.sh --exclude=tests/test_audit_canonical_mirrors.sh --exclude=.github/workflows/branch-protection-audit.yml --exclude=scripts/audit-branch-protection.sh --exclude=scripts/audit-credential-isolation.py --exclude=tests/test_audit_branch_protection.sh --exclude=tests/test_audit_branch_protection_workflow.sh --exclude=tests/test_credential_isolation.py --exclude=specs/credential_isolation.md --exclude=scripts/sync-labels.sh --exclude=tests/test_sync_labels.sh --exclude=BRAND.md --exclude=docs/agents/repository-overview.md --exclude=CONTEXT.md --exclude=bugs/screenshots/ --exclude=.github/screenshots/ --exclude=.bootstrap-log --exclude=.bootstrap-state --exclude=docs/agents/high-priority-scope-discipline.md --exclude=docs/agents/dependabot-reviewer-environment.md --exclude=docs/agents/tracker-unblock-runbook.md --exclude=docs/agents/bootstrap-runbook.md --exclude=docs/agents/propagation-ordering.md --exclude=docs/agents/templated-propagation.md --exclude=docs/agents/coderabbit-audit.md /Users/nathanpayne/GitHub/mergepath/ /Users/nathanpayne/GitHub/sendermark/
+[DRY-RUN] git init /Users/nathanpayne/GitHub/sendermark: git -C /Users/nathanpayne/GitHub/sendermark init -q -b main
+[DRY-RUN] stage initial files: git -C /Users/nathanpayne/GitHub/sendermark add -A
+[DRY-RUN] initial commit: git -C /Users/nathanpayne/GitHub/sendermark -c commit.gpgsign=false commit -q -m $'Initial commit (bootstrapped from mergepath@6ed6ab6)\n\nSource: https://github.com/nathanjohnpayne/mergepath/commit/6ed6ab62b3bcde20b86d6e00b06751f8e8289b1d'
+[DRY-RUN] create remote: gh repo create nathanjohnpayne/sendermark --private --description Keeps\ company\ contact\ cards\ current\ on\ the\ Mac:\ logos\ from\ Logo.dev\ and\ the\ numbers\ each\ company\ texts\ from. --source=/Users/nathanpayne/GitHub/sendermark
+[DRY-RUN] push bootstrap commit to nathanjohnpayne/sendermark: env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= git -c credential.helper= -c credential.helper=\!gh\ auth\ git-credential -C /Users/nathanpayne/GitHub/sendermark push -u origin HEAD
+[DRY-RUN] label create: needs-external-review: gh label create needs-external-review --repo nathanjohnpayne/sendermark --color bf0606 --description External\ review\ required\ before\ merge --force
+[DRY-RUN] label create: needs-human-review: gh label create needs-human-review --repo nathanjohnpayne/sendermark --color 7057ff --description Awaiting\ human\ triage\ or\ decision --force
+[DRY-RUN] label create: policy-violation: gh label create policy-violation --repo nathanjohnpayne/sendermark --color b60205 --description Blocked\ by\ review-policy.yml\ violation --force
+[DRY-RUN] label create: human-hold: gh label create human-hold --repo nathanjohnpayne/sendermark --color 000000 --description Hard\ merge\ freeze\ -\ human-remove-only\;\ supersedes\ all\ gates --force
+[DRY-RUN] label create: needs-local-agent: gh label create needs-local-agent --repo nathanjohnpayne/sendermark --color fbca04 --description A\ cloud/limited\ session\ parked\ this\ step\;\ a\ session\ with\ the\ named\ capability\ resumes\ it --force
+[DRY-RUN] label create: human-action: gh label create human-action --repo nathanjohnpayne/sendermark --color 0e8a16 --description Requires\ human\ attention --force
+[DRY-RUN] label create: decision-needed: gh label create decision-needed --repo nathanjohnpayne/sendermark --color e99695 --description Needs\ a\ human\ decision\ before\ work\ proceeds\ \(issue\ triage\,\ not\ a\ PR\ merge\ gate\) --force
+[DRY-RUN] label create: agent-action: gh label create agent-action --repo nathanjohnpayne/sendermark --color 1d76db --description Agent\ task\ —\ not\ blocked\ on\ human --force
+[DRY-RUN] label create: size:S: gh label create size:S --repo nathanjohnpayne/sendermark --color c2e0c6 --description Small:\ one\ or\ a\ few\ files\,\ straightforward\ verification.\ Calibrated\ to\ nathanpaynedotcom#942/#849. --force
+[DRY-RUN] label create: size:M: gh label create size:M --repo nathanjohnpayne/sendermark --color fef2c0 --description Medium:\ real\ design\ choice\ plus\ tests\ across\ a\ subsystem.\ Calibrated\ to\ nathanpaynedotcom#881/#825. --force
+[DRY-RUN] label create: size:L: gh label create size:L --repo nathanjohnpayne/sendermark --color f9d0c4 --description Large:\ crosses\ subsystems\ or\ changes\ a\ depended-on\ contract.\ Calibrated\ to\ nathanpaynedotcom#900. --force
+[DRY-RUN] label create: priority:critical: gh label create priority:critical --repo nathanjohnpayne/sendermark --color B60205 --description Broken\ now\ on\ the\ merge\ path\,\ dated\ evidence\,\ no\ workaround.\ Expect\ this\ to\ be\ empty. --force
+[DRY-RUN] label create: priority:high: gh label create priority:high --repo nathanjohnpayne/sendermark --color D93F0B --description Actionable\ now\;\ delay\ has\ demonstrated\ material\ cost.\ Cite\ evidence\ in\ the\ issue. --force
+[DRY-RUN] label create: priority:normal: gh label create priority:normal --repo nathanjohnpayne/sendermark --color 8B949E --description Default.\ Worth\ doing\;\ no\ observed\ live\ impact\,\ or\ it\ fails\ in\ the\ safe\ direction. --force
+[DRY-RUN] label create: priority:low: gh label create priority:low --repo nathanjohnpayne/sendermark --color D4D8DD --description Would\ not\ be\ missed.\ A\ candidate\ for\ closure\ at\ the\ next\ audit\ if\ still\ untouched. --force
+[DRY-RUN] label create: status:blocked: gh label create status:blocked --repo nathanjohnpayne/sendermark --color 6E7781 --description Cannot\ proceed\ until\ something\ outside\ this\ issue\ happens.\ Name\ what\,\ in\ the\ issue. --force
+[DRY-RUN] invite collaborator: nathanpayne-claude (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-claude -f permission=write
+[DRY-RUN] invite collaborator: nathanpayne-cursor (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-cursor -f permission=write
+[DRY-RUN] invite collaborator: nathanpayne-codex (write): gh api -X PUT repos/nathanjohnpayne/sendermark/collaborators/nathanpayne-codex -f permission=write
+[DRY-RUN] yq -i '.coderabbit.enabled = false' /Users/nathanpayne/GitHub/sendermark/.github/review-policy.yml: yq -i .coderabbit.enabled\ =\ false /Users/nathanpayne/GitHub/sendermark/.github/review-policy.yml
+[DRY-RUN] rm /Users/nathanpayne/GitHub/sendermark/.coderabbit.yml: rm -f /Users/nathanpayne/GitHub/sendermark/.coderabbit.yml
+[DRY-RUN] git add review-policy.yml + .coderabbit.yml: git -C /Users/nathanpayne/GitHub/sendermark add .github/review-policy.yml .coderabbit.yml
+[DRY-RUN] commit CodeRabbit-disable: git -C /Users/nathanpayne/GitHub/sendermark -c commit.gpgsign=false commit -q -m config:\ disable\ CodeRabbit\ \(private\ repo\,\ free\ tier\ is\ public-only\)
+[DRY-RUN] push origin main (CodeRabbit-disable): git -C /Users/nathanpayne/GitHub/sendermark push origin main
+[DRY-RUN] create Project v2: sendermark: gh project create --owner nathanjohnpayne --title sendermark --format json
+[DRY-RUN] Status field: Backlog/Ready/In progress/In review/Done: gh project field-create \<N\> --owner nathanjohnpayne --name Status --data-type SINGLE_SELECT --single-select-options Backlog\,Ready\,In\ progress\,In\ review\,Done
+[DRY-RUN] set board readme: gh project edit \<N\> --owner nathanjohnpayne --readme $'Keeps company contact cards current on the Mac: logos from Logo.dev and the numbers each company texts from.\n\n# Phase 0 — Foundations\nTODO: populate from the new repo\'s PRD / spec.\n\nGenerated by scripts/bootstrap-new-repo.sh (#156 sub-E).'
+[DRY-RUN] mkdir specs/: mkdir -p /Users/nathanpayne/GitHub/sendermark/specs
+[DRY-RUN] mkdir plans/: mkdir -p /Users/nathanpayne/GitHub/sendermark/plans
+[DRY-RUN] mkdir gh-projects/examples/sendermark/: mkdir -p /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark
+[DRY-RUN] write specs/sendermark.md (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/specs/sendermark.md TODO:\ write\ the\ implementation\ spec\ for\ this\ repo.\ Canonical\ PRDs\ live\ in\ nathanjohnpayne/docs/projects/\<project\>/prds/\ and\ are\ mirrored\ here\ via\ project-doc\ sync.
+[DRY-RUN] write plans/sendermark-sprint-0.md (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/plans/sendermark-sprint-0.md TODO:\ write\ the\ Sprint\ 0\ plan\ \(milestone\ breakdown\ /\ phasing\)\ for\ this\ repo.\ Wizard\ left\ this\ empty\ per\ #156\ deliberate-not-in-scope\ decision.
+[DRY-RUN] write scripts/gh-projects/examples/sendermark/create-issues.sh (placeholder): bootstrap::_write_file /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/create-issues.sh $'#!/usr/bin/env bash\n# scripts/gh-projects/examples/<repo>/create-issues.sh\n#\n# Phase 0 / Phase 1 issue-seeding skeleton for <repo>. Generated by\n# the Mergepath bootstrap wizard (#156 sub-E). Fill in the issue list\n# and run once after the repo is bootstrapped.\n#\n# Usage: bash scripts/gh-projects/examples/<repo>/create-issues.sh\n\nset -euo pipefail\n\n# TODO: populate with the Phase 0 / Phase 1 issues for <repo>.\n# Example shape:\n#   gh issue create --repo nathanjohnpayne/<repo> \\\n#     --title "Phase 0: scaffold" \\\n#     --label agent-action,size:S \\\n#     --body "..."\n'
+[DRY-RUN] chmod +x create-issues.sh: chmod +x /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/create-issues.sh
+[DRY-RUN] --- bootstrap summary (dry-run; not appended verbatim) ---
+[DRY-RUN] 
+[DRY-RUN] ==> Bootstrap complete: nathanjohnpayne/sendermark
+[DRY-RUN] 
+[DRY-RUN] REPO:        https://github.com/nathanjohnpayne/sendermark
+[DRY-RUN] PROJECT:     https://github.com/users/nathanjohnpayne/projects/<N>
+[DRY-RUN] LOCAL DIR:   /Users/nathanpayne/GitHub/sendermark
+[DRY-RUN] 
+[DRY-RUN] DONE:
+[DRY-RUN]   [done] Template mirror + name substitution
+[DRY-RUN]   [done] GitHub repo created (private) + 16 canonical labels attempted + reviewer invites + secrets
+[DRY-RUN]   [done] CodeRabbit + Codex App posture
+[DRY-RUN]   [done] Project v2 board configured (#<N>)
+[DRY-RUN]   [done] Empty implementation-spec / plan scaffolds written
+[DRY-RUN] 
+[DRY-RUN] SKIPPED:
+[DRY-RUN]   [skip] Firebase setup (firebase=none)
+[DRY-RUN] 
+[DRY-RUN] WARNINGS:
+[DRY-RUN]   - Population of .env.local from Firebase web console is manual.
+[DRY-RUN]   - Reviewer-identity collaborator invites must be accepted by each
+[DRY-RUN]     agent account at https://github.com/nathanjohnpayne/sendermark/invitations.
+[DRY-RUN] 
+[DRY-RUN] CROSS-REPO LOOP UPDATE:
+[DRY-RUN]   See template-mirror stage output above for the PR (if anchors
+[DRY-RUN]   were present). If anchors were absent, manually add 'sendermark'
+[DRY-RUN]   to the loop lists in mergepath's DEPLOYMENT.md +
+[DRY-RUN]   REVIEW_POLICY.md.
+[DRY-RUN]   NOTE: this loop-doc PR does NOT enroll 'sendermark' for ongoing
+[DRY-RUN]   sync. The one-time template rsync above and .mergepath-sync.yml
+[DRY-RUN]   consumer enrollment are SEPARATE steps — a repo registered only
+[DRY-RUN]   in the loop docs receives none of mergepath's post-bootstrap
+[DRY-RUN]   propagation. Enroll it as a consumer per NEXT STEPS below so the
+[DRY-RUN]   weekly propagation-drift sweep tracks it (see mergepath#741).
+[DRY-RUN] 
+[DRY-RUN] NEXT STEPS (human-action):
+[DRY-RUN]   1. Accept reviewer collaborator invites at:
+[DRY-RUN]      https://github.com/nathanjohnpayne/sendermark/invitations
+[DRY-RUN]      (sign in once per agent identity)
+[DRY-RUN]   2. Enroll 'sendermark' as a .mergepath-sync.yml consumer so it
+[DRY-RUN]      receives ongoing propagation (not just the one-time rsync):
+[DRY-RUN]      add it to the consumers: list with a facts: block verified
+[DRY-RUN]      against its own package.json (frameworks / testing / jsx_in_js
+[DRY-RUN]      / ESM-vs-CJS eslint variant), then run
+[DRY-RUN]      scripts/sync-to-downstream.sh --audit --repos sendermark and
+[DRY-RUN]      drive the first sync canary-first. See mergepath#741 and the
+[DRY-RUN]      .mergepath-sync.yml header.
+[DRY-RUN]   3. Write the repo-local implementation spec:
+[DRY-RUN]      /Users/nathanpayne/GitHub/sendermark/specs/sendermark.md
+[DRY-RUN]      Canonical PRDs live in nathanjohnpayne/docs/projects/sendermark/prds/
+[DRY-RUN]   4. Populate Phase 0 / Phase 1 issues via the create-issues.sh
+[DRY-RUN]      skeleton: /Users/nathanpayne/GitHub/sendermark/scripts/gh-projects/examples/sendermark/
+[DRY-RUN]   5. Set board #<N>'s built-in workflow targets
+[DRY-RUN]      (board ... > Workflows): Item added -> Backlog, Item reopened
+[DRY-RUN]      -> Ready, Pull request linked to issue -> In review, Item
+[DRY-RUN]      closed -> Done. The API cannot set these. See
+[DRY-RUN]      scripts/gh-projects/README.md § Status lanes.
+[DRY-RUN]   6. Set provider-level spend caps before pasting LLM API keys:
+[DRY-RUN]      - https://platform.openai.com/account/limits
+[DRY-RUN]      - https://console.anthropic.com/settings/limits
+[DRY-RUN]   7. Drive Sprint 0 PR #1 through the Phase 4 review flow.
+[DRY-RUN] 
+[DRY-RUN] DOC: docs/agents/bootstrap-runbook.md (in mergepath) explains every
+[DRY-RUN]      stage above and how to debug or resume on failure.
+[DRY-RUN] 
+2026-11-17T19:18:51Z remove stale hub-only doc docs/agents/high-priority-scope-discipline.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/high-priority-scope-discipline.md
+2026-11-17T19:18:51Z remove stale hub-only doc docs/agents/dependabot-reviewer-environment.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/dependabot-reviewer-environment.md
+2026-11-17T19:18:51Z remove stale hub-only doc docs/agents/tracker-unblock-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/tracker-unblock-runbook.md
+2026-11-17T19:18:51Z remove stale hub-only doc docs/agents/bootstrap-runbook.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/bootstrap-runbook.md
+2026-11-17T19:18:51Z remove stale hub-only doc docs/agents/propagation-ordering.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/propagation-ordering.md
+2026-11-17T19:18:51Z remove stale hub-only doc docs/agents/templated-propagation.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/templated-propagation.md
+2026-11-17T19:18:51Z remove stale hub-only doc docs/agents/coderabbit-audit.md: rm -f -- /Users/nathanpayne/GitHub/sendermark/docs/agents/coderabbit-audit.md
+2026-11-17T19:18:51Z rsync /Users/nathanpayne/GitHub/mergepath -> /Users/nathanpayne/GitHub/sendermark: rsync -a --exclude=.git/ --exclude=.DS_Store --exclude=dist/ --exclude=mergepath/ --exclude=packaging/ --exclude=.mergepath-sync.yml --exclude=scripts/sync-to-downstream.sh --exclude=tests/test_sync_to_downstream.sh --exclude=scripts/lib/sync-audit-json.sh --exclude=tests/test_sync_audit_json.sh --exclude=specs/sync_audit_json.md --exclude=.github/workflows/weekly-drift-audit.yml --exclude=.mergepath-project-docs.yml --exclude=docs/projects/ --exclude=scripts/project-doc-sync.sh --exclude=tests/test_project_doc_sync.sh --exclude=.github/templates/required-workflows/ --exclude=scripts/build/materialize-merge-queue-policy-source.sh --exclude=.github/chainguard/ --exclude=.claude/worktrees/ --exclude=.claude/settings.local.json --exclude=.claude/launch.json --exclude=specs/mergepath_playground.md --exclude=plans/mergepath-playground.md --exclude=specs/bootstrap_consumer_identity.md --exclude=specs/bootstrap_label_seeding.md --exclude=specs/bootstrap_source_attribution.md --exclude=specs/sync_test_closure.md --exclude=specs/project_doc_sync.md --exclude=scripts/policy-sim.sh --exclude=scripts/wave-audit.sh --exclude=tests/test_wave_audit.sh --exclude=scripts/audit-canonical-mirrors.sh --exclude=tests/test_audit_canonical_mirrors.sh --exclude=.github/workflows/branch-protection-audit.yml --exclude=scripts/audit-branch-protection.sh --exclude=scripts/audit-credential-isolation.py --exclude=tests/test_audit_branch_protection.sh --exclude=tests/test_audit_branch_protection_workflow.sh --exclude=tests/test_credential_isolation.py --exclude=specs/credential_isolation.md --exclude=scripts/sync-labels.sh --exclude=tests/test_sync_labels.sh --exclude=BRAND.md --exclude=docs/agents/repository-overview.md --exclude=CONTEXT.md --exclude=bugs/screenshots/ --exclude=.github/screenshots/ --exclude=.bootstrap-log --exclude=.bootstrap-state --exclude=docs/agents/high-priority-scope-discipline.md --exclude=docs/agents/dependabot-reviewer-environment.md --exclude=docs/agents/tracker-unblock-runbook.md --exclude=docs/agents/bootstrap-runbook.md --exclude=docs/agents/propagation-ordering.md --exclude=docs/agents/templated-propagation.md --exclude=docs/agents/coderabbit-audit.md /Users/nathanpayne/GitHub/mergepath/ /Users/nathanpayne/GitHub/sendermark/
+2026-11-17T19:19:32Z rm orphan tests/test_mergepath_playground.sh: rm -f /Users/nathanpayne/GitHub/sendermark/tests/test_mergepath_playground.sh
+2026-11-17T19:19:32Z rmdir empty bugs: rmdir /Users/nathanpayne/GitHub/sendermark/bugs
+2026-11-17T19:19:32Z drop mergepath-specific .repo-template.yml entries: bootstrap::_yq_clean_repo_template /Users/nathanpayne/GitHub/sendermark/.repo-template.yml
+2026-11-17T19:19:32Z substitute names in README.md: bootstrap::_substitute_one_file /Users/nathanpayne/GitHub/sendermark/README.md sendermark https://github.com/nathanjohnpayne/sendermark Keeps\ company\ contact\ cards\ current\ on\ the\ Mac:\ logos\ from\ Logo.dev\ and\ the\ numbers\ each\ company\ texts\ from.
+2026-11-17T19:19:32Z substitute names in .ai_context.md: bootstrap::_substitute_one_file /Users/nathanpayne/GitHub/sendermark/.ai_context.md sendermark https://github.com/nathanjohnpayne/sendermark Keeps\ company\ contact\ cards\ current\ on\ the\ Mac:\ logos\ from\ Logo.dev\ and\ the\ numbers\ each\ company\ texts\ from.
+2026-11-17T19:19:32Z substitute names in .repo-template.yml: bootstrap::_substitute_one_file /Users/nathanpayne/GitHub/sendermark/.repo-template.yml sendermark https://github.com/nathanjohnpayne/sendermark Keeps\ company\ contact\ cards\ current\ on\ the\ Mac:\ logos\ from\ Logo.dev\ and\ the\ numbers\ each\ company\ texts\ from.
+2026-11-17T19:19:32Z substitute names in SECURITY.md: bootstrap::_substitute_one_file /Users/nathanpayne/GitHub/sendermark/SECURITY.md sendermark https://github.com/nathanjohnpayne/sendermark Keeps\ company\ contact\ cards\ current\ on\ the\ Mac:\ logos\ from\ Logo.dev\ and\ the\ numbers\ each\ company\ texts\ from.
+2026-11-17T19:19:32Z git init /Users/nathanpayne/GitHub/sendermark: git -C /Users/nathanpayne/GitHub/sendermark init -q -b main
+2026-11-17T19:19:32Z stage initial files: git -C /Users/nathanpayne/GitHub/sendermark add -A

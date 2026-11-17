@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# CI wrapper for the complete-history reviewer-feedback accounting gate (#1000).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT="$REPO_ROOT/scripts/review-feedback-accounting.sh"
+TEST="$REPO_ROOT/tests/test_review_feedback_accounting.sh"
+HANDOFF_TEST="$REPO_ROOT/tests/test_post_phase_4b_handoff.sh"
+HANDOFF_SCRIPT="$REPO_ROOT/scripts/post-phase-4b-handoff.sh"
+ARCHIVE_RENDERER="$REPO_ROOT/scripts/render-feedback-archive.sh"
+SURFACE_FINGERPRINT="$REPO_ROOT/scripts/review-feedback-surface-fingerprint.sh"
+MARKER_TEST="$REPO_ROOT/tests/test_marker_provenance.py"
+RELAY_VERIFIER="$REPO_ROOT/scripts/workflow/verified-relay-markers.py"
+LANE_VERIFIER="$REPO_ROOT/scripts/workflow/verify-live-propagation.sh"
+FAILED=0
+
+for file in "$SCRIPT" "$TEST" "$HANDOFF_SCRIPT" "$HANDOFF_TEST" \
+  "$ARCHIVE_RENDERER" "$SURFACE_FINGERPRINT" "$MARKER_TEST" \
+  "$RELAY_VERIFIER" "$LANE_VERIFIER"; do
+  if [ ! -f "$file" ]; then
+    echo "FAIL: missing required file: ${file#"$REPO_ROOT/"}"
+    FAILED=1
+  elif [ ! -x "$file" ]; then
+    echo "FAIL: required file is not executable: ${file#"$REPO_ROOT/"}"
+    FAILED=1
+  fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_review_feedback_accounting: FAIL (pre-flight)"
+  exit 1
+fi
+
+LINT_TOOLING_LIB="$REPO_ROOT/scripts/lib/lint-tooling.sh"
+if [ ! -f "$LINT_TOOLING_LIB" ]; then
+  echo "FAIL: missing required library: scripts/lib/lint-tooling.sh"
+  exit 1
+fi
+# shellcheck source=../lib/lint-tooling.sh
+. "$LINT_TOOLING_LIB"
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck --severity=warning "$SCRIPT" "$TEST" \
+    "$ARCHIVE_RENDERER" "$SURFACE_FINGERPRINT" \
+    "$REPO_ROOT/scripts/lib/feedback-archive-identities.sh" \
+    "$REPO_ROOT/tests/test_feedback_archive_identities.sh" \
+    || FAILED=1
+else
+  lint_tooling_require_shellcheck || FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "check_review_feedback_accounting: FAIL (static analysis)"
+  exit 1
+fi
+
+# The four suites share no state, so they run as case-pool cases side by side
+# and replay their output in this order (#2990); the accounting suite starts
+# first because it sets the step's wall time. A failing suite adds to FAIL and
+# the check fails after all four report. A checkout behind the wave that
+# delivers the pool runs them one after another.
+# shellcheck disable=SC2034 # case_pool_wait adds each suite's passes here
+PASS=0
+FAIL=0
+# shellcheck disable=SC2329 # invoked through case_pool_add / the serial loop
+run_suite() { # <interpreter> <path>
+  if ! "$1" "$2"; then
+    echo "check_review_feedback_accounting: FAIL (${2#"$REPO_ROOT/"})" >&2
+    FAIL=$((FAIL + 1))
+  fi
+}
+if [ -f "$REPO_ROOT/tests/lib/case-pool.sh" ]; then
+  # shellcheck source=tests/lib/case-pool.sh
+  source "$REPO_ROOT/tests/lib/case-pool.sh"
+  case_pool_add run_suite bash "$REPO_ROOT/tests/test_feedback_archive_identities.sh"
+  case_pool_add --first run_suite bash "$TEST"
+  case_pool_add run_suite bash "$HANDOFF_TEST"
+  case_pool_add run_suite python3 "$MARKER_TEST"
+  case_pool_wait
+else
+  run_suite bash "$REPO_ROOT/tests/test_feedback_archive_identities.sh"
+  run_suite bash "$TEST"
+  run_suite bash "$HANDOFF_TEST"
+  run_suite python3 "$MARKER_TEST"
+fi
+if [ "$FAIL" -ne 0 ]; then
+  echo "check_review_feedback_accounting: FAIL ($FAIL suite(s))"
+  exit 1
+fi
+echo "check_review_feedback_accounting: PASS"

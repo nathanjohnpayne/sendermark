@@ -1,0 +1,2892 @@
+#!/usr/bin/env bash
+# scripts/phase-4b-review.sh — Phase 4b AUTOMATED review orchestrator.
+#
+# REFERENCE IMPLEMENTATION (#<this-feature>). Replaces the human shuttle in
+# REVIEW_POLICY.md § Phase 4b with an orchestrated, headless CLI review:
+# select the external reviewer (≠ author), dispatch to the direction-
+# specific adapter (codex exec / claude -p), then post the resulting
+# verdict under the reviewer PAT via scripts/gh-as-reviewer.sh. An
+# APPROVED review on the current HEAD from a non-author reviewer identity
+# is exactly the "Phase 4b substitute" clearance the existing merge gate
+# (scripts/codex-review-check.sh, codex.allow_phase_4b_substitute, #218)
+# already accepts — so this script changes NO merge-gate code.
+#
+# Design: plans/automated-phase-4b-handoff.md.
+#
+# Usage:
+#   scripts/phase-4b-review.sh <PR#> [--repo owner/repo]
+#       [--reviewer nathanpayne-<agent>] [--author <agent>]
+#       [--head <sha>] [--expected-base-sha <sha>] [--diff-file <path>]
+#       [--wave-scope-file <path>] [--offline-diff] [--dry-run]
+#       [--force-enabled]
+#
+# Overrides (mostly for tests / non-git contexts):
+#   --author         PR's authoring agent (claude|codex|...). NOT an override
+#                    (#1143): the PR body is read and validated against the
+#                    shared contract on every run, and this flag is only
+#                    cross-checked against the `Authoring-Agent:` the body
+#                    declares. A disagreement fails closed (exit 3); omitting
+#                    the flag simply skips the cross-check. There is no way to
+#                    make Phase 4b act on an identity the body does not carry.
+#   --reviewer       force the external reviewer login (skips selection, but
+#                    still must differ from the authoring agent).
+#   --head           expected live PR HEAD sha. Default: gh api pulls/<n>
+#                    .head.sha. A supplied SHA must equal the live PR head;
+#                    mismatch fails closed with exit 3 before capture,
+#                    adapter dispatch, or review POST. For --offline-diff it
+#                    is display context only and carries no posting authority.
+#   --expected-base-sha
+#                    Optional 40-hex base SHA fence for a caller that already
+#                    captured the PR's base with its head. When supplied, the
+#                    live head/base pair is read together before adapter work,
+#                    before post-review issue filing, and immediately before
+#                    the review POST. A moved or unreadable base fails closed.
+#   --diff-file      compatibility assertion of the object-derived diff bytes.
+#   --wave-scope-file <path>
+#                    structured canonical range pinned by the operator;
+#                    trusted wave code regenerates curated bytes after live
+#                    canary byte verification. Do not replace its canonical
+#                    bases with the moving live PR base.
+#   --wave-codex-request <comment-id>
+#                    with --wave-scope-file only: the Codex request comment
+#                    scripts/wave-audit.sh created or bound on the canary. The
+#                    barrier's Codex arm then clears only on the answer to
+#                    that request (#2771; p4b_wave_codex_binding_state). It
+#                    only removes ways to clear, never adds one.
+#   --offline-diff   display-only preview of supplied bytes. Requires
+#                    --dry-run, --diff-file, and --head; never posts and has
+#                    no live immutable-input binding.
+#   --retain-evidence require tripwires for a bound --dry-run whose verdict
+#                     the caller will retain (historical prefix receipts).
+#   --dry-run        do everything EXCEPT post the review; print intended
+#                    action.
+#   --admin-override "<owner authorization quote>"
+#                    admin automated 4b override (#2633). A deterministic
+#                    tripwire is recorded and the run continues to the real
+#                    adapter, whose verdict posts under the reviewer identity
+#                    as usual. Barrier and Codex human stops are not
+#                    overridden here: they keep the owner tiebreak (#2544).
+#                    The quote must be one non-empty line of at most 500
+#                    characters; it and every overridden stop are written
+#                    into the posted review body and every terminal JSON
+#                    summary (`admin_overridden`). Correctness stops are never
+#                    overridden: holds (6), feedback accounting (7), input
+#                    integrity and drift (3), request-budget evidence (10),
+#                    and every provider-barrier result. Once a tripwire is
+#                    overridden, an adapter that yields no usable verdict
+#                    exits 8 (the tripwire still holds), never the exit-4
+#                    manual fallback that wave fan-out may proceed on.
+#   --owner-authorization <comment-id>
+#                    one round beyond a spent phase_4b_automation.max_review_rounds
+#                    cap (#2968; specs/phase_4b_round_cap.md). The comment must
+#                    be the owner's (author_identity) unedited PR comment with
+#                    exactly one line
+#                    P4B_EXTRA_ROUND_AUTHORIZED=<canonical-https-PR-URL>@<full-head-sha> reason: <why>
+#                    naming this PR and its current head, newer than every
+#                    automated Phase 4b review. The ledger reservation records
+#                    the comment id, so it authorizes exactly one run; a new
+#                    head or another run needs a fresh comment. The posted
+#                    review cites it beside its run marker. Every barrier,
+#                    hold, tripwire, accounting and writer-boundary check
+#                    still applies. Refused with --dry-run, with
+#                    --wave-scope-file, with no governing cap and with a cap
+#                    that is not spent (exit 3); an invalid or consumed
+#                    authorization keeps the spent stop (exit 8). A comment
+#                    from the owner's account is not proof the owner typed it.
+#   --force-enabled  run this one invocation even when
+#                    phase_4b_automation.enabled is false/absent in
+#                    .github/review-policy.yml (#1046). Overrides ONLY
+#                    `enabled` — mode, fail_closed and post_review_issues
+#                    still come from config, and the reviewer-≠-author gate
+#                    is never overridable. The emitted JSON's `enabled_via`
+#                    reads "override" instead of "config" so a review posted
+#                    this way is auditable after the fact. Same env
+#                    equivalent as every other flag here: P4B_FORCE_ENABLED=1.
+#                    The trusted-path rule (#628) still applies UNCHANGED —
+#                    this must still run from a trusted main-ref checkout,
+#                    never the PR-under-review's own checkout — and matters
+#                    more here, since a per-run flag invites running it ad
+#                    hoc from whatever directory happens to be open.
+#
+# Env:
+#   GH_TOKEN / op-preflight cache   reviewer-scoped token (auto-sourced).
+#   CODEX_BIN / CLAUDE_BIN          adapter CLI overrides (tests).
+#   P4B_GH_AS_REVIEWER              reviewer wrapper override (tests).
+#   P4B_GH_AS_AUTHOR                author wrapper override (tests) — used
+#                                   for the step-9 post-review issue writes.
+#   P4B_HANDOFF                     manual handoff renderer override (tests).
+#   P4B_FORCE_ENABLED               1/true — same as --force-enabled.
+#   P4B_ADAPTER_TIMEOUT_SECONDS     env override for the outer adapter-call
+#                                   timeout; default is resolved per-adapter
+#                                   from phase_4b_automation (900 when absent).
+#   Timeout + effort are otherwise read from phase_4b_automation
+#   (adapter_timeout_seconds / <adapter>_timeout_seconds / <adapter>_effort;
+#   see p4b_resolve_adapter_timeout / p4b_resolve_adapter_effort) and passed to
+#   the adapter via P4B_REVIEW_CLI_TIMEOUT_SECONDS / P4B_{CLAUDE,CODEX}_EFFORT.
+#   A malformed or out-of-range config fails closed (exit 3).
+#
+# Exit codes:
+#   0  APPROVED — review posted (or would post under --dry-run).
+#   1  CHANGES_REQUESTED — review posted; the author must address findings.
+#   3  usage / infrastructure or immutable-input integrity error; hard stop.
+#   4  fell back to the manual handoff (adapter error/timeout, invalid
+#      verdict, or no adapter for the selected reviewer). The chat-side
+#      block from scripts/post-phase-4b-handoff.sh is emitted on stderr.
+#   5  automation disabled or mode != local — caller uses the manual
+#      handoff (today's behavior). Not an error.
+#   6  held: external review has not reached the reviewed head yet (#814).
+#      NOT a fallback and NOT an unavailable reviewer — no handoff block is
+#      emitted. An early hold records no loop; a final pre-POST timeout-
+#      generation retraction corrects its already-provisional loop to
+#      not-posted/fail-closed. The JSON carries barrier_pending:true and
+#      retry_after; the caller should retry after that many seconds.
+#      Deliberately distinct from 4 so that every existing
+#      consumer of 4 keeps its meaning: AGENTS.md, REVIEW_POLICY.md and
+#      scripts/wave-audit.sh all treat 4 as a reviewer that will not answer,
+#      and wave-audit proceeds fail-open on it — which would be wrong for a
+#      wait that clears on its own.
+#   7  FEEDBACK_UNACCOUNTED — a reviewer finding has no durable disposition.
+#      Before dispatch, account for findings and rerun (#1000). After a posted
+#      approval, review_posted:true identifies an acknowledgment to repair
+#      without repeating the review. No handoff block is emitted.
+#   8  HUMAN_TIEBREAKER_REQUIRED — a deterministic tripwire matched, or a
+#      governing Codex-cap human stop holds. Tripwires stop before adapter
+#      dispatch. No review authority or Phase 4b handoff is produced; a human
+#      must select the review/disposition path.
+#   10 BARRIER_EVIDENCE_ERROR — request-budget evidence was unreadable or the
+#      head moved. No adapter is run and no Phase 4b handoff is rendered.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=phase-4b/lib.sh
+. "$ROOT/phase-4b/lib.sh"
+# #2968: owner authorization of one round beyond a spent round cap, and the
+# provenance record the merge gate reads. Hard-sourced: the round-cap block
+# below calls it whenever --owner-authorization is given.
+[ -r "$ROOT/lib/p4b-review-provenance.sh" ] || p4b_die 3 "missing helper: $ROOT/lib/p4b-review-provenance.sh (see #2968)"
+# shellcheck source=lib/p4b-review-provenance.sh
+. "$ROOT/lib/p4b-review-provenance.sh"
+# Raw adapter evidence is independent of the presentation rewritten for GitHub.
+P4B_VALIDATED_VERDICT=""
+P4B_VERDICT_EVIDENCE_FILE=""
+P4B_VERDICT_EVIDENCE_ERROR=""
+p4b_unposted_verdict_summary() {
+  if [ -n "$P4B_VALIDATED_VERDICT" ] && [ "${REVIEW_POSTED:-false}" != true ] && [ "${DRY_RUN:-false}" != true ]; then
+    printf '%s\n' "$P4B_VALIDATED_VERDICT" | jq -cs --arg path "$P4B_VERDICT_EVIDENCE_FILE" \
+      --arg error "$P4B_VERDICT_EVIDENCE_ERROR" \
+      'if length == 1 and (.[0] | type == "object") then
+         {validated_verdict:.[0],validated_verdict_path:(if $path == "" then null else $path end)}
+         + if $error == "" then {} else {validated_verdict_retention_error:$error} end
+       else error("expected exactly one validated verdict object") end'
+  else
+    printf '{}\n'
+  fi
+}
+p4b_die_diagnostic() {
+  shift # The caller owns the exit code and error message.
+  local extra
+  if [ -n "$P4B_VALIDATED_VERDICT" ] && [ "${REVIEW_POSTED:-false}" != true ] && [ "${DRY_RUN:-false}" != true ]; then
+    extra="$(admin_override_summary)" || return 1
+    printf '%s\n' "$extra" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "$HEAD" --arg reviewer "$REVIEWER" \
+      --arg reason "$*" \
+      'if length == 1 and (.[0] | type == "object") then .[0] as $extra |
+         {pr_number:$pr,repo:$repo,head_sha:$head,reviewer_identity:$reviewer,
+          review_posted:false,reason:$reason} + $extra
+       else error("expected exactly one admin summary object") end'
+  fi
+}
+# shellcheck source=phase-4b/immutable-input.sh
+. "$ROOT/phase-4b/immutable-input.sh"
+
+# Phase 4b approval-loop accounting (#602). Sourced when present so the hook
+# call sites below exist; a missing or unsourceable module simply leaves
+# accounting off (the plain-summary review body posts unchanged). Advisory to
+# safety: no accounting failure may block, fabricate, or re-code a review.
+P4B_ACCT_AVAILABLE=false
+if [ -r "$ROOT/phase-4b/accounting.sh" ]; then
+  # shellcheck source=phase-4b/accounting.sh
+  if . "$ROOT/phase-4b/accounting.sh"; then
+    P4B_ACCT_AVAILABLE=true
+  fi
+fi
+# True iff the module loaded AND phase_4b_automation.accounting.enabled is
+# not false (defaults on under the disabled-by-default parent; this line is
+# only reached when the parent automation is enabled).
+p4b_acct_on() { [ "$P4B_ACCT_AVAILABLE" = true ] && p4b_acct_hook_active; }
+
+# Whether THIS invocation's loop record has been appended to the loop log.
+# Set after the pre-post record; consulted by the failure paths so a review
+# that never actually posted is corrected instead of double-recorded.
+P4B_ACCT_LOOP_RECORDED=false
+# Set only when a pre-POST fence has ALREADY, and SUCCESSFULLY, corrected this
+# invocation's provisional loop before entering fall_back_to_manual. The
+# fallback must not append a second record for the same invocation — but it
+# must still retry when the earlier correction failed, so this records that the
+# correction LANDED, never merely that it was attempted (#1143 round 5).
+P4B_PRE_POST_ACCT_CLEANED=false
+# Outcome of the most recent p4b_acct_mark_unposted call: true when the loop
+# correction landed (or there was nothing to correct), false when the rewrite
+# failed.
+#
+# WHY A GLOBAL AND NOT A RETURN STATUS — do not "tidy" this into one (#1143).
+# p4b_acct_mark_unposted is ADVISORY by contract: it must never change the
+# caller's exit code. Six of its call sites have the shape
+#
+#     X || { p4b_acct_mark_unposted "..."; p4b_die N "..."; }
+#
+# and bash applies errexit to commands inside the group following the FINAL
+# `||`. A non-zero return from the first command in that group therefore
+# aborts the run *before* the intended `p4b_die N`, silently turning an
+# advisory accounting failure into a different exit code — precisely the
+# contract violation the function promises cannot happen. A seventh call site
+# is bare inside an `if` body, with the same consequence. Making the status the
+# channel would leave the contract depending on every present and future caller
+# remembering `|| true`, which is a convention, not a guarantee.
+#
+# The global keeps the advisory guarantee structural (the function cannot
+# abort a caller) while still making the outcome observable to the one caller
+# that needs it.
+#
+# STALENESS: p4b_acct_mark_unposted resets this to true on entry, before any
+# early return, so a reader always sees the outcome of the attempt it just
+# triggered and never a leftover from an earlier one. Readers additionally
+# default it to FALSE when unset, not true — see the read site — so the
+# unreachable case fails toward "we did not correct it" (a retry, harmless and
+# idempotent) rather than toward "we did" (a durable phantom posted record,
+# which is the defect this whole variable exists to prevent).
+P4B_ACCT_LAST_CORRECTION_OK=true
+
+# Identity belongs to this invocation, never its parent. Preserve the existing
+# staging tuple under a non-p4b prefix so entropy failure cannot weaken pending
+# ownership or advertise it as genuine history identity. Generate the genuine
+# identity only after the enabled-path runtime checks below.
+P4B_ACCT_RUN_ID="local-$$-$(date +%s 2>/dev/null || echo 0)-${RANDOM:-0}"
+export P4B_ACCT_RUN_ID
+
+# p4b_acct_mark_unposted <why>
+# Correct the provisional accounting state when the review did NOT actually
+# post (#615 Codex): amend this invocation's loop-log line (posted →
+# not-posted, fail-closed with the reason) and discard the staged ledger
+# record so local state never claims a phantom posted approval. Advisory —
+# never alters review flow or exit codes.
+#
+# Whether the correction LANDED is reported in P4B_ACCT_LAST_CORRECTION_OK,
+# not in the exit status (#1143 round 5). The status stays 0 on every path
+# because six call sites below invoke this inside `X || { … ; p4b_die N …; }`
+# groups and one bare inside an `if` body, all under `set -e`: a non-zero
+# return there aborts the run before the intended p4b_die, turning an ADVISORY
+# accounting failure into a changed exit code — exactly what this function's
+# contract promises never to do, and a trap the next caller would have to
+# remember `|| true` to avoid. The global keeps the advisory guarantee
+# structural while still making the outcome observable.
+p4b_acct_mark_unposted() {
+  local why="$1"
+  # Reset FIRST, before any early return, so this can never be read stale from
+  # an earlier attempt. A leftover `true` here would be the same "the flag
+  # records that we tried" defect one level up.
+  P4B_ACCT_LAST_CORRECTION_OK=true
+  p4b_acct_on 2>/dev/null || return 0
+  p4b_acct_hook_discard_pending_record || true
+  if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+    if p4b_acct_hook_mark_last_loop_unposted "$why"; then
+      P4B_ACCT_LOOP_RECORDED=false
+    else
+      # Do NOT clear P4B_ACCT_LOOP_RECORDED here. The loop log still carries a
+      # `posted` claim for a review that did not post, so a later correction
+      # attempt must still see something to correct; clearing it made the
+      # failure indistinguishable from success and retired the retry.
+      p4b_warn "accounting: could not correct the unposted loop record (leaving it recorded so a later attempt retries)"
+      P4B_ACCT_LAST_CORRECTION_OK=false
+    fi
+  fi
+  return 0
+}
+
+ADAPTER_DIR="$(p4b_adapter_dir)"
+HANDOFF="${P4B_HANDOFF:-$ROOT/post-phase-4b-handoff.sh}"
+FEEDBACK_ACCOUNTING_GATE="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$ROOT/review-feedback-accounting.sh}"
+GH_AS_REVIEWER="${P4B_GH_AS_REVIEWER:-$ROOT/gh-as-reviewer.sh}"
+# Author wrapper for the step-9 issue writes (#672/#674): resolves AND
+# identity-verifies the author PAT before each write, replacing manual
+# token resolution (test override: P4B_GH_AS_AUTHOR).
+GH_AS_AUTHOR="${P4B_GH_AS_AUTHOR:-$ROOT/gh-as-author.sh}"
+# Outer adapter-call timeout. An explicit env override wins (tests/manual);
+# otherwise it is resolved per-adapter from policy after the reviewer is chosen
+# (see p4b_resolve_adapter_timeout). Captured here so the env override is not
+# shadowed by the policy resolution below.
+ADAPTER_TIMEOUT_ENV="${P4B_ADAPTER_TIMEOUT_SECONDS:-}"
+ADAPTER_TIMEOUT=""
+
+PR="" ; REPO="" ; REVIEWER="" ; AUTHOR="" ; HEAD="" ; EXPECTED_BASE_SHA="" ; EXPECTED_BASE_SHA_SET=false ; DIFF_FILE="" ; DRY_RUN=false ; RETAIN_EVIDENCE=false ; OFFLINE_DIFF=false ; WAVE_SCOPE_FILE="" ; WAVE_CODEX_REQUEST=""
+INPUT_DIR=""
+INPUT_METADATA_DIGEST=""
+FORCE_ENABLED=false
+# #2633: owner-authorized admin automated 4b override. Its value is the
+# owner's quoted authorization, recorded in the posted review body.
+ADMIN_OVERRIDE_SET=false
+ADMIN_OVERRIDE_QUOTE=""
+ADMIN_OVERRIDDEN='[]'
+# #2968: the owner-authorization comment id for one round beyond a spent
+# round cap. Consumed once, through the round ledger.
+P4B_OWNER_AUTH_ID=""
+case "${P4B_FORCE_ENABLED:-}" in
+  1|true|TRUE|True|yes|YES) FORCE_ENABLED=true ;;
+esac
+
+usage() {
+  echo "usage: phase-4b-review.sh <PR#> [--repo owner/repo] [--reviewer <login>] [--author <agent>] [--head <sha>] [--expected-base-sha <40-hex>] [--diff-file <path>] [--wave-scope-file <path>] [--wave-codex-request <comment-id>] [--offline-diff] [--dry-run] [--retain-evidence] [--force-enabled] [--admin-override <owner-quote>] [--owner-authorization <comment-id>]" >&2
+  exit 3
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)          REPO="${2:-}"; shift 2 ;;
+    --reviewer)      REVIEWER="${2:-}"; shift 2 ;;
+    --author)        AUTHOR="${2:-}"; shift 2 ;;
+    --head)          HEAD="${2:-}"; shift 2 ;;
+    --expected-base-sha)
+      [ $# -ge 2 ] || p4b_die 3 "--expected-base-sha requires exactly 40 hexadecimal characters"
+      EXPECTED_BASE_SHA_SET=true; EXPECTED_BASE_SHA="$2"; shift 2 ;;
+    --diff-file)     DIFF_FILE="${2:-}"; shift 2 ;;
+    --wave-scope-file) WAVE_SCOPE_FILE="${2:-}"; shift 2 ;;
+    --wave-codex-request) WAVE_CODEX_REQUEST="${2:-}"; shift 2 ;;
+    --dry-run)       DRY_RUN=true; shift ;;
+    --retain-evidence) RETAIN_EVIDENCE=true; shift ;;
+    --offline-diff)  OFFLINE_DIFF=true; shift ;;
+    --force-enabled) FORCE_ENABLED=true; shift ;;
+    --admin-override)
+      # A quote that starts with "-" is a mistyped option (`--admin-override
+      # --dry-run`), never authorization text: refuse rather than consume it.
+      case "${2:-}" in ''|-*) p4b_die 3 "--admin-override requires the owner's quoted authorization" ;; esac
+      ADMIN_OVERRIDE_SET=true; ADMIN_OVERRIDE_QUOTE="$2"; shift 2 ;;
+    --owner-authorization)
+      case "${2:-}" in [1-9]*) ;; *) p4b_die 3 "--owner-authorization requires the owner's authorization comment id" ;; esac
+      case "$2" in *[!0-9]*) p4b_die 3 "--owner-authorization requires a numeric comment id" ;; esac
+      P4B_OWNER_AUTH_ID="$2"; shift 2 ;;
+    -h|--help)       usage ;;
+    -*) echo "phase-4b-review.sh: unknown flag: $1" >&2; usage ;;
+    *)
+      if [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; usage; fi
+      shift ;;
+  esac
+done
+
+if [ "$ADMIN_OVERRIDE_SET" = true ]; then
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *[![:space:]]*) ;;
+    *) p4b_die 3 "--admin-override requires a non-empty owner authorization quote" ;;
+  esac
+  case "$ADMIN_OVERRIDE_QUOTE" in
+    *$'\n'*|*$'\r'*) p4b_die 3 "--admin-override quote must be a single line" ;;
+  esac
+  [ "${#ADMIN_OVERRIDE_QUOTE}" -le 500 ] || p4b_die 3 "--admin-override quote must be at most 500 characters"
+fi
+
+# #2968: an owner authorization spends one round beyond a spent cap on one
+# live PR head. A preview cannot consume it, and a wave canary never needs it.
+if [ -n "$P4B_OWNER_AUTH_ID" ]; then
+  [ "$DRY_RUN" != true ] || p4b_die 3 "--owner-authorization cannot be combined with --dry-run: only a posting run consumes it"
+  [ -z "$WAVE_SCOPE_FILE" ] || p4b_die 3 "--owner-authorization does not apply to a wave canary (--wave-scope-file)"
+fi
+
+if [ "$RETAIN_EVIDENCE" = true ]; then
+  [ "$DRY_RUN" = true ] && [ "$OFFLINE_DIFF" = false ] \
+    || p4b_die 3 "--retain-evidence requires a bound, non-offline --dry-run"
+fi
+
+# #2771: the wave audit's Codex arm is bound to the request it created. The
+# library resets the posture when sourced (above), so only this assignment,
+# after validation, can set it.
+if [ -n "$WAVE_CODEX_REQUEST" ]; then
+  [[ "$WAVE_CODEX_REQUEST" =~ ^[1-9][0-9]{0,18}$ ]] \
+    || p4b_die 3 "--wave-codex-request must be a positive comment id; got '$WAVE_CODEX_REQUEST'"
+  [ -n "$WAVE_SCOPE_FILE" ] || p4b_die 3 "--wave-codex-request requires --wave-scope-file"
+  # Read by the sourced library's barrier; deliberately not exported.
+  # shellcheck disable=SC2034
+  P4B_BARRIER_WAVE_CODEX_REQUEST="$WAVE_CODEX_REQUEST"
+fi
+
+if [ "$OFFLINE_DIFF" = true ]; then
+  [ -z "$WAVE_SCOPE_FILE" ] || p4b_die 3 "offline input cannot request wave scope"
+  [ "$DRY_RUN" = true ] && [ -n "$DIFF_FILE" ] && [ -n "$HEAD" ] \
+    || p4b_die 3 "--offline-diff requires --dry-run, --diff-file and a display --head"
+fi
+[ -n "$PR" ] || usage
+[[ "$PR" =~ ^[1-9][0-9]*$ ]] || p4b_die 3 "PR# must be a positive integer; got '$PR'"
+if [ "$EXPECTED_BASE_SHA_SET" = true ]; then
+  [[ "$EXPECTED_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] \
+    || p4b_die 3 "--expected-base-sha must be exactly 40 hexadecimal characters"
+  EXPECTED_BASE_SHA="$(printf '%s' "$EXPECTED_BASE_SHA" | tr '[:upper:]' '[:lower:]')"
+fi
+
+# --- automation entry decision ---------------------------------------------
+# #1046: --force-enabled / P4B_FORCE_ENABLED overrides ONLY `enabled`, so a
+# one-off automated run can be tried on a single PR without flipping the
+# repo-wide governance switch. `mode` (and every other phase_4b_automation
+# field read below) still comes from config unconditionally — an override
+# that also flipped `mode` would leave the config reading "on" for a repo
+# that never opted in, which is exactly what the bootstrap-reset default
+# (false) exists to prevent. ENABLED_VIA is carried into the emitted JSON so
+# a review posted under the override is distinguishable after the fact from
+# one posted under a configured opt-in.
+# Read from the parsed policy (#2913). A policy that cannot be read (no
+# parser, no jq, a parse error, a value of the wrong kind) is not read as the
+# defaults: the run defers to the manual handoff below with its own reason,
+# policy-unreadable, which --force-enabled does not override.
+POLICY_UNREADABLE=""
+ENABLED="$(p4b_automation_field enabled bool)" || POLICY_UNREADABLE=enabled
+ENABLED="${ENABLED:-false}"
+ENABLED_VIA="config"
+if [ -z "$POLICY_UNREADABLE" ] && [ "$ENABLED" != "true" ] && [ "$FORCE_ENABLED" = true ]; then
+  ENABLED="true"
+  ENABLED_VIA="override"
+  p4b_log "phase_4b_automation.enabled != true, but --force-enabled/P4B_FORCE_ENABLED requested this run anyway"
+fi
+MODE="$(p4b_automation_field mode string)" || POLICY_UNREADABLE="${POLICY_UNREADABLE:-mode}"
+MODE="${MODE:-local}"
+
+json_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '"%s"' "$value"
+}
+
+emit_skip_json() {
+  # $ENABLED can be "true" here via --force-enabled even though this
+  # invocation is still skipping (e.g. mode-not-local, which the override
+  # deliberately does not touch) — report what actually held, not a
+  # hardcoded false, so a forced-but-still-skipped run reads honestly.
+  printf '{"pr_number":%s,"repo":%s,"automation_enabled":%s,"enabled_via":%s,"skipped":true,"reason":%s}\n' \
+    "$PR" "$(json_string "$REPO")" \
+    "$([ "$ENABLED" = "true" ] && echo true || echo false)" \
+    "$(json_string "$ENABLED_VIA")" "$(json_string "$1")"
+}
+
+if [ -n "$POLICY_UNREADABLE" ]; then
+  p4b_log "ERROR: phase_4b_automation.$POLICY_UNREADABLE could not be read from the review policy — deferring to the manual handoff"
+  emit_skip_json "policy-unreadable"
+  exit 5
+fi
+if [ "$ENABLED" != "true" ]; then
+  p4b_log "phase_4b_automation.enabled != true — deferring to the manual handoff"
+  emit_skip_json "automation-disabled"
+  exit 5
+fi
+if [ "$MODE" != "local" ]; then
+  p4b_log "phase_4b_automation.mode='$MODE' (not 'local') — deferring to the manual handoff"
+  emit_skip_json "mode-not-local"
+  exit 5
+fi
+
+command -v jq >/dev/null 2>&1 || p4b_die 3 "jq is required"
+# node is a HARD runtime dependency as of #1143, and it was not one before.
+# The identity fence runs the shared contract parser
+# (scripts/lib/pr-body-contract.mjs, executed by pr_body_validate) on EVERY
+# enabled run; callers passing --author used to skip the body read entirely and
+# therefore never reached node. Checked here — beside jq, and AFTER the
+# disabled/mode gates, so the default disabled path stays dependency-free for
+# consumers — so a host missing it is told which dependency is absent instead
+# of meeting a parser error three frames deeper.
+#
+# `node --version` rather than `command -v node`: a node that is present but
+# cannot execute is just as fatal, and this catches both. It also makes the
+# check testable, since shadowing a `command -v` probe with a failing shim
+# proves nothing — `command -v` would still find the shim.
+node --version >/dev/null 2>&1 \
+  || p4b_die 3 "node is required and must be runnable (the shared PR-body contract parser runs under it)"
+
+# Draw once for heartbeat/history identity and pending-record ownership.
+# A host-independent 128-bit value survives cross-checkout/root aggregation;
+# PID/time/RANDOM cannot provide that identity. Entropy is advisory: a failed,
+# malformed or stalled draw leaves accounting's local staging fallback intact
+# without persisting a weak identity or producing a heartbeat. The guarded
+# subshell also contains the timeout helper's dependency/error exits.
+if _p4b_run_entropy="$(p4b_run_with_timeout 2 node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))' 2>/dev/null)" \
+   && [[ "$_p4b_run_entropy" =~ ^[0-9a-f]{32}$ ]]; then
+  P4B_ACCT_RUN_ID="p4b-$_p4b_run_entropy"
+  export P4B_ACCT_RUN_ID
+fi
+unset _p4b_run_entropy
+
+# Hard-required (#799). Every documented fallback in this script keyed off an
+# empty head sha, and an unreadable read never produced one — see the call
+# sites below. A consumer missing the lib must die here rather than run with
+# the dead guards restored.
+[ -r "$ROOT/lib/gh-api-scalar.sh" ] || p4b_die 3 "missing helper: $ROOT/lib/gh-api-scalar.sh (see #799)"
+# shellcheck source=lib/gh-api-scalar.sh
+. "$ROOT/lib/gh-api-scalar.sh"
+# Shared PR-body identity parser (#1121) -- same contract as the guard and the
+# merge gate. A local regex here would pick a marker out of an HTML comment.
+. "$ROOT/lib/pr-body-contract.sh"
+
+# Auto-source the op-preflight reviewer PAT only after the disabled/mode checks.
+# The default disabled path must stay credential-free and exit 5 without
+# touching 1Password/GitHub auth state.
+if [ -r "$ROOT/lib/preflight-helpers.sh" ]; then
+  # shellcheck source=lib/preflight-helpers.sh
+  . "$ROOT/lib/preflight-helpers.sh"
+  preflight_require_token reviewer || true
+  load_preflight_env_vars
+fi
+
+# --- resolve repo / head / author ------------------------------------------
+need_gh() { command -v gh >/dev/null 2>&1 || p4b_die 3 "gh is required for this path (or pass the matching override flag)"; }
+
+# Opt-in base fence for callers that captured an exact head/base pair (#1475).
+# Read both mutable refs in ONE PR response: separate head and base reads can
+# manufacture a pair that never existed together. The historic --head-only
+# path now captures and fences the same coherent pair when this option is absent.
+P4B_BASE_FENCE_REASON=""
+revalidate_expected_base() {  # <stage>
+  local stage="$1" pair live_head live_base extra
+  P4B_BASE_FENCE_REASON=""
+  [ "$EXPECTED_BASE_SHA_SET" = true ] || return 0
+  pair="$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | join(" ")' 2>/dev/null)" || pair=""
+  IFS=' ' read -r live_head live_base extra <<EOF
+$pair
+EOF
+  if [ -z "$live_head" ] || [ -z "$live_base" ] || [ -n "$extra" ] \
+     || ! looks_like_sha "$live_base"; then
+    P4B_BASE_FENCE_REASON="could not read one coherent live PR head/base pair ($stage)"
+    return 1
+  fi
+  if [ "$live_head" != "$HEAD" ]; then
+    P4B_BASE_FENCE_REASON="PR head changed during review (reviewed $HEAD, live $live_head; checked $stage)"
+    return 1
+  fi
+  live_base="$(printf '%s' "$live_base" | tr '[:upper:]' '[:lower:]')"
+  if [ "$live_base" != "$EXPECTED_BASE_SHA" ]; then
+    P4B_BASE_FENCE_REASON="PR base changed during review (expected $EXPECTED_BASE_SHA, live $live_base; checked $stage)"
+    return 1
+  fi
+  return 0
+}
+
+if [ -z "$REPO" ]; then
+  need_gh
+  REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+  [ -n "$REPO" ] || p4b_die 3 "could not resolve repo; pass --repo owner/name"
+fi
+
+if [ "$OFFLINE_DIFF" = true ]; then
+  # Explicit preview bytes have no server tuple or posting authority.
+  EXPECTED_BASE_SHA_SET=false
+  p4b_warn "offline diff preview: supplied bytes are unbound and cannot authorize a review POST"
+else
+# Capture head and base together on every path, including supplied --head.
+# Both exact Git objects become the immutable reasoning input below.
+need_gh
+PAIR="$(gh api "repos/$REPO/pulls/$PR" --jq '[.head.sha, .base.sha] | join(" ")' 2>/dev/null)" || PAIR=""
+IFS=' ' read -r LIVE_HEAD LIVE_BASE PAIR_EXTRA <<EOF
+$PAIR
+EOF
+[[ "$LIVE_HEAD" =~ ^[0-9a-f]{40}$ && "$LIVE_BASE" =~ ^[0-9a-f]{40}$ ]] \
+  && [ -z "$PAIR_EXTRA" ] || p4b_die 3 "could not resolve a complete coherent PR head/base pair"
+[ -z "$HEAD" ] || [ "$HEAD" = "$LIVE_HEAD" ] || p4b_die 3 "supplied head differs from live PR head"
+[ "$EXPECTED_BASE_SHA_SET" != true ] || [ "$EXPECTED_BASE_SHA" = "$LIVE_BASE" ] \
+  || p4b_die 3 "supplied base differs from live PR base"
+HEAD="$LIVE_HEAD"
+EXPECTED_BASE_SHA="$LIVE_BASE"
+EXPECTED_BASE_SHA_SET=true
+if ! revalidate_expected_base initial; then
+  p4b_die 3 "$P4B_BASE_FENCE_REASON"
+fi
+
+fi
+
+# Authoring agent. The PR BODY is the record of authorship, and it is read and
+# validated on EVERY run (#1143). Required even when --reviewer is forced, so
+# the cross-agent invariant still applies.
+#
+# #1143: this block used to run only under `[ -z "$AUTHOR" ]`, which made the
+# contract enforced for callers that omitted `--author` and unenforced for
+# callers that passed it — backwards from what the flag means. `--author` is a
+# convenience for a caller that already knows the identity, never an assertion
+# that the body is well-formed and never a licence to skip reading it. There is
+# deliberately NO opt-out: a caller that cannot produce a contract-satisfying
+# body has not established who authored the PR, and Phase 4b must not pick a
+# reviewer against an identity nothing corroborates.
+need_gh
+# #799: `--jq '.body // ""'` reads as a safe default and is not one — gh
+# emits the error body WITHOUT running the filter, so the `// ""` never
+# applies. No `--shape` is possible on free text (a PR body may legitimately
+# be empty, or contain anything), so the status is the whole guard here:
+# gh_api_scalar returns 3 with empty stdout, and the contract check below then
+# rejects the empty body instead of scanning a JSON error body for an agent
+# name.
+body="$(gh_api_scalar "PR body for $REPO#$PR" \
+  "repos/$REPO/pulls/$PR" --jq '.body // ""')" || body=""
+# Validate the body against the SHARED contract before trusting any identity
+# parsed out of it (#855). Phase 4b sourced pr-body-contract.sh and then only
+# extracted the agent, so a body that the required Self-Review gate would
+# reject -- a duplicate marker, an unknown agent, a heading hidden in a code
+# fence -- still selected a reviewer here. One contract, one implementation,
+# both enforcement paths.
+pr_body_validate "$body" "$(p4b_config)" \
+  || p4b_die 3 "PR body does not satisfy the Authoring-Agent contract"
+BODY_AUTHOR="$(pr_body_authoring_agent "$body")" \
+  || p4b_die 3 "could not parse Authoring-Agent from PR body (parser did not complete)"
+[ -n "$BODY_AUTHOR" ] || p4b_die 3 "could not parse Authoring-Agent from PR body"
+# #1143: when the caller ALSO named an identity, the two must agree. Compare
+# the normalized AGENT on both sides (p4b_agent_of_login lowercases and strips
+# the `nathanpayne-` prefix), because the agent — not the literal spelling — is
+# what selects the reviewer and carries the cross-agent invariant below. A
+# disagreement fails closed rather than silently preferring the flag, which
+# could otherwise pair the PR with a reviewer the real authoring agent must not
+# be paired with.
+if [ -n "$AUTHOR" ] \
+   && [ "$(p4b_agent_of_login "$AUTHOR")" != "$(p4b_agent_of_login "$BODY_AUTHOR")" ]; then
+  p4b_die 3 "--author '$AUTHOR' contradicts the PR body's Authoring-Agent '$BODY_AUTHOR'"
+fi
+# The body wins even when they agree: one source of truth downstream.
+AUTHOR="$BODY_AUTHOR"
+
+# --- select reviewer + adapter ---------------------------------------------
+AUTHOR_AGENT="$(p4b_agent_of_login "$AUTHOR")"
+if [ -z "$REVIEWER" ]; then
+  REVIEWER="$(p4b_select_reviewer "$AUTHOR" || true)"
+  [ -n "$REVIEWER" ] || p4b_die 3 "no external reviewer (≠ author '$AUTHOR') in available_reviewers"
+fi
+REVIEWER_AGENT="$(p4b_agent_of_login "$REVIEWER")"
+if [ "$REVIEWER_AGENT" = "$AUTHOR_AGENT" ]; then
+  p4b_die 3 "reviewer '$REVIEWER' matches authoring agent '$AUTHOR'; Phase 4b requires a different reviewer identity"
+fi
+ADAPTER="$(p4b_adapter_of_login "$REVIEWER")"
+ADAPTER_SCRIPT="$ADAPTER_DIR/review-via-${ADAPTER}.sh"
+DIRECTION="${AUTHOR_AGENT}->${ADAPTER}"
+
+# --- resolve reviewer CLI runtime bounds from policy (#589) -----------------
+# Fail closed on a malformed/out-of-range config rather than running the CLI
+# mis-bounded or with an invalid effort.
+RESOLVED_TIMEOUT="$(p4b_resolve_adapter_timeout "$ADAPTER")" \
+  || p4b_die 3 "invalid phase_4b_automation timeout for adapter '$ADAPTER' (integer seconds in [${P4B_MIN_ADAPTER_TIMEOUT_SECONDS}, ${P4B_MAX_ADAPTER_TIMEOUT_SECONDS}] required)"
+RESOLVED_EFFORT="$(p4b_resolve_adapter_effort "$ADAPTER")" \
+  || p4b_die 3 "invalid phase_4b_automation effort for adapter '$ADAPTER'"
+# Outer adapter-call bound: env override wins, else the policy-resolved value.
+ADAPTER_TIMEOUT="${ADAPTER_TIMEOUT_ENV:-$RESOLVED_TIMEOUT}"
+# Feed the effective bounds to the adapter via env, but only where the caller
+# has not already set them (env override wins for tests/manual runs). The inner
+# CLI timeout defaults to the SAME effective outer timeout (ADAPTER_TIMEOUT), so
+# a P4B_ADAPTER_TIMEOUT_SECONDS override to extend a slow run reaches the adapter
+# too and does not get shadowed by the policy value (#598 Codex P2).
+: "${P4B_REVIEW_CLI_TIMEOUT_SECONDS:=$ADAPTER_TIMEOUT}"
+export P4B_REVIEW_CLI_TIMEOUT_SECONDS
+# EFFECTIVE_EFFORT is the value the adapter actually runs at — an existing
+# P4B_{CLAUDE,CODEX}_EFFORT override is preserved by `:=`, so record THAT (not
+# the policy-resolved value) in the review metadata (#598 Codex P3).
+case "$ADAPTER" in
+  claude) : "${P4B_CLAUDE_EFFORT:=$RESOLVED_EFFORT}"; export P4B_CLAUDE_EFFORT
+          EFFECTIVE_EFFORT="$P4B_CLAUDE_EFFORT" ;;
+  codex)  if [ -n "$RESOLVED_EFFORT" ]; then
+            : "${P4B_CODEX_EFFORT:=$RESOLVED_EFFORT}"; export P4B_CODEX_EFFORT
+          fi
+          EFFECTIVE_EFFORT="${P4B_CODEX_EFFORT:-}" ;;
+  *)      EFFECTIVE_EFFORT="$RESOLVED_EFFORT" ;;
+esac
+
+# Machine-level telemetry is advisory and has no authority reads. Install its
+# EXIT composition before the first barrier/refusal, which precedes the temp
+# cleanup definition. The original cleanup runs when present and remains owner
+# of its paths; the exit status is captured before any telemetry operation.
+p4b_heartbeat_start() { return 0; }
+p4b_heartbeat_stage() { return 0; }
+p4b_heartbeat_finish() { return 0; }
+if [ -r "$ROOT/phase-4b/heartbeat.sh" ]; then
+  # shellcheck source=phase-4b/heartbeat.sh
+  . "$ROOT/phase-4b/heartbeat.sh" || true
+fi
+_p4b_on_exit() {
+  local rc="$1"
+  if [ -n "$P4B_VERDICT_EVIDENCE_FILE" ]; then
+    if [ "${REVIEW_POSTED:-false}" = true ] || [ "$rc" = 0 ]; then
+      rm -f "$P4B_VERDICT_EVIDENCE_FILE" || true
+    else
+      p4b_warn "validated adapter verdict retained at $P4B_VERDICT_EVIDENCE_FILE"
+    fi
+  elif [ -n "$P4B_VERDICT_EVIDENCE_ERROR" ] && [ "${REVIEW_POSTED:-false}" != true ]; then
+    p4b_warn "$P4B_VERDICT_EVIDENCE_ERROR; validated verdict is available in terminal JSON only"
+  fi
+  if declare -F _p4b_cleanup_tmp >/dev/null 2>&1; then _p4b_cleanup_tmp || true; fi
+  # #2663: give back an unspent round reservation. Never after a POST was
+  # attempted: an uncertain publication keeps its slot until reconciled.
+  if declare -F release_round_reservation >/dev/null 2>&1; then release_round_reservation "exit-$rc" || true; fi
+  p4b_heartbeat_finish "$rc" || true
+  return "$rc"
+}
+trap '_p4b_on_exit "$?"' EXIT
+# Invocation results are unknown until this run produces them. Do not publish
+# inherited environment values as adapter output or confirmed POST evidence.
+REVIEW_POSTED=false
+REVIEW_ACKNOWLEDGMENT=""
+ADAPTER_RC=""
+VERDICT=""
+P4B_ACCT_LOOP_STARTED_EPOCH=""
+P4B_ACCT_LOOP_ELAPSED_SECONDS=""
+p4b_heartbeat_start || true
+
+p4b_log "PR $REPO#$PR  HEAD=${HEAD:-?}  direction=$DIRECTION  reviewer=$REVIEWER  adapter=$ADAPTER  timeout=${ADAPTER_TIMEOUT}s  effort=${EFFECTIVE_EFFORT:-cli-default}  dry_run=$DRY_RUN"
+
+# feedback_accounting_status: run the accounting gate once. Returns 0 when
+# clear, 1 when a finding is unaccounted, 2 when the gate failed or is
+# missing; prints the gate's JSON to stderr on anything but clear.
+feedback_accounting_status() {
+  local accounting_json="" accounting_rc=0
+  command -v "$FEEDBACK_ACCOUNTING_GATE" >/dev/null 2>&1 || {
+    p4b_warn "review feedback accounting gate unavailable: $FEEDBACK_ACCOUNTING_GATE"
+    return 2
+  }
+  accounting_json=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO") \
+    || accounting_rc=$?
+  case "$accounting_rc" in
+    0) p4b_log "review feedback accounting clear"; return 0 ;;
+    1) printf '%s\n' "$accounting_json" >&2; return 1 ;;
+    *) printf '%s\n' "$accounting_json" >&2; p4b_warn "review feedback accounting gate failed with exit $accounting_rc"; return 2 ;;
+  esac
+}
+
+require_feedback_accounted() {
+  local rc=0
+  feedback_accounting_status || rc=$?
+  case "$rc" in
+    0) ;;
+    1) p4b_die 7 "review feedback is unaccounted; disposition every finding before Phase 4b dispatch" ;;
+    *) p4b_die 3 "review feedback accounting gate failed or is unavailable" ;;
+  esac
+}
+
+# The approval writer-boundary accounting fence (#1581). This run has already
+# recorded its loop and may have filed follow-ups, so refuse through the
+# pre-post cleanup first: exit 7 for unaccounted feedback, 3 when the gate
+# itself fails.
+refuse_approval_if_feedback_unaccounted() {
+  local acct_rc=0 acct_reason
+  feedback_accounting_status || acct_rc=$?
+  [ "$acct_rc" -ne 0 ] || return 0
+  acct_reason="review feedback became unaccounted during the Phase 4b run; refusing the approval"
+  [ "$acct_rc" -eq 1 ] || acct_reason="review feedback accounting failed at the approval writer boundary; refusing the approval"
+  cleanup_pre_post_refusal_side_effects "$acct_reason" true \
+    "Review feedback accounting" "the review feedback on ${REPO}#${PR}"
+  if [ "$acct_rc" -eq 1 ]; then p4b_die 7 "$acct_reason"; else p4b_die 3 "$acct_reason"; fi
+}
+
+# The Codex request generation this run is authorized under (#1598). A run
+# whose barrier carries a request-budget snapshot uses the snapshot's
+# generation, which the authority fences keep verifying. A run without one
+# (the Phase 4a timeout route, or a Codex-cleared head) captures the live
+# generation right after the barrier authorizes it, before the adapter runs, so
+# a request that arrives later is never mistaken for one the run covered. This
+# precedes every side effect, so an unreadable generation just stops (exit 10).
+capture_authorized_request_generation() {
+  local payload
+  P4B_AUTHORIZED_REQUEST_GENERATION="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" \
+    | jq -ce '.request_generation | select(type == "array")' 2>/dev/null)" && return 0
+  P4B_AUTHORIZED_REQUEST_GENERATION="$(p4b_live_request_generation "$REPO" "$PR")" && return 0
+  P4B_AUTHORIZED_REQUEST_GENERATION=""
+  # The read failed. When the PR's GOVERNING base policy (the one the merge
+  # gate applies) disables Codex, Codex requests carry no authority and the
+  # gate ignores them: proceed without a record. Consulted only on this
+  # failure path, so the common path makes no extra reads; an unresolvable
+  # governing policy counts as enabled (fail closed).
+  if codex_requests_ungoverned; then
+    return 0
+  fi
+  payload="$(jq -nc '{decision:"error",reason:"Codex request generation could not be read when the run was authorized",coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-generation-unreadable",request_budget:null}')"
+  stop_for_barrier_error "$payload"
+}
+
+# True when the PR's governing base policy disables Codex (#1598). Resolved
+# once, on demand; afterwards the run neither records nor enforces a request
+# generation.
+codex_requests_ungoverned() {
+  [ "$P4B_CODEX_REQUESTS_GOVERN" = true ] || return 0
+  if [ "$(p4b_governing_codex_enabled "$REPO" "$PR" 2>/dev/null)" = "false" ]; then
+    P4B_CODEX_REQUESTS_GOVERN=false
+    return 0
+  fi
+  return 1
+}
+
+# Verify, at the writer boundary, the request generation the approval body
+# records (#1598). A snapshot route's generation was just re-proved by the
+# authority fence. A route without a snapshot re-reads the live generation and
+# refuses the approval if it moved since authorization: a request that arrived
+# after the barrier (the Phase 4a timeout route included) was never reviewed
+# and must not be recorded as covered. The final mode repeats only this cheap
+# generation read after final accounting, including on request-budget routes.
+refuse_approval_if_request_generation_moved() {
+  local mode="${1:-pre-accounting}" live_gen="" reason evidence payload
+  [ "$P4B_CODEX_REQUESTS_GOVERN" = true ] || return 0
+  if [ -z "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
+    evidence=request-generation-unrecorded
+    reason="the approval carries no authorized Codex request generation; refusing the approval"
+  elif [ "$mode" != final ] && printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | jq -e '.request_generation | type == "array"' >/dev/null 2>&1; then
+    return 0
+  elif ! live_gen="$(p4b_live_request_generation "$REPO" "$PR")"; then
+    evidence=request-generation-unrecorded
+    reason="Codex request generation could not be re-read before the approval; refusing the approval"
+  elif ! p4b_same_request_generation "{\"request_generation\":$live_gen}" \
+    "{\"request_generation\":$P4B_AUTHORIZED_REQUEST_GENERATION}"; then
+    evidence=request-generation-changed
+    reason="Codex request generation changed since the run was authorized; refusing the approval"
+  else
+    return 0
+  fi
+  # A request generation that moved or cannot be re-read matters only when
+  # the governing policy enables Codex.
+  if codex_requests_ungoverned; then
+    return 0
+  fi
+  cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Codex request authority" "the Codex request generation for ${REPO}#${PR}"
+  payload="$(jq -nc --arg r "$reason" --arg ce "$evidence" \
+    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:$ce,request_budget:null}')"
+  stop_for_barrier_error "$payload"
+}
+
+# #2633: the admin override fields every terminal summary carries, so a run
+# that absorbed a tripwire reports it however it ends.
+admin_override_summary() {
+  local evidence
+  evidence="$(p4b_unposted_verdict_summary)" || return 1
+  printf '%s\n' "$evidence" | jq -s --argjson overridden "$ADMIN_OVERRIDDEN" --arg quote "$ADMIN_OVERRIDE_QUOTE" \
+    --argjson set "$ADMIN_OVERRIDE_SET" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $evidence |
+      {admin_overridden:$overridden,admin_override_quote:(if $set then $quote else null end)} + $evidence
+    else error("expected exactly one unpublished verdict summary object") end'
+}
+
+# --- manual-handoff fallback -----------------------------------------------
+fall_back_to_manual() {
+  local why="$1"
+  local handoff_ref="$PR"
+  local handoff_output="" handoff_rc=0 handoff_rendered=false
+  [ -n "$REPO" ] && handoff_ref="${REPO}#${PR}"
+  # Every fallback reached after adapter dispatch depends on the same
+  # below-cap request snapshot that authorized that dispatch. Recheck it before
+  # rendering the authority-bearing handoff. The revalidator exits directly on
+  # refusal, so this central guard cannot recurse through this function.
+  revalidate_codex_request_budget_authority pre-post
+  require_feedback_accounted
+  # Accounting (#602): record the fail-closed loop as positive safety
+  # evidence. Advisory — a recording failure never alters this fallback.
+  # When this invocation's loop is ALREADY in the log (recorded before the
+  # posting step, e.g. head drift inside post_review), amend that line
+  # instead of appending a duplicate fail-closed loop (#615 Codex).
+  if p4b_acct_on 2>/dev/null; then
+    if [ "${P4B_PRE_POST_ACCT_CLEANED:-false}" = true ]; then
+      : # the final timeout fence already corrected this invocation's loop
+    elif [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+      p4b_acct_mark_unposted "$why"
+    else
+      p4b_acct_hook_note_fallback "$why" \
+        || p4b_warn "accounting: could not record the fail-closed loop (continuing)"
+    fi
+  fi
+  # The handoff helper is stdout-only, but it performs its own feedback and PR
+  # metadata reads before returning the rendered block. Capture that read-only
+  # output first; none of it becomes authority until the parent prints it.
+  # #2633: once the admin override absorbed a tripwire, that tripwire still
+  # holds when the adapter produced no usable verdict. Exit 4 reads as
+  # "reviewer unavailable, may proceed" to wave-audit.sh, so keep the
+  # tripwire's terminal no-fan-out exit 8 and render no handoff for it.
+  if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -eq 0 ] && [ -x "$HANDOFF" ]; then
+    handoff_output=$(PHASE_4B_REVIEWER_IDENTITY="$REVIEWER" "$HANDOFF" "$handoff_ref" 2>&1) \
+      || handoff_rc=$?
+    handoff_rendered=true
+  fi
+  # The parent feedback gate, advisory accounting, and helper above all run
+  # external commands. Bind their entire window to the request-budget snapshot
+  # at the actual writer boundary. Keep the early fence: it performs refusal
+  # cleanup before a fallible feedback read can interrupt that path. This final
+  # fence is unconditional so a missing helper cannot grant fallback via JSON.
+  revalidate_codex_request_budget_authority pre-post
+  if [ "$handoff_rendered" = true ] && [ "$handoff_rc" -eq 5 ]; then
+    # The renderer observed actual ongoing review after the adapter fallback.
+    # Preserve the failed adapter's accounting, but do not publish a handoff.
+    printf '%s\n' "$handoff_output" >&2
+    hold_for_external_review "$(jq -nc \
+      '{decision:"pending",retry_after:30,codex:"not-yet",codex_evidence:"manual-handoff-review-in-flight",reason:"manual handoff renderer observed an active review"}')"
+  fi
+  if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -gt 0 ]; then
+    p4b_warn "admin override (#2633): the adapter produced no usable verdict ($why); the overridden tripwire still requires human-mediated review"
+    local ao
+    ao="$(admin_override_summary)" || exit 8
+    printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+          --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+          --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" '
+      if length == 1 and (.[0] | type == "object") then .[0] as $ao |
+      {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
+       reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
+       review_posted:false, fell_back_to_manual:false, barrier_pending:false,
+       human_tiebreaker_required:true, reason:$why,
+       automation_enabled:true, enabled_via:$enabled_via} + $ao
+      else error("expected exactly one admin summary object") end' || exit 8
+    exit 8
+  fi
+  p4b_warn "falling back to the manual Phase 4b handoff: $why"
+  if [ "$handoff_rendered" = true ]; then
+    case "$handoff_rc" in
+      0) printf '%s\n' "$handoff_output" >&2 ;;
+      4)
+        printf '%s\n' "$handoff_output" >&2
+        p4b_die 7 "review feedback became unaccounted before manual Phase 4b handoff; no handoff rendered"
+        ;;
+      *) p4b_warn "could not render chat-side handoff block (needs gh); brief the human manually" ;;
+    esac
+  fi
+  local ao
+  ao="$(admin_override_summary)" || exit 4
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --arg why "$why" --arg enabled_via "$ENABLED_VIA" \
+        --argjson barrier "${BARRIER_ESCALATION_JSON:-null}" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
+    {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
+     reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
+     review_posted:false, fell_back_to_manual:true, reason:$why,
+     barrier_escalation:$barrier,
+     automation_enabled:true, enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 4
+  exit 4
+}
+
+# #814: a barrier that has not opened yet is NOT a fallback. It exits 6, its
+# own code, carrying barrier_pending:true and retry_after so the caller retries
+# after that many seconds instead of paging a human.
+#
+# Exit 6 rather than reusing 4 (raised in review). Every existing consumer of 4
+# reads it as "this reviewer will not answer": AGENTS.md and REVIEW_POLICY.md
+# route it to the manual handoff, and scripts/wave-audit.sh proceeds fail-open
+# on CI + lane. Reusing 4 would make those true statements false and would turn
+# the ordinary case — wave-audit dispatching a canary before either provider
+# has read it — into the documented fail-open path.
+#
+# Deliberately does NOT render the chat-side handoff and does NOT write a
+# note_fallback ledger entry: nothing has failed. Recording a fail-closed loop
+# on every bounded retry would flood the accounting history and inflate the
+# #813 series-3 fallback counts with waits that later succeed on their own.
+#
+# Normally reached before approval-side accounting and step-9 issue filing:
+# either from the pre-adapter barrier or from the first targeted timeout-
+# generation recheck immediately after the adapter. The final pre-POST recheck
+# can also hold after those side effects; that caller corrects the provisional
+# accounting record and closes this run's follow-up issues first.
+hold_for_external_review() {
+  local payload="$1"
+  p4b_warn "external review has not reached the current head; holding without posting (retry_after=$(printf '%s' "$payload" | jq -r '.retry_after // 0')s)"
+  local ao
+  ao="$(admin_override_summary)" || exit 6
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
+    {pr_number:$pr, repo:$repo, head_sha:$head, direction:$direction,
+     reviewer_identity:$reviewer, adapter:$adapter, verdict:null,
+     review_posted:false, fell_back_to_manual:false, barrier_pending:true,
+     retry_after:($b.retry_after // 0), barrier:$b,
+     reason:"external review has not reached the current head",
+     automation_enabled:true, enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 6
+  exit 6
+}
+
+# #2633: under --admin-override, a deterministic tripwire is recorded and the
+# run continues to the real adapter, whose verdict posts as usual. Only the
+# tripwire site calls this: it runs after every provider barrier and before
+# the body renders, so no provider hold, request-budget snapshot or writer-
+# boundary recheck is skipped. Barrier and Codex human stops keep their own
+# owner exits (#2544) because absorbing them would skip the barrier's
+# CodeRabbit arm and its budget evidence.
+#
+# Only a well-formed tripwire match is absorbed: decision human-review and a
+# non-empty, duplicate-free list of the fixed reason codes escalation.cjs
+# emits. Any other classifier result (version skew, `{}`, a non-array) is an
+# input-integrity failure, never a stop the owner's quote can run past.
+admin_override_absorbs() {
+  [ "$ADMIN_OVERRIDE_SET" = true ] || return 1
+  local payload="$1" entry
+  jq -e '.tripwire | type == "object" and .decision == "human-review"
+    and (.tripwires | type == "array" and length > 0 and length == (unique | length))
+    and all(.tripwires[]; . == "reviewer-address" or . == "verdict-instruction"
+      or . == "authorization-policy-publisher-or-credentials")' <<<"$payload" >/dev/null 2>&1 \
+    || p4b_die 3 "admin override (#2633): the escalation result is not a well-formed tripwire match; refusing to run past it"
+  entry="$(jq -c '{decision,reason,tripwires:.tripwire.tripwires}' <<<"$payload")"
+  ADMIN_OVERRIDDEN="$(jq -c --argjson e "$entry" '. + [$e] | unique' <<<"$ADMIN_OVERRIDDEN")"
+  p4b_warn "admin override (#2633): continuing past a deterministic tripwire ($(jq -r '.tripwires | join(", ")' <<<"$entry")) to the real adapter"
+  return 0
+}
+
+stop_for_human_tiebreaker() {
+  local payload="$1"
+  if printf '%s' "$payload" | jq -e '.tripwire' >/dev/null 2>&1; then
+    p4b_warn "Deterministic Phase 4b tripwire requires human-mediated review; no adapter or approval dispatched"
+  elif printf '%s' "$payload" | jq -e '.round_cap' >/dev/null 2>&1; then
+    p4b_warn "$(printf '%s' "$payload" | jq -r '.reason')"
+  else
+    p4b_warn "Codex human stop holds (spent blocking-review budget, runaway, untested rebuttal or disagreement at a spent request ceiling); stopping for a human tiebreaker without adapter dispatch or Phase 4b handoff"
+  fi
+  local ao
+  ao="$(admin_override_summary)" || exit 8
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     human_tiebreaker_required:true,barrier:$b,reason:$b.reason,
+     automation_enabled:true,enabled_via:$enabled_via}
+    # #2663: a spent round cap reports round_cap at the top level, as every
+    # other round-cap stop does.
+    + (if $b.round_cap then {round_cap:$b.round_cap} else {} end) + $ao
+    else error("expected exactly one admin summary object") end' || exit 8
+  exit 8
+}
+
+# BEGIN p4b_round_cap
+# #2663: enforce phase_4b_automation.max_review_rounds as a hard cap. The
+# governing base policy supplies the cap. Occupied slots come from the per-PR
+# git-ref round ledger (p4b/lib.sh) plus any completed round it does not
+# account for. A run reserves a slot with a fast-forward-only ledger update
+# before any adapter run; a conflict means a fresh read and a full
+# re-evaluation, never a blind retry. The reserving run id travels in the
+# posted review, the only key an uncertain POST is reconciled against.
+#
+# Only the writer frees its slot, and only before it attempted a review POST,
+# after which it exits. Every other outcome keeps the slot occupied: a
+# completed round, an uncertain POST (it may still land), a crash, or an
+# entry edited by anyone else. A crashed run therefore spends one slot; the
+# owner's remedy is a higher governing cap, never reuse, because no client
+# check can prove an in-flight POST will not land later. Nothing resets the
+# count, and no tiebreak, retry or fallback grants a further round. It runs
+# after the provider barrier, so the blocking budget and every Codex human
+# stop keep precedence. Enforcement holds only where every automated
+# publisher reserves through this ledger; an older orchestrator that does not
+# is outside it.
+#
+# #2968: the one sanctioned round beyond a spent cap. With
+# --owner-authorization <comment-id>, a spent cap (nothing in flight) is not
+# a stop when that PR comment is a valid owner authorization for this PR and
+# this head (p4b_prov_authorization), newer than every automated Phase 4b
+# review, and no ledger entry has consumed it. The reservation then records
+# `authorization: <comment-id>`: that entry is the single-use consumption,
+# and the same fast-forward-only write that admits one competing writer
+# admits one consumer. A consumed, invalid, stale or edited authorization
+# keeps the spent stop (exit 8); a cap that is not spent refuses the flag
+# (exit 3) and consumes nothing. The binding check before the POST re-reads
+# the authorization, and the posted review cites it next to its run marker.
+P4B_ROUND_CAP_JSON=null
+P4B_ROUND_CAP=none
+P4B_ROUND_AUTHOR=""
+P4B_ROUND_RESERVED=false
+P4B_ROUND_POST_ATTEMPTED=false
+P4B_ROUND_LEDGER_REF=""
+P4B_ROUND_TREE=""
+P4B_ROUND_WHERE=""
+P4B_OWNER_AUTH_JSON=null
+P4B_OWNER_AUTH_FLOOR=""
+ROUND_REVIEWS='[]'
+round_cap_evidence_error() {
+  local reason="$1"
+  # At the writer boundary the loop already says posted and approval
+  # follow-ups may be filed; undo them as every pre-POST refusal does.
+  [ "$P4B_ROUND_WHERE" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Phase 4b round cap" "the completed Phase 4b rounds of ${REPO}#${PR}"
+  p4b_warn "$reason; stopping without review publication or Phase 4b handoff"
+  local ao
+  ao="$(admin_override_summary)" || exit 10
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --arg reason "$reason" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     infrastructure_error:true,round_cap:{state:"unreadable"},reason:$reason,
+     automation_enabled:true,enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 10
+  exit 10
+}
+round_cap_stop() { # <exit> <state> <reason> <where>
+  local code="$1" state="$2" reason="$3" where="$4"
+  [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+    "Phase 4b round cap" "the completed Phase 4b rounds of ${REPO}#${PR}"
+  release_round_reservation "$state"
+  if [ "$code" = 8 ]; then
+    stop_for_human_tiebreaker "$(jq -nc --arg r "$reason" --argjson rc "$P4B_ROUND_CAP_JSON" --arg s "$state" \
+      '{decision:"human-tiebreaker",reason:$r,round_cap:($rc + {state:$s})}')"
+  fi
+  p4b_warn "$reason"
+  local ao
+  ao="$(admin_override_summary)" || exit 6
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --arg reason "$reason" --argjson rc "$P4B_ROUND_CAP_JSON" \
+        --arg s "$state" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:true,retry_after:60,
+     round_cap:($rc + {state:$s}),reason:$reason,
+     automation_enabled:true,enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 6
+  exit 6
+}
+round_api() { # <method> <endpoint> [<payload-json>] -> response on stdout, rc
+  local payload="" rc=0
+  if [ -n "${3:-}" ]; then
+    payload=$(mktemp "${TMPDIR:-/tmp}/p4b-round-ledger.XXXXXX") || return 2
+    printf '%s' "$3" >"$payload"
+    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
+      gh api "$2" --method "$1" --input "$payload" || rc=$?
+    rm -f "$payload"
+  else
+    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" "$GH_AS_REVIEWER" -- \
+      gh api "$2" --method "$1" || rc=$?
+  fi
+  return "$rc"
+}
+# round_rounds_read -> ROUND_STATE (completed rounds from the PR's reviews).
+# The paginated read is taken twice and must agree: a consistency check
+# against a page shifting mid-read, not a guaranteed snapshot. Rounds are not
+# what the cap's atomicity rests on; the ledger is.
+round_rounds_read() {
+  command -v gh_api_array >/dev/null 2>&1 \
+    || round_cap_evidence_error "Phase 4b round cap: the paginated reader is unavailable"
+  local attempt reviews first second
+  for attempt in 1 2 3; do
+    reviews=$(gh_api_array "repos/$REPO/pulls/$PR/reviews" "Phase 4b round evidence") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's reviews are unreadable"
+    first=$(p4b_completed_rounds_from_reviews "$reviews" "$P4B_ROUND_AUTHOR") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's review history is malformed"
+    reviews=$(gh_api_array "repos/$REPO/pulls/$PR/reviews" "Phase 4b round evidence") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's reviews are unreadable"
+    second=$(p4b_completed_rounds_from_reviews "$reviews" "$P4B_ROUND_AUTHOR") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's review history is malformed"
+    if [ "$(printf '%s' "$first" | jq -c '[.rounds[].id]')" = "$(printf '%s' "$second" | jq -c '[.rounds[].id]')" ]; then
+      ROUND_STATE="$second"; ROUND_REVIEWS="$reviews"; return 0
+    fi
+    p4b_log "round cap: consecutive review reads disagreed (attempt $attempt); re-reading (#2663)"
+  done
+  round_cap_evidence_error "Phase 4b round cap: consecutive review reads never agreed"
+}
+# round_ledger_load -> LEDGER_TIP ("" when the ref is absent), LEDGER_ENTRIES;
+# rc 1 with ROUND_LEDGER_ERR set when the ledger is unreadable or malformed.
+# It never exits, so the release path in the EXIT trap can use it without
+# emitting a second result or replacing the run's exit status.
+round_ledger_load() {
+  local ref_json err rc=0 commit_json
+  ROUND_LEDGER_ERR=""
+  err=$(mktemp "${TMPDIR:-/tmp}/p4b-round-ledger-err.XXXXXX") \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: no scratch space"; return 1; }
+  ref_json=$(gh api "repos/$REPO/git/ref/${P4B_ROUND_LEDGER_REF#refs/}" 2>"$err") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if grep -Eq 'HTTP 404|Not Found' "$err" 2>/dev/null; then
+      rm -f "$err"; LEDGER_TIP=""; LEDGER_ENTRIES='[]'; return 0
+    fi
+    rm -f "$err"; ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger ref is unreadable"; return 1
+  fi
+  rm -f "$err"
+  LEDGER_TIP=$(printf '%s' "$ref_json" | jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' 2>/dev/null) \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger ref is malformed"; return 1; }
+  commit_json=$(gh api "repos/$REPO/git/commits/$LEDGER_TIP") \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger commit is unreadable"; return 1; }
+  LEDGER_ENTRIES=$(p4b_round_ledger_parse "$(printf '%s' "$commit_json" | jq -r '.message // ""')") \
+    || { ROUND_LEDGER_ERR="Phase 4b round cap: the round ledger is malformed"; return 1; }
+}
+# round_ledger_read: round_ledger_load, failing closed with exit 10.
+round_ledger_read() {
+  round_ledger_load || round_cap_evidence_error "$ROUND_LEDGER_ERR"
+}
+# round_ledger_write <entries-json> -> 0 published, 1 conflict (re-read and
+# re-evaluate), 2 unknown. A lost response is resolved by reading the tip:
+# the update applied exactly when the tip now holds this run's intended state.
+# It never exits; callers decide whether an unknown outcome is fatal.
+round_ledger_write() {
+  local entries="$1" message commit rc=0 out
+  if [ -z "$P4B_ROUND_TREE" ]; then
+    # GitHub refuses an empty tree (`{"tree":[]}` is HTTP 422 "Invalid tree
+    # info") and a repository need not hold git's well-known empty tree, so
+    # the ledger commits carry one constant file. The message is the ledger.
+    P4B_ROUND_TREE=$(round_api POST "repos/$REPO/git/trees" "$(jq -nc '{tree:[{path:"README",mode:"100644",type:"blob",
+        content:"mergepath Phase 4b round ledger (#2663). The tip commit message carries the ledger; see specs/phase_4b_round_cap.md.\n"}]}')" \
+      | jq -er '.sha' 2>/dev/null) || return 2
+  fi
+  message=$(p4b_round_ledger_message "$PR" "$entries") || return 2
+  commit=$(round_api POST "repos/$REPO/git/commits" "$(jq -nc --arg m "$message" --arg t "$P4B_ROUND_TREE" --arg p "$LEDGER_TIP" \
+      '{message:$m,tree:$t,parents:(if $p == "" then [] else [$p] end)}')" | jq -er '.sha' 2>/dev/null) || return 2
+  if [ -z "$LEDGER_TIP" ]; then
+    out=$(round_api POST "repos/$REPO/git/refs" "$(jq -nc --arg r "$P4B_ROUND_LEDGER_REF" --arg s "$commit" '{ref:$r,sha:$s}')" 2>&1) || rc=$?
+  else
+    out=$(round_api PATCH "repos/$REPO/git/refs/${P4B_ROUND_LEDGER_REF#refs/}" "$(jq -nc --arg s "$commit" '{sha:$s,force:false}')" 2>&1) || rc=$?
+  fi
+  [ "$rc" -ne 0 ] || return 0
+  if printf '%s' "$out" | grep -Eq 'HTTP 422|HTTP 409|Reference already exists|not a fast forward|Update is not a fast forward'; then
+    return 1
+  fi
+  # Unknown outcome: the tip decides.
+  round_ledger_load || return 2
+  [ "$LEDGER_TIP" = "$commit" ] && return 0
+  return 1
+}
+round_my_entries() { printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" '[.[] | select(.run == $run)]'; }
+# round_provenance_trailer: the end of every posted review body. A per-run
+# nonce lets an uncertain POST be reconciled against THIS run's review, never
+# another caller's identical body on the same head (#2663). An authorized
+# round writes its authorization record directly before that marker, the only
+# place the merge gate reads it (p4b_owner_authorization), so a quoted copy
+# elsewhere in the body is never the citation (#2968).
+round_provenance_trailer() {
+  if [ -n "$P4B_OWNER_AUTH_ID" ]; then
+    printf '\n<!-- mergepath-p4b-owner-authorization: %s -->\n' "$P4B_OWNER_AUTH_ID"
+  fi
+  printf '\n<!-- mergepath-p4b-run: %s -->\n' "$P4B_ACCT_RUN_ID"
+  printf '\n\n_Posted by scripts/phase-4b-review.sh under the reviewer identity. See plans/automated-phase-4b-handoff.md._\n'
+}
+# round_owner_authorization_line: the Review Metadata line of an authorized
+# round (#2968). The reason is owner-typed free text in a reviewer-authored
+# body, so every ASCII punctuation character is escaped, as the #2633
+# admin-override quote is: it renders unchanged but cannot form a tier marker,
+# ack token or HTML-comment record. A quoted reserved Codex command first gets
+# the zero-width break adapter strings get, or the comment guard would refuse
+# the POST after the single-use authorization was consumed.
+round_owner_authorization_line() {
+  [ -n "$P4B_OWNER_AUTH_ID" ] || return 0
+  printf -- '- Owner authorization (#2968): one round beyond the spent Phase 4b round cap, authorized for this head by https://github.com/%s/pull/%s#issuecomment-%s; reason: "%s"\n' \
+    "$REPO" "$PR" "$P4B_OWNER_AUTH_ID" \
+    "$(jq -rn --argjson v "$P4B_OWNER_AUTH_JSON" '($v.reason // "")
+        | gsub("@(?<command>codex[\\s\u001c-\u001f]+rev[i\u0130\u0131]ew)"; "@\u200b\(.command)"; "i")
+        | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')"
+}
+# round_owner_authorization_check <where> -> validates --owner-authorization
+# against fresh PR comments and the current ledger (#2968). Pre-dispatch an
+# invalid authorization keeps the spent stop (exit 8); at the writer boundary
+# it refuses the POST through pre-POST cleanup (exit 10). Unreadable evidence
+# exits 10 either way.
+round_owner_authorization_check() {
+  local where="$1" comments v consumed
+  command -v gh_api_array >/dev/null 2>&1 \
+    || round_cap_evidence_error "Phase 4b round cap: the paginated reader is unavailable"
+  comments=$(gh_api_array "repos/$REPO/issues/$PR/comments" "Phase 4b owner authorization") \
+    || round_cap_evidence_error "Phase 4b round cap: the PR comments holding owner authorization $P4B_OWNER_AUTH_ID are unreadable"
+  if [ "$where" = pre-dispatch ]; then
+    P4B_OWNER_AUTH_FLOOR=$(p4b_prov_latest_claim_at "$ROUND_REVIEWS") \
+      || round_cap_evidence_error "Phase 4b round cap: the PR's review history is malformed"
+  fi
+  v=$(p4b_prov_authorization "$comments" "$P4B_OWNER_AUTH_ID" "$P4B_ROUND_AUTHOR" \
+        "$(p4b_prov_pr_url "$REPO" "$PR")" "$HEAD" "$P4B_OWNER_AUTH_FLOOR") \
+    || round_cap_evidence_error "Phase 4b round cap: the PR comments are malformed"
+  # Consumed by any entry but this run's own, in any state: a released run
+  # still spent its authorization, so a retry needs a fresh one.
+  consumed=$(printf '%s' "$LEDGER_ENTRIES" | jq -r --argjson id "$P4B_OWNER_AUTH_ID" --arg run "$P4B_ACCT_RUN_ID" \
+    '[.[] | select(.authorization == $id and .run != $run) | .run] | join(", ")') \
+    || round_cap_evidence_error "Phase 4b round cap: the round ledger is malformed"
+  if [ -n "$consumed" ]; then
+    v=$(jq -nc --arg r "$consumed" --arg id "$P4B_OWNER_AUTH_ID" \
+      '{ok:false, why:"owner authorization \($id) was already consumed by run \($r); another run needs a fresh authorization"}')
+  fi
+  # Pre-dispatch a valid authorization is "valid" until the reservation that
+  # consumes it lands; at the writer boundary it is already consumed.
+  P4B_ROUND_CAP_JSON=$(printf '%s' "${P4B_ROUND_CAP_JSON:-null}" | jq -c --argjson v "$v" --argjson id "$P4B_OWNER_AUTH_ID" --arg where "$where" \
+    '(. // {}) + {owner_authorization:({comment_id:$id, state:(if ($v.ok | not) then "refused" elif $where == "pre-post" then "consumed" else "valid" end)}
+                  + (if $v.ok then {head:$v.head, created_at:$v.created_at} else {why:$v.why} end))}')
+  if [ "$(printf '%s' "$v" | jq -r '.ok')" != true ]; then
+    if [ "$where" = pre-dispatch ]; then
+      round_cap_stop 8 spent "Phase 4b round cap spent on ${REPO}#${PR}; $(printf '%s' "$v" | jq -r '.why'). The owner may authorize one further round on this head with a new PR comment line P4B_EXTRA_ROUND_AUTHORIZED=<canonical-https-PR-URL>@<full-head-sha> reason: <why> (#2968)" pre-dispatch
+    fi
+    round_cap_evidence_error "Phase 4b round cap: owner authorization $P4B_OWNER_AUTH_ID no longer holds ($(printf '%s' "$v" | jq -r '.why')); not publishing"
+  fi
+  P4B_OWNER_AUTH_JSON="$v"
+}
+release_round_reservation() { # <why>; writer-only, never after a POST attempt
+  [ "$P4B_ROUND_RESERVED" = true ] || return 0
+  [ "$P4B_ROUND_POST_ATTEMPTED" != true ] || return 0
+  # Runs from the EXIT trap after the result is out, so it must never exit or
+  # print a result: every failure leaves the slot occupied and only warns.
+  local attempt entries mine
+  for attempt in 1 2 3 4 5; do
+    round_ledger_load || break
+    mine=$(round_my_entries)
+    [ "$(printf '%s' "$mine" | jq 'length')" = 1 ] || break
+    if [ "$(printf '%s' "$mine" | jq -r '.[0].state')" = released ]; then P4B_ROUND_RESERVED=false; return 0; fi
+    entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" 'map(if .run == $run then .state = "released" else . end)')
+    if round_ledger_write "$entries"; then P4B_ROUND_RESERVED=false; return 0; fi
+  done
+  p4b_warn "could not release this run's Phase 4b round slot (${1:-done}); it stays occupied"
+  P4B_ROUND_RESERVED=false
+}
+enforce_phase4b_round_cap() {
+  local where="$1" policy attempt occ occupied in_flight entries mine
+  if [ "$where" = pre-dispatch ]; then
+    policy=$(p4b_governing_policy_json "$REPO" "$PR") \
+      || round_cap_evidence_error "Phase 4b round cap: the governing review policy is unreadable"
+    P4B_ROUND_CAP=$(p4b_governing_round_cap "$policy") \
+      || round_cap_evidence_error "Phase 4b round cap: phase_4b_automation.max_review_rounds is not a positive integer"
+    P4B_ROUND_AUTHOR=$(printf '%s' "$policy" | jq -r '.author_identity // "nathanjohnpayne"' 2>/dev/null) \
+      || round_cap_evidence_error "Phase 4b round cap: author_identity is unreadable"
+    P4B_ROUND_LEDGER_REF="refs/mergepath/p4b-rounds/pr-$PR"
+  fi
+  if [ "$P4B_ROUND_CAP" = none ]; then
+    [ -z "$P4B_OWNER_AUTH_ID" ] || p4b_die 3 "--owner-authorization applies only where phase_4b_automation.max_review_rounds caps Phase 4b rounds; the governing policy of ${REPO}#${PR} sets no cap (#2968)"
+    return 0
+  fi
+  if [ "$where" = pre-post ]; then
+    P4B_ROUND_WHERE=pre-post
+    # Binding check: this run's slot must still be its own, exactly once,
+    # carrying exactly the authorization it reserved under (#2968).
+    round_ledger_read
+    mine=$(round_my_entries)
+    if [ "$(printf '%s' "$mine" | jq 'length')" != 1 ] || [ "$(printf '%s' "$mine" | jq -r '.[0].state')" != reserved ] \
+       || [ "$(printf '%s' "$mine" | jq -r '.[0].authorization // ""')" != "$P4B_OWNER_AUTH_ID" ]; then
+      P4B_ROUND_RESERVED=false
+      round_cap_evidence_error "Phase 4b round cap: this run's ledger slot is missing, duplicated, no longer reserved or no longer bound to its owner authorization; not publishing"
+    fi
+    [ -z "$P4B_OWNER_AUTH_ID" ] || round_owner_authorization_check pre-post
+    return 0
+  fi
+  for attempt in 1 2 3 4 5; do
+    # Fresh reads and a full re-evaluation on every attempt.
+    round_ledger_read
+    round_rounds_read
+    occ=$(p4b_round_occupancy "$LEDGER_ENTRIES" "$ROUND_STATE" "$P4B_ROUND_CAP") \
+      || round_cap_evidence_error "Phase 4b round cap: occupancy could not be computed"
+    occupied=$(printf '%s' "$occ" | jq -r '.occupied'); in_flight=$(printf '%s' "$occ" | jq -r '.in_flight')
+    P4B_ROUND_CAP_JSON=$(printf '%s' "$occ" | jq -c --arg tip "$LEDGER_TIP" --arg ref "$P4B_ROUND_LEDGER_REF" '. + {ledger_ref:$ref,ledger_tip:$tip}')
+    if [ "$(round_my_entries | jq 'length')" != 0 ]; then
+      round_cap_evidence_error "Phase 4b round cap: the ledger already holds this run id; refusing an ambiguous reservation"
+    fi
+    if [ "$occupied" -ge "$P4B_ROUND_CAP" ]; then
+      if [ "$in_flight" -gt 0 ]; then
+        round_cap_stop 6 held "Phase 4b round slots on ${REPO}#${PR} are occupied (${occupied}/${P4B_ROUND_CAP}, ${in_flight} in flight); not dispatching a competing round. An in-flight slot frees only if its writer releases it before publishing (#2663)" pre-dispatch
+      fi
+      if [ -z "$P4B_OWNER_AUTH_ID" ]; then
+        round_cap_stop 8 spent "Phase 4b round cap spent on ${REPO}#${PR} (${occupied}/${P4B_ROUND_CAP} occupied); an owner decision or a reduced scope is required, and no further automated round runs (#2663). The owner may authorize one further round on this head with a PR comment line P4B_EXTRA_ROUND_AUTHORIZED=<canonical-https-PR-URL>@<full-head-sha> reason: <why>, run with --owner-authorization <comment-id> (#2968)" pre-dispatch
+      fi
+      round_owner_authorization_check pre-dispatch
+    elif [ -n "$P4B_OWNER_AUTH_ID" ]; then
+      p4b_die 3 "--owner-authorization applies only to a spent round cap; ${REPO}#${PR} has ${occupied}/${P4B_ROUND_CAP} round slots occupied, so run without it (the authorization stays unconsumed) (#2968)"
+    fi
+    entries=$(printf '%s' "$LEDGER_ENTRIES" | jq -c --arg run "$P4B_ACCT_RUN_ID" --arg head "$HEAD" --arg auth "$P4B_OWNER_AUTH_ID" \
+      '. + [{run:$run,head:$head,state:"reserved"} + (if $auth == "" then {} else {authorization:($auth | tonumber)} end)]')
+    # Called directly, never in $( ): an unknown outcome re-reads the ledger
+    # into this shell. An unknown outcome may have applied, so it reserves
+    # nothing this run could release; the slot stays occupied.
+    local wrc=0
+    round_ledger_write "$entries" || wrc=$?
+    case "$wrc" in
+      0) P4B_ROUND_RESERVED=true
+         [ -z "$P4B_OWNER_AUTH_ID" ] \
+           || P4B_ROUND_CAP_JSON=$(printf '%s' "$P4B_ROUND_CAP_JSON" | jq -c '.owner_authorization.state = "consumed"')
+         return 0 ;;
+      1) p4b_log "round ledger moved under this run (attempt $attempt); re-reading and re-evaluating (#2663)" ;;
+      *) round_cap_evidence_error "Phase 4b round cap: the round ledger could not be updated" ;;
+    esac
+  done
+  round_cap_evidence_error "Phase 4b round cap: the round ledger kept moving; no slot reserved"
+}
+
+# END p4b_round_cap
+
+stop_for_barrier_error() {
+  local payload="$1"
+  p4b_warn "request-budget authority failed; stopping without review publication or Phase 4b handoff"
+  local ao
+  ao="$(admin_override_summary)" || exit 10
+  printf '%s\n' "$ao" | jq -s --argjson pr "$PR" --arg repo "$REPO" --arg head "${HEAD:-}" \
+        --arg direction "$DIRECTION" --arg reviewer "$REVIEWER" \
+        --arg adapter "$ADAPTER" --argjson b "$payload" --arg enabled_via "$ENABLED_VIA" '
+    if length == 1 and (.[0] | type == "object") then .[0] as $ao |
+    {pr_number:$pr,repo:$repo,head_sha:$head,direction:$direction,
+     reviewer_identity:$reviewer,adapter:$adapter,verdict:null,
+     review_posted:false,fell_back_to_manual:false,barrier_pending:false,
+     infrastructure_error:true,barrier:$b,reason:$b.reason,
+     automation_enabled:true,enabled_via:$enabled_via} + $ao
+    else error("expected exactly one admin summary object") end' || exit 10
+  exit 10
+}
+
+# A barrier that opened over a rate-limited CodeRabbit (#1178). Set when the
+# barrier's CodeRabbit arm classified `rate-limited` and it opened anyway on a
+# a Codex arm that permits adapter review. Read by the body renderer below.
+BARRIER_CODERABBIT_RATE_LIMITED=false
+# A barrier whose CodeRabbit arm CARRIED an earlier head's review forward
+# (#1335): "<source-commit> <fingerprint>" when set, empty otherwise. Read only
+# by the review-body renderer below.
+BARRIER_CODERABBIT_CARRIED=""
+# The barrier's escalation record (#2879): its reason, Codex evidence and the
+# wave request binding (#2771). fall_back_to_manual carries it in the exit 4
+# summary so the wave audit can say why it holds. Evidence only, no authority.
+BARRIER_ESCALATION_JSON=null
+
+# Run the same-head barrier and act on it. Escalation routes to the existing
+# manual handoff; only the non-terminal case takes the new hold path.
+P4B_PRE_ADAPTER_CODEX_EVIDENCE=""
+P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="null"
+P4B_AUTHORIZED_REQUEST_GENERATION=""
+P4B_CODEX_REQUESTS_GOVERN=true
+P4B_PRE_ADAPTER_REQUEST_GENERATION=""
+run_same_head_barrier() {
+  local where="$1" scope="${2:-all}" out rc=0
+  out="$(p4b_same_head_barrier "$REPO" "$PR" "$HEAD" "$REVIEWER" "$DRY_RUN" "$scope")" || rc=$?
+  case "$rc" in
+    0)
+      # pre-fallback too (#1579): the no-adapter fallback revalidates a waived
+      # spent ceiling before it renders the handoff, and needs the evidence.
+      if [ "$where" = "pre-adapter" ] || [ "$where" = "pre-fallback" ]; then
+        P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence // "unreadable"')"
+      fi
+      case "$where" in
+        pre-adapter|pre-fallback)
+          P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="$(printf '%s' "$out" | jq -c '.request_budget // null')"
+          P4B_PRE_ADAPTER_REQUEST_GENERATION="$(printf '%s' "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" | \
+            jq -c 'select(.state == "available") | .request_generation // empty')"
+          ;;
+      esac
+      # #2120: disclose the missing CodeRabbit report without claiming Codex
+      # reported — its arm may be waived or disabled. The independent adapter
+      # still performs the external review, and its verdict decides the run.
+      if [ "$(printf '%s' "$out" | jq -r '.coderabbit // empty' 2>/dev/null || true)" = "rate-limited" ]; then
+        BARRIER_CODERABBIT_RATE_LIMITED=true
+        p4b_warn "CodeRabbit refused $HEAD as rate limited and cannot be re-asked; the Codex arm permits the independent Phase 4b adapter review"
+      fi
+      # #1335: the other shape that opens without CodeRabbit speaking on this
+      # exact head. Narrated for the same two readers, for the same reason.
+      if [ "$(printf '%s' "$out" | jq -r '.coderabbit // empty' 2>/dev/null || true)" = "carried" ]; then
+        BARRIER_CODERABBIT_CARRIED="$(printf '%s' "$out" | jq -r '[.coderabbit_carryforward.source_commit // "unknown", .coderabbit_carryforward.fingerprint // "unknown"] | join(" ")' 2>/dev/null || printf 'unknown unknown')"
+        p4b_warn "CodeRabbit did not re-review $HEAD (it does not review merge commits); its review of ${BARRIER_CODERABBIT_CARRIED%% *} carries forward because the external-review fingerprint is unchanged (${BARRIER_CODERABBIT_CARRIED#* })"
+      fi
+      return 0
+      ;;
+    1) hold_for_external_review "$out" ;;
+    3) stop_for_human_tiebreaker "$out" ;;
+    4) stop_for_barrier_error "$out" ;;
+    *)
+      # A spent-ceiling waiver that escalated still carries its authority
+      # snapshot (#1579); keep it so the handoff rechecks the ceiling first.
+      case "$where:$(printf '%s' "$out" | jq -r '.codex_evidence // empty' 2>/dev/null)" in
+        pre-adapter:request-ceiling*|pre-fallback:request-ceiling*)
+          P4B_PRE_ADAPTER_CODEX_EVIDENCE="$(printf '%s' "$out" | jq -r '.codex_evidence')"
+          P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON="$(printf '%s' "$out" | jq -c '.request_budget // null')"
+          ;;
+      esac
+      BARRIER_ESCALATION_JSON="$(printf '%s' "$out" | jq -c \
+        '{reason, codex, codex_evidence, coderabbit, wave_binding:(.wave_binding // null)}' 2>/dev/null || printf null)"
+      fall_back_to_manual "external review barrier ($where): $(printf '%s' "$out" | jq -r '.reason // "escalated"')"
+      ;;
+  esac
+}
+
+# A timeout is retractable evidence: another exact author trigger on the same
+# head starts a new Phase 4a attempt. Only revalidate that generation here;
+# rerunning the whole barrier would also re-probe CodeRabbit and could turn an
+# unrelated transient into a late hold.
+# Shared by EVERY pre-POST refusal that can happen after this invocation's loop
+# was provisionally recorded — the Phase 4a timeout fence and, since #1143, the
+# PR-body identity fence. One ordering, one implementation: a second copy is
+# how the two drift out of step.
+#
+# The cause phrases are parameters so the two callers report truthfully; their
+# defaults reproduce the timeout wording byte-for-byte, so that caller is
+# unchanged.
+cleanup_pre_post_refusal_side_effects() {
+  # <why> <mark-accounting> [<warn-cause>] [<issue-cause>]
+  local why="$1" mark_accounting="${2:-false}"
+  local warn_cause="${3:-Phase 4a timeout evidence}"
+  local issue_cause="${4:-the Phase 4a timeout waiver for ${REPO}#${PR}}"
+  # Local state first: issue cleanup and the fallback accounting gate both use
+  # external commands and may fail or hang. The loop/ledger must already say
+  # not-posted before either can interrupt this refusal path.
+  if [ "$mark_accounting" = true ]; then
+    if [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+      p4b_acct_mark_unposted "$why"
+      # Only claim the correction is done once it actually LANDED (#1143 round
+      # 5). Setting this unconditionally recorded "we called the corrector",
+      # not "the loop no longer says posted" — so a failed rewrite marked
+      # itself complete and fall_back_to_manual skipped the one remaining
+      # attempt, leaving a durable posted record for a review that never
+      # posted. That is the outcome the round-4 ordering fix exists to
+      # prevent, reached through the correction's FAILURE path instead of
+      # through its ordering.
+      # Default FALSE when unset, deliberately. Unset is unreachable (the
+      # variable is initialised at the top of this script and reset on entry to
+      # p4b_acct_mark_unposted), but the two failure directions are not
+      # symmetric: defaulting true would claim a correction landed that may not
+      # have, leaving a durable `posted` record for a review that never posted;
+      # defaulting false at worst runs the later correction attempt again,
+      # which is idempotent. Fail toward the retry.
+      if [ "${P4B_ACCT_LAST_CORRECTION_OK:-false}" = true ]; then
+        P4B_PRE_POST_ACCT_CLEANED=true
+      fi
+    fi
+  fi
+  if [ "${VERDICT:-}" = "APPROVED" ] && [ -n "${P4B_CREATED_ISSUE_REFS:-}" ]; then
+    p4b_warn "$warn_cause changed before the approval POST — closing this run's filed post-review issues as superseded: $P4B_CREATED_ISSUE_REFS"
+    p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: $issue_cause changed before the Phase 4b approval could post; a rerun files fresh follow-ups."
+    P4B_CREATED_ISSUE_REFS=""
+  fi
+}
+
+# A below-cap request snapshot authorizes adapter dispatch only while its
+# governing PR tuple, resolved policy budget, and request generation remain
+# current. A base advance/retarget, mutable default-policy fallback, or exact
+# author-owned `@codex review` can change that authority during the long
+# adapter or rendering windows without moving the reviewed head. Re-read that
+# narrow snapshot at each authority-bearing exit; current-head Codex reports
+# and trusted timeouts carry no snapshot and therefore pay no extra read or
+# change in precedence.
+#
+# Changed or unreadable evidence exits 10 directly. A clean rerun then observes
+# the new final request and enters the ordinary bounded wait; this invocation
+# must not convert stale budget authority into either a review or manual handoff.
+# #1560 slice 3: a barrier that opened on a spent request ceiling (codex
+# evidence request-ceiling*) carries authority only while the ceiling is still
+# spent and no human stop holds. The adapter run can take the whole adapter
+# timeout, in which a late Codex response, a rebuttal or a policy change can
+# appear, so re-read both at every authority-bearing exit, like the
+# below-cap snapshot below. A human stop exits 8; anything else that changed
+# or cannot be read exits 10.
+revalidate_request_ceiling_authority() {
+  local where="${1:-post-adapter}" budget_json budget_rc=0 budget_state
+  local stops_json stops_rc=0 stops_state reason payload
+  case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in request-ceiling*) ;; *) return 0 ;; esac
+  # The human-stop read (a multi-request ledger) runs FIRST, and the budget read
+  # with its generation and spent-ceiling checks runs LAST, so a request posted
+  # during the slower stop read is still caught (#1579). What remains is the
+  # window between this last read and the POST, the same window every other
+  # fence in this script accepts.
+  stops_json="$(p4b_codex_human_stops "$REPO" "$PR" "$HEAD")" || stops_rc=$?
+  stops_state="$(printf '%s' "$stops_json" | jq -r '.state // "unsafe"' 2>/dev/null || printf unsafe)"
+  budget_json="$(p4b_codex_request_budget_state "$REPO" "$PR" "$HEAD")" || budget_rc=$?
+  budget_state="$(printf '%s' "$budget_json" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  local fresh_state="$budget_state"
+  # Still spent, and spent by the same request generation the barrier saw: an
+  # exact author request posted while the adapter ran (a new final request)
+  # voids this run's authority, so the next run enters the bounded final-request
+  # wait (#1579).
+  if [ "$budget_rc" -eq 0 ] \
+     && ! p4b_same_request_generation "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
+    budget_state=generation-changed
+  fi
+  # Also the same tuple and policy as the barrier's snapshot (#1579): a PR
+  # retargeted during the adapter run makes both fresh reads agree with each
+  # other but not with the base the head was reviewed against.
+  if [ "$budget_rc" -eq 0 ] \
+     && ! p4b_same_governing_tuple "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON" "$budget_json"; then
+    budget_state=snapshot-changed
+  fi
+  # Before dispatch, a NEW pending final request is not an error: hold so the
+  # next run enters its bounded wait (#1583). Only that: a generation changed
+  # by an edited or deleted request (budget available again) or by a request
+  # already answered (exhausted) takes the authority-error path below.
+  if [ "$where" = pre-dispatch ] && [ "$budget_rc:$budget_state" = 0:generation-changed ] \
+     && [ "$fresh_state" = final-request-pending ]; then
+    hold_for_external_review "$(jq -nc '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:"request-cap-final-pending",trigger:"skipped",resume:"skipped"}')"
+  fi
+  case "$budget_rc:$budget_state" in
+    0:exhausted|0:final-request-pending) ;;
+    *)
+      reason="The Codex request ceiling is no longer spent, or its evidence is unreadable, after external review began; refusing stale Phase 4b authority"
+      [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+        "Codex request authority" "the spent Codex request ceiling for ${REPO}#${PR}"
+      payload="$(jq -nc --arg r "$reason" --argjson b "${budget_json:-null}" \
+        '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-ceiling-authority-changed",request_budget:$b}')"
+      stop_for_barrier_error "$payload"
+      ;;
+  esac
+  # One policy generation for the ceiling and the stops (#1579).
+  if [ "$stops_rc" -eq 0 ] && ! p4b_same_governing_tuple "$budget_json" "$stops_json"; then
+    stops_rc=2
+    stops_json='{"state":"unsafe","reason":"pr-policy-tuple-changed-between-ceiling-and-stops"}'
+    stops_state=unsafe
+  fi
+  case "$stops_rc:$stops_state" in
+    0:clear) return 0 ;;
+    0:stop)
+      reason="A human stop appeared during external review at the spent Codex request ceiling ($(printf '%s' "$stops_json" | jq -r '.stops | join(", ")')); human tiebreaker required"
+      [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+        "Codex human stop" "the spent Codex request ceiling for ${REPO}#${PR}"
+      payload="$(jq -nc --arg r "$reason" --argjson b "$budget_json" --argjson hs "$stops_json" \
+        '{decision:"human-tiebreaker",reason:$r,coderabbit:"unchanged",codex:"cap-exhausted",codex_evidence:"request-ceiling-human-stop",request_budget:$b,human_stops:$hs}')"
+      stop_for_human_tiebreaker "$payload"
+      ;;
+    *)
+      reason="Codex human-stop evidence became unreadable or moved during external review; refusing stale Phase 4b authority"
+      [ "$where" != pre-post ] || cleanup_pre_post_refusal_side_effects "$reason" true \
+        "Codex request authority" "the spent Codex request ceiling for ${REPO}#${PR}"
+      payload="$(jq -nc --arg r "$reason" --argjson hs "${stops_json:-null}" \
+        '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:"request-ceiling-human-stop-unreadable",request_budget:null,human_stops:$hs}')"
+      stop_for_barrier_error "$payload"
+      ;;
+  esac
+}
+
+revalidate_codex_request_budget_authority() {
+  local where="${1:-post-adapter}"
+  local unsafe_budget="" recheck_rc=0 reason evidence payload
+  revalidate_request_ceiling_authority "$where"
+  [ -n "$P4B_PRE_ADAPTER_REQUEST_GENERATION" ] || return 0
+
+  unsafe_budget="$(p4b_codex_available_authority_revalidate \
+    "$REPO" "$PR" "$HEAD" "$P4B_PRE_ADAPTER_REQUEST_BUDGET_JSON")" || recheck_rc=$?
+  [ "$recheck_rc" -ne 0 ] || return 0
+  evidence="$(printf '%s' "$unsafe_budget" | jq -r '.reason // "request-budget-authority-unreadable"' \
+    2>/dev/null || printf request-budget-authority-unreadable)"
+  case "$evidence" in
+    request-generation-changed)
+      reason="Codex request generation changed during external review; rerun against the current request timeline"
+      ;;
+    request-generation-reread-failed)
+      reason="Codex request generation could not be re-read during external review; refusing stale Phase 4b authority"
+      ;;
+    pr-policy-tuple-changed)
+      reason="The PR governing policy tuple changed during external review; rerun against the stabilized head and base"
+      ;;
+    governing-budget-changed)
+      reason="The governing Codex request budget changed during external review; rerun under the current base policy"
+      ;;
+    *)
+      reason="Codex governing request-budget authority could not be re-read during external review; refusing stale Phase 4b authority"
+      ;;
+  esac
+  if [ "$where" = pre-post ]; then
+    cleanup_pre_post_refusal_side_effects "$reason" true \
+      "Codex request authority" "the governing Codex request-budget snapshot for ${REPO}#${PR}"
+  fi
+  payload="$(jq -nc --arg r "$reason" --arg ce "$evidence" --argjson b "$unsafe_budget" \
+    '{decision:"error",reason:$r,coderabbit:"unchanged",codex:"escalate",codex_evidence:$ce,request_budget:$b}')"
+  stop_for_barrier_error "$payload"
+}
+
+revalidate_phase4a_timeout_generation() {
+  local where="${1:-post-adapter}"
+  [ "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" = timeout ] || return 0
+  local out rc=0 state why
+  out="$(p4b_codex_timeout_determination "$REPO" "$PR" "$HEAD")" || rc=$?
+  state="$(printf '%s' "$out" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      why="Phase 4a timeout generation changed during external review ($state); holding for the newer attempt"
+      if [ "$where" = "pre-post" ]; then
+        cleanup_pre_post_refusal_side_effects "$why" true
+      fi
+      hold_for_external_review "$(jq -nc --arg ce "$state" \
+        '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:$ce,trigger:"skipped",resume:"skipped"}')"
+      ;;
+    *)
+      why="Phase 4a timeout generation changed during external review ($state); refusing the old waiver"
+      if [ "$where" = "pre-post" ]; then
+        # Correct accounting before the fallback's feedback gate can itself
+        # fail, then tell the fallback not to append a duplicate loop record.
+        cleanup_pre_post_refusal_side_effects "$why" true
+      fi
+      fall_back_to_manual "$why"
+      ;;
+  esac
+}
+
+# #2771 (Phase 4b on #2875): the barrier's wave binding is decided on every
+# request on the PR, not only the configured author's exact commands, so the
+# request-generation fences below cannot see a foreign or prose request that
+# lands during the adapter run. Re-run the same evaluation after the adapter
+# and once more inside the final feedback-accounting fences, and hold (exit
+# 6) unless it still clears. The evaluation makes several reads, so it runs
+# before the last feedback accounting, not after it: a finding that lands
+# during those reads is then still accounted for (Phase 4b on #2888). The
+# POST is preceded only by revalidate_wave_binding_stable, one comment read
+# compared with what this clear saw.
+P4B_WAVE_BINDING_STABILITY=""
+revalidate_wave_binding() {
+  local where="${1:-post-adapter}" out state why
+  [ -n "${P4B_BARRIER_WAVE_CODEX_REQUEST:-}" ] || return 0
+  # Only a dispatch the answered binding authorized is re-checked. The barrier
+  # keeps its account-block waiver for a bound wave (no request can then be
+  # answered); fencing that path would turn the retained fallback into a
+  # repeated exit 6 (Codex on #2888).
+  [ "${P4B_PRE_ADAPTER_CODEX_EVIDENCE:-}" = wave-request-answered ] || return 0
+  out="$(p4b_wave_binding_evaluate "$REPO" "$PR" "$HEAD" "$P4B_BARRIER_WAVE_CODEX_REQUEST")"
+  state="$(printf '%s' "$out" | jq -r '.state // "unreadable"' 2>/dev/null || printf unreadable)"
+  if [ "$state" = clear ]; then
+    P4B_WAVE_BINDING_STABILITY="$(printf '%s' "$out" | jq -c '.stability // null' 2>/dev/null || printf null)"
+    return 0
+  fi
+  why="The wave audit's Codex request $P4B_BARRIER_WAVE_CODEX_REQUEST no longer binds on $HEAD ($where: $(printf '%s' "$out" | jq -r '.reason // "unknown"' 2>/dev/null)); holding"
+  if [ "$where" = "pre-post" ]; then
+    cleanup_pre_post_refusal_side_effects "$why" true
+  fi
+  hold_for_external_review "$(printf '%s' "$out" | jq -c '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",
+    codex_evidence:("wave-request-" + (.reason // "unknown")),trigger:"skipped",resume:"skipped",wave_binding:(del(.generation, .stability))}' 2>/dev/null \
+    || jq -nc '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",codex_evidence:"wave-request-unreadable",trigger:"skipped",resume:"skipped"}')"
+}
+
+# The last wave-binding read before the POST: no request moved since the
+# clear revalidate_wave_binding pre-post recorded. Missing evidence holds.
+revalidate_wave_binding_stable() {
+  local why
+  [ -n "${P4B_BARRIER_WAVE_CODEX_REQUEST:-}" ] || return 0
+  [ "${P4B_PRE_ADAPTER_CODEX_EVIDENCE:-}" = wave-request-answered ] || return 0
+  p4b_wave_binding_stable "$REPO" "$PR" "${P4B_WAVE_BINDING_STABILITY:-}" && return 0
+  why="The wave audit's Codex request $P4B_BARRIER_WAVE_CODEX_REQUEST may no longer bind on $HEAD (a request moved after the final binding evaluation); holding"
+  cleanup_pre_post_refusal_side_effects "$why" true
+  hold_for_external_review "$(jq -nc '{decision:"pending",retry_after:0,coderabbit:"unchanged",codex:"not-yet",
+    codex_evidence:"wave-request-requests-changed-before-post",trigger:"skipped",resume:"skipped"}')"
+}
+
+# --- #1143: the body can disagree with ITSELF, later ------------------------
+#
+# The identity fence at the top of this script reads the PR body exactly ONCE,
+# and the adapter run that follows can last the configured timeout (900s by
+# default). Every drift check between that read and the review POST compares
+# HEAD shas — and editing a PR body does not move HEAD, so a mid-run identity
+# change passes all of them untouched.
+#
+# The concrete attack that closes: a run starts against a body declaring
+# `codex`, so it selects the CLAUDE reviewer; while the adapter reasons, the
+# body is edited to declare `claude`; the run then files follow-up issues and
+# posts an APPROVED as nathanpayne-claude on a PR whose declared authoring
+# agent is now claude. That is the cross-agent invariant broken by the same
+# mechanism the up-front fence exists to close, one layer deeper in time.
+#
+# Returns 0 only when the LIVE body still satisfies the contract AND still
+# declares the agent this run was planned against ($AUTHOR_AGENT, normalized).
+# Every unmodelled input is drift, not a pass: an unreadable read, an empty
+# body, and a body that no longer validates all return 1. Callers own the
+# cleanup, so this reuses the head-drift call sites rather than adding a
+# second drift idiom — the reason lands in P4B_BODY_DRIFT_REASON so no caller
+# has to infer status through a command substitution.
+#
+# A body edit that does NOT touch the identity (adding prose, fixing a typo)
+# still validates and still declares the same agent, so it does not refuse.
+# Only contract-breaking or identity-changing edits do.
+P4B_BODY_DRIFT_REASON=""
+revalidate_pr_body_author() {  # <stage-label>
+  local stage="${1:-pre-post}" live_body live_agent
+  P4B_BODY_DRIFT_REASON=""
+  live_body="$(gh_api_scalar "PR body for $REPO#$PR ($stage)" \
+    "repos/$REPO/pulls/$PR" --jq '.body // ""')" || live_body=""
+  if ! pr_body_validate "$live_body" "$(p4b_config)"; then
+    P4B_BODY_DRIFT_REASON="the PR body no longer satisfies the Authoring-Agent contract (checked $stage)"
+    return 1
+  fi
+  live_agent="$(p4b_agent_of_login "$(pr_body_authoring_agent "$live_body")")"
+  if [ -z "$live_agent" ] || [ "$live_agent" != "$AUTHOR_AGENT" ]; then
+    P4B_BODY_DRIFT_REASON="the PR body's Authoring-Agent changed during review (reviewed '$AUTHOR_AGENT', live '${live_agent:-unreadable}', checked $stage)"
+    return 1
+  fi
+  return 0
+}
+
+# Temp hygiene: one EXIT trap owns every temp path this run creates (the
+# review body rendered below and the dry-run accounting sandbox, when one
+# exists).
+_p4b_cleanup_tmp() {
+  if [ -n "${INPUT_DIR:-}" ]; then rm -rf "$INPUT_DIR" 2>/dev/null || true; fi
+  if [ -n "${BODY_FILE:-}" ]; then rm -f "$BODY_FILE" 2>/dev/null || true; fi
+  if [ -n "${_P4B_ACCT_DRY_STATE:-}" ]; then rm -rf "$_P4B_ACCT_DRY_STATE" 2>/dev/null || true; fi
+}
+# _p4b_on_exit composes this cleanup with advisory terminal recording.
+
+# Dry-run accounting isolation (#615 Codex round 11, P2): a dry-run must not
+# mutate persistent accounting state. It used to append its simulated loop to
+# the REAL per-PR loop log, where it was never rotated (no review posts on a
+# dry-run) — so a later real run consumed rehearsal history: a dry-run
+# CHANGES_REQUESTED P1 on the current head would trip the same-head safety
+# gate against a subsequent valid approval, and a dry-run APPROVED loop
+# inflated the next posted record's loop history and running totals. Redirect
+# ALL accounting state (loop log, pending stage, ledger) to a throwaway COPY
+# of the real state for the rest of this run: every hook — recording, render,
+# rotation, the same-head gate — behaves exactly as a real run would (full
+# history present, gate fidelity preserved), and the real state is untouched.
+# Placed BEFORE the first fall_back_to_manual call site so even an early
+# fallback's note_fallback recording lands in the sandbox.
+#
+# The redirect is NOT conditional on accounting being available (Codex P2 on
+# #842). The #814 barrier keys its pending marker off the same state dir, and a
+# missing or unsourceable accounting module is an explicitly supported
+# configuration — so gating this block on P4B_ACCT_AVAILABLE let a dry run
+# write its marker into the REAL .mergepath/phase-4b-barrier, where a later
+# real run inherited time accumulated by the rehearsal and could exhaust the
+# barrier into a manual handoff it had not earned. Every dry run now gets an
+# isolated state dir; only the COPY of prior history needs accounting.
+_P4B_ACCT_DRY_STATE=""
+if [ "$DRY_RUN" = true ]; then
+  # An `if`, not `[ ... ] && assign`: as a standalone statement the latter
+  # returns non-zero whenever accounting is unavailable, which under this
+  # script's errexit would abort the run — in exactly the degraded
+  # configuration this change exists to support.
+  _p4b_real_state=""
+  if [ "$P4B_ACCT_AVAILABLE" = true ]; then
+    _p4b_real_state="$(p4b_acct_state_dir)"
+  fi
+  if _P4B_ACCT_DRY_STATE="$(mktemp -d "${TMPDIR:-/tmp}/p4b-acct-dry.XXXXXX" 2>/dev/null)"; then
+    if [ -d "$_p4b_real_state" ]; then
+      cp -Rp "$_p4b_real_state/." "$_P4B_ACCT_DRY_STATE/" 2>/dev/null \
+        || p4b_warn "accounting: could not copy state into the dry-run sandbox; the dry-run renders from empty history (real state untouched)"
+    fi
+  else
+    # No sandbox ⇒ still never touch real state: point at a fresh unused
+    # path; hooks mkdir/append there or degrade advisorily (warn + plain
+    # summary). Real state stays untouched either way.
+    _P4B_ACCT_DRY_STATE="${TMPDIR:-/tmp}/p4b-acct-dry-unavailable.$$"
+    p4b_warn "accounting: could not create the dry-run sandbox; dry-run accounting starts from empty state (real state untouched)"
+  fi
+  P4B_ACCT_STATE_DIR="$_P4B_ACCT_DRY_STATE"
+  export P4B_ACCT_STATE_DIR
+fi
+
+ADAPTER_MISSING=false
+if [ ! -x "$ADAPTER_SCRIPT" ]; then
+  ADAPTER_MISSING=true
+  # No adapter is an infrastructure fallback, never authority to bypass the
+  # governing Codex cap. This mode makes no provider-triggering writes and
+  # still requires authority-bearing input classification before fallback.
+  # Pure previews keep their existing offline/unavailable behavior.
+  if [ "$DRY_RUN" != true ]; then
+    run_same_head_barrier "pre-fallback" cap-only
+  fi
+fi
+
+# First barrier evaluation (#814), before the adapter run — the expensive part
+# of the loop. If external review has not reached this head there is nothing
+# to order the approval against yet, so the reasoning pass is not worth
+# spending. Placed AFTER the adapter-existence check rather than before it
+# (a deviation from #814's change detail, recorded there): a PR with no
+# adapter can never get a Phase 4b review, so probing providers and possibly
+# triggering CodeRabbit for it would be wasted work and wasted allowance.
+#
+# Skipped entirely on --dry-run (Codex P2 on #842). The barrier guards the
+# review POST, and a dry-run never posts, so there is no ordering hazard for
+# it to prevent — running it would be ceremony. It is not free ceremony
+# either: both provider helpers are gh-backed, so it breaks the offline
+# dry-run recipe in scripts/phase-4b/README.md ("Try it (dry-run, offline,
+# with fake CLIs)"), which exists precisely to validate adapter dispatch and
+# verdict parsing with no network and no credentials. That workflow is also
+# how tests/test_phase_4b_automation.sh exercises the package.
+if [ "$ADAPTER_MISSING" = true ]; then
+  : # The cap-only barrier above owns this path; no provider-triggering probe.
+elif [ "$DRY_RUN" = true ]; then
+  p4b_warn "dry-run: skipping the same-head barrier — it guards the review POST, and a dry-run posts nothing (offline dry-runs stay offline)"
+else
+  run_same_head_barrier "pre-adapter"
+  capture_authorized_request_generation
+fi
+
+# #1583: the barrier's spent-ceiling decision can predate the CodeRabbit probe.
+# Recheck it at the dispatch boundary so a new final request holds (exit 6,
+# its bounded wait) instead of spending an adapter run that the post-adapter
+# fence would only discard. It runs before the accounting gate below, so that
+# gate stays the last read before dispatch.
+if [ "$DRY_RUN" != true ] && [ "$ADAPTER_MISSING" != true ]; then
+  revalidate_request_ceiling_authority pre-dispatch
+  # #2663: after the barrier (its Codex stops take precedence) and before the
+  # accounting gate and the adapter, so a refused round spends no review.
+  enforce_phase4b_round_cap pre-dispatch
+fi
+
+# Do not spend an external reviewer round while an earlier finding remains
+# unread or undispositioned. Unlike the provider-ordering barrier, this also
+# applies to dry-runs: invoking the reasoning adapter is the scarce action the
+# gate protects. The command override keeps the orchestrator hermetic in tests.
+# An unavailable pure preview needs no captured input. Posting and retained
+# evidence must cross the same input fence even when no adapter can run.
+if [ "$ADAPTER_MISSING" != true ] || [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; then
+  require_feedback_accounted
+
+  # Resolve exact objects in an isolated store, never through a mutable PR diff
+  # endpoint. A supplied diff is only a compatibility assertion of these bytes.
+  INPUT_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/p4b-input.XXXXXX")" \
+    || p4b_die 3 "could not create protected review input"
+  if [ "$OFFLINE_DIFF" = true ]; then
+    [ -f "$DIFF_FILE" ] && [ ! -L "$DIFF_FILE" ] \
+      || p4b_die 3 "offline diff must be a regular file"
+    cp "$DIFF_FILE" "$INPUT_DIR/review.diff" || p4b_die 3 "could not protect offline input"
+    chmod 400 "$INPUT_DIR/review.diff"
+    DIFF_FILE="$INPUT_DIR/review.diff"
+    OFFLINE_INPUT_DIGEST="$(p4b_input_digest "$DIFF_FILE")" || p4b_die 3 "could not fingerprint offline input"
+  else
+    if ! p4b_run_with_timeout 90 "$ROOT/phase-4b/immutable-input.sh" capture \
+         "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" "$INPUT_DIR"; then
+      p4b_die 3 "could not capture immutable PR base/head objects"
+    fi
+    if [ -n "$WAVE_SCOPE_FILE" ]; then
+      if ! p4b_run_with_timeout 180 "$ROOT/phase-4b/immutable-input.sh" wave-capture \
+          "$REPO" "$PR" "$EXPECTED_BASE_SHA" "$HEAD" \
+          "$WAVE_SCOPE_FILE" "$INPUT_DIR" "$(p4b_config)"; then
+        p4b_die 3 "could not regenerate trusted canonical wave input"
+      fi
+    fi
+    INPUT_METADATA_DIGEST="$(p4b_input_digest "$INPUT_DIR/input.json")" \
+      || p4b_die 3 "could not fingerprint review input metadata"
+    if [ -n "$DIFF_FILE" ]; then
+      SUPPLIED_DIGEST="$(p4b_input_digest "$DIFF_FILE")" \
+        || p4b_die 3 "supplied diff is unreadable or unprotected"
+      [ "$SUPPLIED_DIGEST" = "$(jq -er '.diff_sha256' "$INPUT_DIR/input.json")" ] \
+        || p4b_die 3 "supplied diff differs from captured immutable objects"
+    fi
+    DIFF_FILE="$INPUT_DIR/review.diff"
+  fi
+fi
+
+revalidate_immutable_input() {
+  if [ "$OFFLINE_DIFF" = true ]; then
+    [ "$(p4b_input_digest "$DIFF_FILE")" = "$OFFLINE_INPUT_DIGEST" ]
+    return
+  fi
+  [ "$(p4b_input_digest "$INPUT_DIR/input.json")" = "$INPUT_METADATA_DIGEST" ] \
+    && p4b_revalidate_input "$REPO" "$PR" "$INPUT_DIR"
+}
+
+# #1757: the complete immutable PR input, before trimming or model dispatch,
+# owns deterministic egregious-case escalation. Existing barrier stops above
+# remain authoritative. Pure previews retain their exemption; historical
+# callers retaining reusable review evidence request the same tripwire fence.
+if [ "$OFFLINE_DIFF" != true ] && { [ "$DRY_RUN" != true ] || [ "$RETAIN_EVIDENCE" = true ]; }; then
+  escalation="$(node "$ROOT/phase-4b/escalation.cjs" "$INPUT_DIR")" \
+    || p4b_die 3 "could not verify deterministic Phase 4b escalation input"
+  if [ "$(printf '%s' "$escalation" | jq -r '.exemption // empty')" = verified-propagation ]; then
+    p4b_warn "byte-verified propagation canary: tripwires do not re-gate canonical content that already merged on the hub (#2633)"
+  fi
+  if ! printf '%s' "$escalation" | jq -e '.decision == "model-review" and .tripwires == []' >/dev/null; then
+    tripwire_payload="$(jq -nc --argjson escalation "$escalation" \
+      '{decision:"human-tiebreaker",reason:"Deterministic Phase 4b tripwire requires human-mediated review",tripwire:$escalation}')"
+    admin_override_absorbs "$tripwire_payload" || stop_for_human_tiebreaker "$tripwire_payload"
+  fi
+fi
+
+if [ "$ADAPTER_MISSING" = true ]; then
+  fall_back_to_manual "no adapter for reviewer '$REVIEWER' (expected $ADAPTER_SCRIPT)"
+fi
+
+# --- run the adapter (reasoning plane; never posts) ------------------------
+ADAPTER_ARGS=( --pr "$PR" )
+[ -n "$REPO" ]      && ADAPTER_ARGS+=( --repo "$REPO" )
+[ -n "$HEAD" ]      && ADAPTER_ARGS+=( --head "$HEAD" )
+[ -n "$DIFF_FILE" ] && ADAPTER_ARGS+=( --diff-file "$DIFF_FILE" )
+[ "$OFFLINE_DIFF" = true ] || ADAPTER_ARGS+=( --input-metadata "$INPUT_DIR/input.json" )
+
+# Accounting (#602): per-loop timing signals, captured whether or not the
+# adapter succeeds so fail-closed loops carry their duration too.
+P4B_ACCT_LOOP_STARTED_EPOCH="$(date +%s)"
+p4b_heartbeat_stage adapter "$P4B_ACCT_LOOP_STARTED_EPOCH" || true
+set +e
+VERDICT_JSON="$(p4b_run_with_timeout "$ADAPTER_TIMEOUT" "$ADAPTER_SCRIPT" "${ADAPTER_ARGS[@]}")"
+ADAPTER_RC=$?
+set -e
+P4B_ACCT_LOOP_ELAPSED_SECONDS=$(( $(date +%s) - P4B_ACCT_LOOP_STARTED_EPOCH ))
+export P4B_ACCT_LOOP_STARTED_EPOCH P4B_ACCT_LOOP_ELAPSED_SECONDS
+p4b_heartbeat_stage adapter || true
+if [ "$DRY_RUN" != true ]; then
+  # This fence precedes adapter rc/schema branching so a failed or malformed
+  # adapter cannot turn a newly occupied final request into a manual handoff.
+  revalidate_codex_request_budget_authority post-adapter
+fi
+if [ "$ADAPTER_RC" -ne 0 ]; then
+  # Input/configuration refusals are hard stops. Adapter dependencies and
+  # unavailable plan login use exit 4 and retain the manual handoff (#1955).
+  [ "$ADAPTER_RC" -ne 3 ] || p4b_die 3 "adapter input or configuration refusal (exit 3)"
+  if p4b_is_timeout_rc "$ADAPTER_RC"; then
+    fall_back_to_manual "adapter timed out after ${ADAPTER_TIMEOUT}s"
+  fi
+  fall_back_to_manual "adapter exited $ADAPTER_RC"
+fi
+# Defense in depth: re-validate before we act on it.
+if ! revalidate_immutable_input \
+  || { [ "$OFFLINE_DIFF" != true ] && ! p4b_validate_bound_input "$VERDICT_JSON" "$INPUT_DIR/input.json" "$DIFF_FILE"; }; then
+  p4b_die 3 "adapter input binding changed or PR head transitioned during review"
+fi
+if ! p4b_validate_verdict "$(printf '%s' "$VERDICT_JSON" | jq -c 'del(.review_input)')"; then
+  fall_back_to_manual "adapter returned a non-conformant verdict"
+fi
+# Preserve the exact schema-valid, bound adapter result before any presentation
+# normalization or late fence can refuse publication (#2790). This private file
+# survives unsuccessful runs; successful publication removes it at EXIT.
+P4B_VALIDATED_VERDICT="$VERDICT_JSON"
+if [ "$DRY_RUN" != true ]; then
+  evidence_dir="${P4B_ACCT_STATE_DIR:-$(p4b_repo_root)/.mergepath}/unposted-verdicts"
+  if mkdir -p "$evidence_dir" && chmod 700 "$evidence_dir" \
+    && evidence_dir="$(cd "$evidence_dir" && pwd)" \
+    && P4B_VERDICT_EVIDENCE_FILE="$(mktemp "$evidence_dir/pr-${PR}.XXXXXX")" \
+    && printf '%s\n' "$P4B_VALIDATED_VERDICT" > "$P4B_VERDICT_EVIDENCE_FILE"; then
+    :
+  else
+    [ -z "$P4B_VERDICT_EVIDENCE_FILE" ] || rm -f "$P4B_VERDICT_EVIDENCE_FILE" || true
+    P4B_VERDICT_EVIDENCE_FILE=""
+    P4B_VERDICT_EVIDENCE_ERROR="could not retain validated adapter verdict under $evidence_dir"
+  fi
+fi
+# #1598: the approval's request-generation record must be writer-owned. The
+# verdict's text (summary, findings) is rendered into the body and echoed by
+# the accounting block, so neutralize any copy of the record marker in it;
+# the substitute merge gate accepts exactly one marker. Reserved Codex command
+# quotes also receive a zero-width break (Python guard whitespace includes
+# U+001C through U+001F in addition to the regex engine's Unicode whitespace).
+VERDICT_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c '
+  walk(if type == "string"
+       then gsub("@(?<command>codex[\\s\u001c-\u001f]+rev[i\u0130\u0131]ew)"; "@\u200b\(.command)"; "i")
+          | gsub("<!--(?<s>\\s*)mergepath-p4b-request-generation"; "<!--\(.s)(quoted) mergepath-p4b-request-generation")
+       else . end)')" || fall_back_to_manual "adapter verdict could not be normalized"
+
+# A Codex trigger can arrive without changing the PR head while the external
+# adapter is running. Revalidate a timeout-derived waiver after the adapter's
+# output is schema-valid but before interpreting it or performing the first
+# approval-side effect. Keep dry-runs offline.
+if [ "$DRY_RUN" != true ]; then
+  revalidate_phase4a_timeout_generation post-adapter
+  revalidate_wave_binding post-adapter
+fi
+
+VERDICT="$(printf '%s' "$VERDICT_JSON" | jq -r '.verdict')"
+SUMMARY="$(printf '%s' "$VERDICT_JSON" | jq -r '.summary')"
+FINDINGS_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.findings | length')"
+TOKEN_COUNT="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.token_count // empty')"
+USAGE_SOURCE="$(printf '%s' "$VERDICT_JSON" | jq -r '.usage.source // empty')"
+ADAPTER_RUNS=1
+# Posting covers preparation and its side effects; it never asserts a POST.
+p4b_heartbeat_stage posting || true
+
+# p4b_file_post_review_issues <verdict-json>
+# Policy step 9 executor (#672): one `post-review` + `observation` issue per
+# discretionary finding on an APPROVED verdict, filed in $REPO under the
+# AUTHOR identity and assigned to it. Writes go through gh-as-author.sh —
+# the wrapper resolves the author PAT (OP_PREFLIGHT_AUTHOR_PAT or keyring)
+# AND identity-verifies it before the write, which both satisfies the
+# no-bare-gh-writes contract and closes the wrong-identity risk from the
+# round-2 finding more strongly than manual token resolution did.
+# Prints TWO lines: line 1 = comma-separated `#N` references (reused +
+# created, for the review body), line 2 = the subset CREATED by this
+# invocation (for cleanup — a reused prior-run issue must never be closed
+# by this run's failure paths, #674 round-5 P2). ANY single failure —
+# wrapper/token verification, a missing label on the target repo, an API
+# error, or a DEDUP SEARCH error (#674 CodeRabbit Major: a swallowed search
+# failure would read as "no existing issue" and mint duplicates) — returns
+# non-zero so the caller refuses the approval (fail-closed: an APPROVED may
+# never post with its observations unfiled; that failure mode degrades
+# exactly to the pre-#672 refusal).
+p4b_file_post_review_issues() {
+  local vjson="$1" author_login refs="" created="" i total sev fpath fline fbody title bfile url existing
+  author_login="$(p4b_top_field author_identity)"; author_login="${author_login:-nathanjohnpayne}"
+  total="$(printf '%s' "$vjson" | jq -r '.findings | length')"
+  i=0
+  while [ "$i" -lt "$total" ]; do
+    sev="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].severity')"
+    fpath="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].path // "PR"')"
+    fline="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].line // empty')"
+    fbody="$(printf '%s' "$vjson" | jq -r --argjson i "$i" '.findings[$i].body')"
+    # Policy step 9 labels are `post-review` plus `observation` OR `risk`
+    # (#674 Codex P2): the verdict schema carries no risk flag, so classify
+    # by the reviewer's own wording — a finding that talks about risk files
+    # as one. Mislabels are trivially editable after the fact; the load-
+    # bearing part is that risk follow-ups stay visible to `risk`-keyed
+    # triage instead of being hard-coded observations.
+    kind="observation"
+    if printf '%s' "$fbody" | grep -qiE '(^|[^[:alpha:]])risk(s|y)?([^[:alpha:]]|$)'; then
+      kind="risk"
+    fi
+    # Rerun idempotency (#674 CodeRabbit): a mid-loop failure leaves earlier
+    # issues behind, and a straight rerun of the same verdict would file
+    # them again. Every issue body embeds a stable head-pinned marker, and
+    # the loop reuses a marker match instead of re-creating. Search-index
+    # lag can miss a JUST-created issue; the worst case is one duplicate —
+    # exactly the pre-marker status quo — never a lost filing. The marker
+    # keys on a CONTENT fingerprint, not the array index (#674 round-3 P2):
+    # a rerun that returns the same findings reordered or reworded must not
+    # bind an old issue to whatever now occupies the same slot — changed
+    # content mints a fresh issue (the superseded one stays open and
+    # visible, never silently rebound).
+    fp="$(printf '%s|%s|%s|%s' "$sev" "$fpath" "$fline" "$fbody" | cksum | cut -d' ' -f1)"
+    marker="p4b-post-review ${REPO}#${PR} head=${HEAD:-unknown} finding=${fp}"
+    if ! existing="$(gh search issues --repo "$REPO" --state open "\"$marker\"" --json url --jq '.[0].url // empty' 2>/dev/null)"; then
+      # Dedup search ERROR ≠ dedup search EMPTY (#674 CodeRabbit Major):
+      # an API/auth/rate-limit failure here must not read as "no existing
+      # issue" and mint duplicates — fail closed like any other step.
+      p4b_warn "post-review dedup search failed for fingerprint ${fp} — failing closed rather than risking duplicate issues"
+      printf '%s\n%s' "$refs" "$created"
+      return 1
+    fi
+    if [ -n "$existing" ]; then
+      refs="${refs:+$refs, }#${existing##*/}"
+      i=$((i + 1))
+      continue
+    fi
+    # Title follows the documented step-9 convention (`[Post-Review] {brief
+    # description}`, REVIEW_POLICY.md § post-merge issue creation — #674
+    # round-3 P2) so title-shape triage and searches see auto-filed
+    # follow-ups exactly like manual ones.
+    title="$(printf '%.120s' "[Post-Review] ${kind} from ${REPO}#${PR}: ${sev} ${fpath}${fline:+:$fline}")"
+    bfile="$(mktemp "${TMPDIR:-/tmp}/p4b-issue.XXXXXX")"
+    {
+      printf 'Advisory %s %s flagged by the automated Phase 4b APPROVED review of %s#%s. Filed by scripts/phase-4b-review.sh BEFORE the approval posted (policy step 9, #672).\n\n' "$sev" "$kind" "$REPO" "$PR"
+      printf 'Anchor: `%s`%s\n\n' "$fpath" "${fline:+ line $fline}"
+      printf '%s\n' "$fbody"
+      printf '\nReviewer: %s (%s adapter). Reviewed head: `%s`.\n' "$REVIEWER" "$ADAPTER" "${HEAD:-unknown}"
+      printf '\n<!-- %s -->\n' "$marker"
+    } > "$bfile"
+    url="$("$GH_AS_AUTHOR" -- gh issue create --repo "$REPO" \
+      --title "$title" --body-file "$bfile" \
+      --label post-review --label "$kind" \
+      --assignee "$author_login" 2>/dev/null)" \
+      || { rm -f "$bfile"; printf '%s\n%s' "$refs" "$created"; return 1; }
+    rm -f "$bfile"
+    [ -n "$url" ] || { printf '%s\n%s' "$refs" "$created"; return 1; }
+    refs="${refs:+$refs, }#${url##*/}"
+    created="${created:+$created, }#${url##*/}"
+    i=$((i + 1))
+  done
+  printf '%s\n%s' "$refs" "$created"
+}
+
+# p4b_close_post_review_issues <refs "#1, #2"> <reason>
+# Self-cleanup for the filing side effect (#674 round-4 P2): when an
+# approval is refused AFTER issues were filed (head drift, partial filing
+# failure), the filed issues are closed as superseded rather than left
+# orphaned — the dedup search is open-state-scoped, so a rerun files fresh
+# follow-ups instead of resurrecting closed refs. Best-effort: a close
+# failure warns with the ref so the operator can close manually; it never
+# changes the refusal outcome.
+p4b_close_post_review_issues() {
+  local refs="$1" reason="$2" n
+  for n in $(printf '%s' "$refs" | tr ',' ' '); do
+    n="${n##*#}"
+    [ -n "$n" ] || continue
+    "$GH_AS_AUTHOR" -- gh issue close "$n" --repo "$REPO" --comment "$reason" >/dev/null 2>&1 \
+      || p4b_warn "could not close superseded post-review issue #$n — close it manually"
+  done
+  return 0
+}
+
+POST_REVIEW_ISSUE_REFS=""
+P4B_CREATED_ISSUE_REFS=""
+if [ "$VERDICT" = "APPROVED" ] && [ "$FINDINGS_COUNT" -gt 0 ]; then
+  # Policy step 9 (#672): observations/risks from an approving external
+  # reviewer become post-review issues BEFORE the approval clears the merge
+  # gate. The validator has already rejected APPROVED carrying any
+  # policy-REQUIRED tier, so every finding here is discretionary — file the
+  # issues mechanically and post the APPROVED with the references, instead
+  # of discarding the verdict into the manual handoff (which stranded the
+  # caller without the findings it needed to comply). Opt out with
+  # phase_4b_automation.post_review_issues: false (restores the pre-#672
+  # refusal); dry-run prints intent and files nothing.
+  # Opt-out is validated fail-closed (#674 CodeRabbit): only the literal
+  # true/false (or absent ⇒ true) are accepted — a typo like `False`, `no`,
+  # or `0` must not silently fail OPEN into auto-filing issues under the
+  # author PAT.
+  _pri_knob="$(p4b_automation_field post_review_issues)" || _pri_knob="<unreadable>"
+  case "${_pri_knob:-true}" in
+    true) : ;;
+    false)
+      fall_back_to_manual "approved verdict included findings and phase_4b_automation.post_review_issues is false; post-review issue filing is required before Phase 4b clearance"
+      ;;
+    *)
+      fall_back_to_manual "invalid phase_4b_automation.post_review_issues value '${_pri_knob}' (expected true or false) — refusing fail-closed"
+      ;;
+  esac
+  # Tiers the feedback policy marks `ignore` are never surfaced (#674 Codex
+  # P2): drop them from the FILE set. The review body still lists every
+  # verdict finding — it is the faithful record of what the reviewer said —
+  # but no follow-up issue is opened for suppressed tiers.
+  IGNORED_SEVS='[]'; _ig_first=true
+  for _tier in p0 p1 p2 p3; do
+    if [ "$(p4b_feedback_priority_value "$_tier")" = "ignore" ]; then
+      if [ "$_ig_first" = true ]; then IGNORED_SEVS='['; _ig_first=false; else IGNORED_SEVS="$IGNORED_SEVS,"; fi
+      IGNORED_SEVS="$IGNORED_SEVS\"$(printf '%s' "$_tier" | tr '[:lower:]' '[:upper:]')\""
+    fi
+  done
+  [ "$_ig_first" = true ] || IGNORED_SEVS="$IGNORED_SEVS]"
+  FILE_JSON="$(printf '%s' "$VERDICT_JSON" | jq -c --argjson ig "$IGNORED_SEVS" \
+    '{findings: [.findings[] | . as $f | select(($ig | index($f.severity)) | not)]}')"
+  FILE_COUNT="$(printf '%s' "$FILE_JSON" | jq -r '.findings | length')"
+  if [ "$FILE_COUNT" -eq 0 ]; then
+    p4b_log "all $FINDINGS_COUNT APPROVED finding(s) fall in feedback_policy ignore tiers — never surfaced, nothing to file"
+  elif [ "$DRY_RUN" = true ]; then
+    p4b_log "[dry-run] would file $FILE_COUNT post-review issue(s) in $REPO ($FINDINGS_COUNT finding(s) total; ignored tiers filtered), then post APPROVED with the references"
+    POST_REVIEW_ISSUE_REFS="(dry-run: $FILE_COUNT issue(s) would be filed)"
+  else
+    # Side-effect ordering (#674 Codex P2): re-read the live head BEFORE
+    # filing anything. The optional base fence reads the pair coherently at
+    # the same authority boundary, so a same-head retarget during adapter
+    # work cannot file observations for an approval that must not post.
+    # #799: this re-read exists to catch head drift, so an unreadable answer
+    # must NOT compare unequal-and-therefore-drifted, nor equal-and-therefore-
+    # safe. gh_api_scalar makes it empty, which is what the fall-back below
+    # already tested for.
+    live_head_pre="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
+      "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head_pre=""
+    [ -n "$live_head_pre" ] \
+      || p4b_die 3 "could not re-read the live PR head before filing post-review issues"
+    if [ "$live_head_pre" != "$HEAD" ]; then
+      p4b_die 3 "PR head changed during review (reviewed $HEAD, live $live_head_pre) — refusing to file post-review issues for an approval that will not post"
+    fi
+    if ! revalidate_expected_base pre-issue-filing; then
+      p4b_die 3 "$P4B_BASE_FENCE_REASON — refusing to file post-review issues for an approval that will not post"
+    fi
+    # Identity drift (#1143), hoisted ahead of the side effects for the same
+    # reason the head re-read above is: filing issues under the author PAT,
+    # assigned to the author identity and referencing this PR, is an
+    # approval-side effect performed in service of an approval that must not
+    # post. A body edited mid-run to declare the agent this run picked as
+    # REVIEWER evades the head checks entirely, because a body edit does not
+    # move HEAD. Nothing has been filed yet, so the cleanup is the same as the
+    # head-drift branch above: refuse, with zero issues left behind.
+    if ! revalidate_pr_body_author pre-issue-filing; then
+      fall_back_to_manual "$P4B_BODY_DRIFT_REASON — refusing to file post-review issues for an approval that will not post"
+    fi
+    # Same-head laundering gate, hoisted ahead of the side effects (#674
+    # Codex round-2 P2): the authoritative gate below still guards the
+    # POST, but by then the issues would already exist for an approval
+    # that gets refused. Same guards as the authoritative copy (module
+    # loaded; hook consults the loop log keyed to the current HEAD).
+    if [ "$P4B_ACCT_AVAILABLE" = true ] && ! p4b_acct_hook_same_head_required_block; then
+      fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop — refusing to file post-review issues for an approval that will not post"
+    fi
+    set +e
+    _pri_out="$(p4b_file_post_review_issues "$FILE_JSON")"
+    _pri_rc=$?
+    set -e
+    POST_REVIEW_ISSUE_REFS="$(printf '%s\n' "$_pri_out" | sed -n 1p)"
+    # Cleanup operates ONLY on refs this invocation created (#674 round-5
+    # P2): a reused prior-run issue in the body refs must never be closed
+    # because a later step of THIS run failed.
+    P4B_CREATED_ISSUE_REFS="$(printf '%s\n' "$_pri_out" | sed -n 2p)"
+    if [ "$_pri_rc" -ne 0 ]; then
+      # Partial-failure orphans (#674 round-2 + round-4 P2s): surface any
+      # refs that DID file, close this run's creations as superseded
+      # (self-cleanup), and refuse. The dedup search is open-scoped, so a
+      # rerun files fresh follow-ups instead of resurrecting the closed
+      # ones.
+      if [ -n "$P4B_CREATED_ISSUE_REFS" ]; then
+        p4b_warn "post-review issue filing failed partway; closing this run's created refs as superseded: $P4B_CREATED_ISSUE_REFS"
+        p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: post-review filing for ${REPO}#${PR} failed partway and the Phase 4b approval was refused; a rerun files fresh follow-ups."
+      fi
+      fall_back_to_manual "approved verdict included findings and post-review issue filing failed${POST_REVIEW_ISSUE_REFS:+ (partial refs: $POST_REVIEW_ISSUE_REFS, created subset closed as superseded)}; refusing to post an approval with unfiled observations"
+    fi
+    [ -n "$POST_REVIEW_ISSUE_REFS" ] \
+      || fall_back_to_manual "approved verdict included findings but post-review issue filing produced no references"
+    # Post-file head recheck (#674 round-4 P2): a head that drifted DURING
+    # filing pins the just-filed issues to a head whose approval will be
+    # refused at post_review, and a new-head rerun cannot reuse the old
+    # head-pinned markers. Close this run's creations and refuse now.
+    live_head_post="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
+      "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head_post=""
+    if [ -z "$live_head_post" ] || [ "$live_head_post" != "$HEAD" ]; then
+      p4b_warn "PR head drifted during issue filing (reviewed $HEAD, live ${live_head_post:-unreadable}) — closing this run's filed issues as superseded"
+      p4b_close_post_review_issues "$P4B_CREATED_ISSUE_REFS" "Superseded: the PR head of ${REPO}#${PR} changed before the Phase 4b approval could post; a re-run on the new head files fresh follow-ups."
+      p4b_die 3 "PR head changed while filing post-review issues (reviewed $HEAD, live ${live_head_post:-unreadable}); the filed issues were closed as superseded"
+    fi
+    p4b_log "filed $FILE_COUNT post-review issue(s): $POST_REVIEW_ISSUE_REFS"
+    # Enrich the accounting record (#675): the line-1 refs align 1:1 with
+    # FILE_JSON.findings (reused + created alike, in filing order). Zip them
+    # into the tuple-keyed filed-issues channel accounting.sh joins in
+    # p4b_acct_unique_findings, flipping each filed finding's record entry from
+    # unresolved/null to disposition "deferred-to-followup" + its issue link
+    # (advisory_issues_filed then derives), so the machine-readable record
+    # matches the prose "filed as #N" reference instead of contradicting it.
+    # Built via p4b_acct_filed_issues_from_refs (numeric, position-preserving
+    # parse — a malformed middle ref never shifts a later issue onto the wrong
+    # finding, #675 Codex round 1), and ONLY when accounting is loaded (its sole
+    # consumer). Exported BEFORE the accounting render block reads it.
+    if [ "$P4B_ACCT_AVAILABLE" = true ]; then
+      P4B_ACCT_FILED_ISSUES_JSON="$(p4b_acct_filed_issues_from_refs "$POST_REVIEW_ISSUE_REFS" "$FILE_JSON")"
+      [ -n "$P4B_ACCT_FILED_ISSUES_JSON" ] || P4B_ACCT_FILED_ISSUES_JSON='[]'
+      export P4B_ACCT_FILED_ISSUES_JSON
+    fi
+  fi
+fi
+
+# Render the PR review body (summary + findings list).
+BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/p4b-body.XXXXXX")"
+# (cleanup is owned by the _p4b_cleanup_tmp EXIT trap installed above)
+{
+  printf '**Automated Phase 4b review** (%s, reviewer %s)\n\n' "$DIRECTION" "$REVIEWER"
+  printf '%s\n' "$SUMMARY"
+  printf '\n### Review Metadata\n\n'
+  printf -- '- Reviewed head: `%s`\n' "${HEAD:-unknown}"
+  printf -- '- Reviewed base: `%s`\n' "$EXPECTED_BASE_SHA"
+  printf -- '- Reviewed merge base: `%s`\n' "$(jq -r '.review_input.merge_base_sha' <<<"$VERDICT_JSON")"
+  printf -- '- Immutable diff SHA-256: `%s`\n' "$(jq -r '.review_input.diff_sha256' <<<"$VERDICT_JSON")"
+  printf -- '- Reviewed diff SHA-256: `%s`\n' "$(jq -r '.review_input.reviewed_diff_sha256' <<<"$VERDICT_JSON")"
+  if jq -e '.review_input.wave_audit != null' <<<"$VERDICT_JSON" >/dev/null; then
+    printf -- '- Canonical wave range: `%s` .. `%s`\n' \
+      "$(jq -r '.review_input.wave_audit.canonical_base_sha' <<<"$VERDICT_JSON")" \
+      "$(jq -r '.review_input.wave_audit.canonical_head_sha' <<<"$VERDICT_JSON")"
+    printf -- '- Canary PR diff SHA-256: `%s`\n' "$(jq -r '.review_input.pr_diff_sha256' <<<"$VERDICT_JSON")"
+  fi
+  printf -- '- Reviewer identity: `%s`\n' "$REVIEWER"
+  printf -- '- Adapter: `%s`\n' "$ADAPTER"
+  printf -- '- Adapter runs: `%s`\n' "$ADAPTER_RUNS"
+  printf -- '- Adapter timeout: `%ss`\n' "$ADAPTER_TIMEOUT"
+  printf -- '- Reviewer effort: `%s`\n' "${EFFECTIVE_EFFORT:-cli-default}"
+  if [ -n "$TOKEN_COUNT" ]; then
+    printf -- '- Token usage: `%s` tokens' "$TOKEN_COUNT"
+    [ -n "$USAGE_SOURCE" ] && printf ' (source: `%s`)' "$USAGE_SOURCE"
+    printf '\n'
+  else
+    printf -- '- Token usage: not exposed by adapter/CLI\n'
+  fi
+  printf -- '- Model-internal turn count: not exposed by the adapter contract\n'
+  # #2120: report the refusal without inventing a Codex report. This adapter
+  # is the independent external reviewer even when Codex is waived/disabled.
+  if [ "$BARRIER_CODERABBIT_RATE_LIMITED" = true ]; then
+    printf -- '- Provider ordering: CodeRabbit was **rate limited** on this head and could not be re-asked; the Codex arm permitted this independent Phase 4b adapter review (#2120)\n'
+  fi
+  # #1560 slice 3: a review dispatched over a spent Codex request ceiling ran
+  # without a Codex report on this head. Say so, and that no human stop held.
+  case "$P4B_PRE_ADAPTER_CODEX_EVIDENCE" in
+    request-ceiling*)
+      printf -- '- Provider ordering: the Codex request ceiling was spent on this head, so this review ran without a Codex report here; no human stop held (blocking-review budget, runaway, untested rebuttal, disagreement) (#1560)\n'
+      ;;
+  esac
+  # #2633: say which human stops the owner's admin override ran past. The
+  # quote is free text inside a reviewer-authored body, which feedback
+  # accounting scans for tier markers (`**P1`, `![P1 Badge]`), ack tokens and
+  # HTML-comment records. Backslash-escape every ASCII punctuation character:
+  # GitHub renders the same text, and no marker can form. The JSON summary
+  # keeps the raw quote.
+  if [ "$(jq 'length' <<<"$ADMIN_OVERRIDDEN")" -gt 0 ]; then
+    printf -- '- Admin override (#2633): owner authorization "%s"; this automated review ran past: %s\n' \
+      "$(jq -rn --arg q "$ADMIN_OVERRIDE_QUOTE" '$q | gsub("(?<c>[!-/:-@\\[-`{-~])"; "\\\(.c)")')" \
+      "$(jq -r 'map(if .tripwires then "tripwire (" + (.tripwires | join(", ")) + ")" else (.reason // .decision) end) | join("; ")' <<<"$ADMIN_OVERRIDDEN")"
+  fi
+  # #2968: a round beyond the spent round cap names the owner authorization
+  # it consumed (round_owner_authorization_line, in the round-cap block).
+  round_owner_authorization_line
+  # #1335: likewise for a CodeRabbit review carried from identical content.
+  if [ -n "$BARRIER_CODERABBIT_CARRIED" ]; then
+    printf -- '- Provider ordering: CodeRabbit did not re-review this head (a base-only update); its review of `%s` carries forward because the external-review fingerprint is unchanged (`%s`) (#1335)\n' \
+      "${BARRIER_CODERABBIT_CARRIED%% *}" "${BARRIER_CODERABBIT_CARRIED#* }"
+  fi
+  if [ "$FINDINGS_COUNT" -gt 0 ]; then
+    printf '\n### Findings\n\n'
+    printf '%s' "$VERDICT_JSON" | jq -r '
+      .findings[]
+      | "- **\(.severity)** \((.path // "PR") + (if .line then ":\(.line)" else "" end)): \(.body)"'
+    if [ "$VERDICT" = "APPROVED" ]; then
+      # Accurate audit trail (#674 round-3 P3): only claim filing for the
+      # subset that actually filed; ignored-tier findings are listed above
+      # as the faithful verdict record but are deliberately not surfaced
+      # as issues.
+      _ign_count=$(( FINDINGS_COUNT - ${FILE_COUNT:-$FINDINGS_COUNT} ))
+      if [ -n "$POST_REVIEW_ISSUE_REFS" ] && [ "$_ign_count" -eq 0 ]; then
+        printf '\nEach finding above is an advisory follow-up filed as a post-review issue before this approval posted (policy step 9, #672): %s\n' "$POST_REVIEW_ISSUE_REFS"
+      elif [ -n "$POST_REVIEW_ISSUE_REFS" ]; then
+        printf '\n%s of the findings above were filed as post-review issues before this approval posted (policy step 9, #672): %s. The other %s fall in feedback_policy ignore tiers and were deliberately not surfaced as issues.\n' "${FILE_COUNT:-0}" "$POST_REVIEW_ISSUE_REFS" "$_ign_count"
+      elif [ "$_ign_count" -gt 0 ]; then
+        printf '\nAll %s finding(s) above fall in feedback_policy ignore tiers — listed as the faithful verdict record, deliberately not surfaced as post-review issues.\n' "$_ign_count"
+      fi
+    fi
+  fi
+  # #1598: an approval records the Codex request generation it was authorized
+  # under, so the substitute merge gate can hold it once a request outside
+  # that generation exists. Written here, before accounting sizes the body.
+  if [ "$VERDICT" = "APPROVED" ] && [ -n "$P4B_AUTHORIZED_REQUEST_GENERATION" ]; then
+    printf '\n<!-- mergepath-p4b-request-generation: %s -->\n' "$P4B_AUTHORIZED_REQUEST_GENERATION"
+  fi
+  # #2663/#2968: the run marker, the authorization record when there is one,
+  # and the footer (round_provenance_trailer, in the round-cap block).
+  round_provenance_trailer
+} > "$BODY_FILE"
+
+# --- Phase 4b approval-loop accounting (#602) --------------------------------
+# Advisory to safety: any failure below leaves BODY_FILE as the plain summary
+# above and never changes review posting or exit codes. Gated on
+# phase_4b_automation.accounting.enabled (default true under the disabled
+# parent). Loop records accumulate across invocations in the per-PR loop log
+# so a CHANGES_REQUESTED → fix → APPROVED cycle renders its full history.
+if p4b_acct_on 2>/dev/null; then
+  # Clear any stale pending ledger record from a prior run that crashed after
+  # staging but before posting (#615 Codex round 6). Without this, an APPROVED
+  # run whose accounting render later fails/skips (the fail-open path) never
+  # re-stages, and the two-phase commit would append that phantom/old record
+  # after the new review posts. The render below re-stages a freshly tagged
+  # record on the happy path; the commit-time run-id check is the belt to this
+  # suspenders. Advisory — never alters review flow.
+  p4b_acct_hook_discard_pending_record || true
+  ACCT_POSTED_STATE="posted"
+  [ "$DRY_RUN" = true ] && ACCT_POSTED_STATE="dry-run"
+  # The loop is recorded (and the block rendered) BEFORE post_review so the
+  # posted body can include this loop; the posted claim is provisional until
+  # the POST succeeds — every non-posting exit path below corrects it via
+  # p4b_acct_mark_unposted, and the ledger record is staged, committed only
+  # after a successful POST (#615 Codex: no phantom posted approvals).
+  if p4b_acct_hook_record_loop "$VERDICT" "$ACCT_POSTED_STATE" false ""; then
+    P4B_ACCT_LOOP_RECORDED=true
+  else
+    p4b_warn "accounting: could not record this loop (plain summary unaffected)"
+  fi
+  # Render the accounting block ONLY when THIS invocation's loop was recorded
+  # (#615 Codex round 5). p4b_acct_hook_render_approval_block builds the block
+  # from the loop log; if recording the current loop failed (e.g. a read-only
+  # loop-log), the log still holds this PR's OLDER loops, and rendering from it
+  # would emit a block stamped with the CURRENT head whose rigor table claims
+  # that head was reviewed while SILENTLY omitting the current loop — corrupted
+  # accounting instead of an honest fallback. Skipping the render here posts the
+  # plain-summary approval (accounting is advisory; the approval is never
+  # blocked). A recorded-but-otherwise-degraded render still fails-open below.
+  if [ "$VERDICT" = "APPROVED" ] && [ "${P4B_ACCT_LOOP_RECORDED:-false}" = true ]; then
+    if ACCT_BLOCK="$(p4b_acct_hook_render_approval_block)" && [ -n "$ACCT_BLOCK" ]; then
+      # Size guard (#615 Codex round 8, finding 1): the appended block becomes
+      # part of the ONLY body POSTed to GitHub, whose review body has a hard
+      # ~65536-char cap. A large accounting block (many loops/findings) could
+      # push the combined body past that cap and make the APPROVE POST fail —
+      # letting advisory accounting block a valid clearance. Accounting must
+      # never do that. If appending the block would exceed the safe budget
+      # (default 60000, leaving GitHub headroom over the plain summary), the
+      # block is TRUNCATED with an explicit notice; if even the notice would
+      # not fit, the block is dropped and the plain-summary approval posts.
+      # Configurable via P4B_ACCT_MAX_BODY_BYTES (0 disables the guard).
+      _p4b_acct_max_body="${P4B_ACCT_MAX_BODY_BYTES:-60000}"
+      case "$_p4b_acct_max_body" in ''|*[!0-9]*) _p4b_acct_max_body=60000 ;; esac
+      _p4b_acct_notice='
+
+_[accounting truncated: the full block would exceed the review-body size limit; running totals and the machine-readable record are omitted here to keep this valid approval postable. See the per-checkout ledger / prior approvals for complete accounting.]_'
+      if [ "$_p4b_acct_max_body" -gt 0 ]; then
+        _p4b_acct_base_bytes="$(wc -c < "$BODY_FILE" 2>/dev/null | tr -d '[:space:]')"
+        case "$_p4b_acct_base_bytes" in ''|*[!0-9]*) _p4b_acct_base_bytes=0 ;; esac
+        # The append writes "\n\n" (2) + `printf '%s\n' "$ACCT_BLOCK"`. Measure a
+        # candidate append as base + 2 + bytes-of(printf '%s\n' block), so every
+        # size decision uses the SAME accounting (no off-by-one drift).
+        _p4b_acct_appended_bytes() { # <candidate-block> -> total posted body bytes
+          local blk="$1" n
+          n="$(printf '%s\n' "$blk" | wc -c 2>/dev/null | tr -d '[:space:]')"
+          case "$n" in ''|*[!0-9]*) n=0 ;; esac
+          printf '%s' "$(( _p4b_acct_base_bytes + 2 + n ))"
+        }
+        if [ "$(_p4b_acct_appended_bytes "$ACCT_BLOCK")" -gt "$_p4b_acct_max_body" ]; then
+          # Budget for the block CONTENT prefix we keep, leaving room for the
+          # "\n\n" separator, the notice, and printf's trailing "\n".
+          _p4b_acct_notice_bytes="$(printf '%s' "$_p4b_acct_notice" | wc -c 2>/dev/null | tr -d '[:space:]')"
+          case "$_p4b_acct_notice_bytes" in ''|*[!0-9]*) _p4b_acct_notice_bytes=0 ;; esac
+          # -8 safety margin absorbs a multibyte cut at the truncation boundary
+          # so the final body lands comfortably under the cap (no belt trigger).
+          _p4b_acct_keep=$(( _p4b_acct_max_body - _p4b_acct_base_bytes - 2 - _p4b_acct_notice_bytes - 1 - 8 ))
+          if [ "$_p4b_acct_keep" -gt 0 ]; then
+            # SIGPIPE-safe truncation (#615 Codex round 9, finding 1): the prior
+            # `printf … | head -c` form aborts the whole orchestrator under
+            # `set -euo pipefail`. For a block larger than the pipe buffer, head
+            # -c closes the pipe after reading its prefix and printf gets SIGPIPE
+            # (exit 141); pipefail then fails the command substitution and, under
+            # set -e, exits the script BEFORE post_review — advisory accounting
+            # would block a valid approval, the exact opposite of the guard's
+            # intent. Use a pure-bash byte substring (no pipe, no producer to
+            # signal). `LC_ALL=C` makes `${var:0:N}` count BYTES (default UTF-8
+            # locale counts characters), so the slice honors the byte budget and
+            # the -8 margin still absorbs a mid-multibyte cut; the belt below
+            # re-measures and drops the block if a cut still overshoots.
+            # Marker-safe cut (#615 Codex round 10, P3): a raw byte-prefix cut
+            # can land INSIDE the embedded `<!-- p4b-accounting:v1 ... -->`
+            # record, leaving an unterminated HTML comment that swallows the
+            # visible truncation notice appended below. The helper backs the
+            # cut off to just before the comment-open marker in that case.
+            _p4b_acct_trunc="$(p4b_acct_safe_truncate "$ACCT_BLOCK" "$_p4b_acct_keep")"
+            ACCT_BLOCK="${_p4b_acct_trunc}${_p4b_acct_notice}"
+            p4b_warn "accounting: block exceeds the review-body size budget ($_p4b_acct_max_body bytes); truncating it so the approval still posts"
+          else
+            ACCT_BLOCK=""
+            p4b_warn "accounting: no room for the accounting block within the review-body size budget; posting the plain-summary approval"
+          fi
+          # Belt-and-suspenders: if a multibyte cut left the candidate still over
+          # the cap, drop the block entirely rather than risk a POST-rejecting
+          # body. The approval is never blocked either way.
+          if [ -n "$ACCT_BLOCK" ] \
+             && [ "$(_p4b_acct_appended_bytes "$ACCT_BLOCK")" -gt "$_p4b_acct_max_body" ]; then
+            ACCT_BLOCK=""
+            p4b_warn "accounting: truncated block still exceeded the body budget; dropping it and posting the plain-summary approval"
+          fi
+        fi
+      fi
+      if [ -n "$ACCT_BLOCK" ]; then
+        if ! { printf '\n\n'; printf '%s\n' "$ACCT_BLOCK"; } >> "$BODY_FILE"; then
+          p4b_warn "accounting: could not append the accounting block; posting the plain-summary approval"
+        fi
+      fi
+    else
+      p4b_warn "accounting: report generation failed; posting the plain-summary approval (never blocks a valid approval)"
+    fi
+  elif [ "$VERDICT" = "APPROVED" ]; then
+    p4b_warn "accounting: current loop was not recorded; skipping the accounting block so the posted approval never omits this loop while stamping the current head (plain summary posts)"
+  fi
+
+fi
+
+# --- Same-head required-finding SAFETY gate (#615 Codex round 9, finding 2) --
+# Unlike the accounting BLOCK above (advisory — its failure never blocks a
+# valid approval), this is a fail-closed SAFETY check on the approval itself.
+# The fail-closed invariant (an APPROVED verdict may never carry an unresolved
+# required-tier finding on the CURRENT head) lived only inside the accounting
+# RECORD builder: a same-head laundered approval made p4b_acct_build_record
+# return non-zero, the render hook propagated that as an ordinary advisory
+# report-generation failure, and the orchestrator posted the plain-summary
+# APPROVED anyway — letting a P0/P1 CHANGES_REQUESTED on head `abc` be
+# laundered into a clean approval by rerunning the reviewer on the SAME head
+# with no fix commit. Here we run the SAME assertion against the live loop log
+# keyed to the current HEAD, in same_head_only mode (#615 round 9 CodeRabbit:
+# the current loop is legitimately ABSENT from the log whenever recording
+# failed or accounting is disabled, so the record-scoped clauses must not
+# apply); when it refuses, the approval is REFUSED via the manual handoff
+# (fall_back_to_manual, exit 4), never posted. A head change (a real fix
+# commit) or a fail-closed-marked prior loop clears it — the assertion permits
+# the legitimate changes-requested-then-fixed path.
+#
+# Placement (#615 Codex round 10): this gate sits OUTSIDE the p4b_acct_on
+# sub-toggle block above, guarded on P4B_ACCT_AVAILABLE (module loaded) alone.
+# Inside that block, opting out via phase_4b_automation.accounting.enabled:
+# false AFTER a prior loop logged a required finding on this head would skip
+# the gate and launder the finding through a same-head rerun. Out here the
+# toggle only stops NEW recording; history already on disk still blocks. Gate
+# is a no-op when the verdict is not APPROVED, when there is no
+# readable/parseable loop log, or when the module never loaded
+# (P4B_ACCT_AVAILABLE=false: nothing ever recorded history, so there is no
+# history to launder — and the hook function does not exist, so a bare call
+# would exit 127 into fall_back_to_manual and refuse every valid approval the
+# module-missing contract at the top of this file says must post plain; #615
+# round 9, CodeRabbit).
+if [ "$VERDICT" = "APPROVED" ] \
+   && [ "$P4B_ACCT_AVAILABLE" = true ] \
+   && ! p4b_acct_hook_same_head_required_block; then
+  fall_back_to_manual "an unresolved required-tier finding was recorded on the current head ($HEAD) in a prior Phase 4b loop; a rerun without a fix commit cannot launder it into a clean approval (fail-closed)"
+fi
+
+# --- map verdict -> GitHub review state ------------------------------------
+post_review() {
+  local state_flag="$1"
+  local gh_bin=gh
+  local api_cmd=api
+  local event payload_file review_response review_rc created_commit
+  [ -x "$GH_AS_REVIEWER" ] || { p4b_acct_mark_unposted "gh-as-reviewer.sh not found"; p4b_die 3 "gh-as-reviewer.sh not found at $GH_AS_REVIEWER"; }
+  command -v gh >/dev/null 2>&1 || { p4b_acct_mark_unposted "gh unavailable for review POST"; p4b_die 3 "gh is required to post the review"; }
+  case "$state_flag" in
+    --approve) event="APPROVE" ;;
+    --request-changes) event="REQUEST_CHANGES" ;;
+    *) p4b_die 3 "unsupported review state flag: $state_flag" ;;
+  esac
+  # Refuse stale budget authority before the remaining fallible preparation
+  # reads. A second bounded snapshot check below sits at the writer boundary;
+  # this early one preserves cleanup before an intervening read can fail.
+  revalidate_codex_request_budget_authority pre-post
+  revalidate_phase4a_timeout_generation pre-post
+  local live_head
+  # #799: the last drift check before a review POSTS. An unreadable read that
+  # arrived as a JSON blob compared unequal to $HEAD and took the
+  # fall_back_to_manual branch — the safe direction by luck, not by design,
+  # and the diagnostic named a "live head" that was an error body. Empty now
+  # means unread, and the guard on the next line is live.
+  live_head="$(gh_api_scalar --shape sha "live PR head for $REPO#$PR" \
+    "repos/$REPO/pulls/$PR" --jq '.head.sha')" || live_head=""
+  if [ -z "$live_head" ]; then
+    cleanup_pre_post_refusal_side_effects "could not re-read live PR head before posting review" true \
+      "The PR head" "the head of ${REPO}#${PR}"
+    p4b_die 3 "could not re-read live PR head before posting review"
+  fi
+  if [ "$live_head" != "$HEAD" ]; then
+    # Late-window drift (#674 round-5 P2): a push landing during body or
+    # accounting rendering reaches this final check with the step-9 issues
+    # already filed — close this run's creations before refusing, same as
+    # the post-file recheck, so no orphan claims an approval that never
+    # posted.
+    cleanup_pre_post_refusal_side_effects "PR head changed during review (reviewed $HEAD, live $live_head)" true \
+      "The PR head" "the head of ${REPO}#${PR}"
+    p4b_die 3 "PR head changed during review (reviewed $HEAD, live $live_head)"
+  fi
+  # Identity drift, last fence before the POST (#1143). Rendering, accounting
+  # and step-9 filing all sit between the pre-filing check and here, and a body
+  # edit in that window moves no sha, so the live-head fence above cannot see
+  # it. Same cleanup as that fence: close this run's filed follow-ups when an
+  # approval is what is being refused, then fall back.
+  if ! revalidate_pr_body_author pre-post; then
+    # Correct LOCAL state before anything that can be interrupted, via the same
+    # helper the timeout fence above uses (#1143 round 4). This matters because
+    # fall_back_to_manual runs the GitHub-backed require_feedback_accounted
+    # BEFORE it marks the loop unposted: if that gate exits — a transient read
+    # failure, or feedback that genuinely arrived during the adapter run — the
+    # loop log is left asserting that this unposted review WAS posted, with its
+    # pending ledger stage still staged. A persisted claim that a review posted
+    # when it did not is worse than the refusal itself. The helper marks the
+    # loop first, then closes this run's filed issues, and sets the flag
+    # fall_back_to_manual reads so the correction is not applied twice.
+    cleanup_pre_post_refusal_side_effects "$P4B_BODY_DRIFT_REASON" true \
+      "The PR body's declared Authoring-Agent" \
+      "the Authoring-Agent declared by ${REPO}#${PR}"
+    fall_back_to_manual "$P4B_BODY_DRIFT_REASON"
+  fi
+  # Prepare a coherent expected head/base pair after body validation, which
+  # also reads GitHub. The combined request-budget authority fence below then
+  # performs the final tuple read before constructing the payload. As with late
+  # head drift, remove this invocation's filed observations first.
+  if ! revalidate_expected_base pre-post; then
+    cleanup_pre_post_refusal_side_effects "$P4B_BASE_FENCE_REASON" true \
+      "The PR base" "the base of ${REPO}#${PR}"
+    p4b_die 3 "$P4B_BASE_FENCE_REASON"
+  fi
+  # #1581: an approval is the one write a late finding must not slip past.
+  # A required-tier finding can land while the adapter runs, so account for
+  # feedback once more here, at the writer boundary, after every other
+  # preparation read. A CHANGES_REQUESTED review is not gated: it asks for
+  # changes either way.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
+  # The timeout/head/body/base reads above prepare the final review material
+  # and may outlive the earlier budget check. Revalidate the coherent governing
+  # tuple, resolved request budget, and request generation once more after
+  # those reads and immediately before constructing and posting the payload.
+  # This is a bounded consumer fence, not an atomic GitHub read/write protocol;
+  # a residual network interval remains between this observation and the POST.
+  revalidate_codex_request_budget_authority pre-post
+  # #2663: a competing caller may have completed a round during this run.
+  enforce_phase4b_round_cap pre-post
+  # Preserve the early generation fence before the immutable-input and final
+  # feedback reads; snapshot routes were just re-proved by the budget fence.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved
+  # That budget revalidation rebuilds the Codex ledger, a slow read, so account
+  # once more after immutable-input validation for late findings (#1584).
+  if ! revalidate_immutable_input; then
+    cleanup_pre_post_refusal_side_effects "immutable review input changed before POST" true \
+      "The PR input" "the reviewed input of ${REPO}#${PR}"
+    p4b_die 3 "immutable review input changed before POST"
+  fi
+  # #2771: the full binding evaluation runs before the final feedback
+  # accounting, so a finding that lands during its reads is still accounted
+  # for (see revalidate_wave_binding).
+  [ "$event" != "APPROVE" ] || revalidate_wave_binding pre-post
+  [ "$event" != "APPROVE" ] || refuse_approval_if_feedback_unaccounted
+  # #1598: a request can arrive during final accounting. Compare only the live
+  # generation with the original authorization; never rebuild the ledger or
+  # treat that late request as covered. Drift/unreadability uses pre-POST cleanup.
+  [ "$event" != "APPROVE" ] || refuse_approval_if_request_generation_moved final
+  # #2771: the last authority read before the POST, one comment read.
+  [ "$event" != "APPROVE" ] || revalidate_wave_binding_stable
+  payload_file="$(mktemp "${TMPDIR:-/tmp}/p4b-review-payload.XXXXXX")"
+  jq -n --arg commit_id "$HEAD" --arg event "$event" --rawfile body "$BODY_FILE" \
+    '{commit_id:$commit_id,event:$event,body:$body}' > "$payload_file"
+  # Run the SAME strict payload guard locally before transport is attempted.
+  # A definitive refusal here cannot publish; only this writer may return its
+  # reservation at EXIT. Once the wrapper is invoked, every failure remains an
+  # uncertain POST and keeps its slot, including a lost response (#2663/#2790).
+  # MERGEPATH_P4B_REVIEW_WRITE marks this as the orchestrator's own review
+  # write: the guard refuses automated Phase 4b provenance in any other review
+  # body (#2968).
+  if ! MERGEPATH_P4B_REVIEW_WRITE=1 python3 "$ROOT/workflow/gh-comment-trigger-guard.py" --role reviewer -- \
+    gh api "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file" >/dev/null; then # NO_BARE_GH_WRITE_EXEMPT: inert argv to the preceding pure Python payload inspector; actual POST uses the reviewer wrapper below.
+    rm -f "$payload_file"
+    cleanup_pre_post_refusal_side_effects "review payload refused by local comment guard" true \
+      "Review publication" "the review payload for ${REPO}#${PR}"
+    return 1
+  fi
+  P4B_ROUND_POST_ATTEMPTED=true
+  set +e
+  review_response="$(
+    env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" MERGEPATH_P4B_REVIEW_WRITE=1 "$GH_AS_REVIEWER" -- \
+      "$gh_bin" "$api_cmd" "repos/$REPO/pulls/$PR/reviews" --method POST --input "$payload_file"
+  )"
+  review_rc=$?
+  set -e
+  rm -f "$payload_file"
+  if [ "$review_rc" -ne 0 ]; then
+    # #2663: a POST can fail after GitHub created the review (a timeout or a
+    # lost response). Reconcile before reporting failure: adopt exactly one
+    # review by the actual reviewer, on this head, carrying this run's unique
+    # nonce (the same id its ledger entry persisted). Zero or several
+    # adopt nothing, and the ledger slot stays occupied, so no later run
+    # reposts an ambiguous publication.
+    local landed=""
+    if command -v gh_api_array >/dev/null 2>&1 \
+       && landed=$(gh_api_array "repos/$REPO/pulls/$PR/reviews" "review POST reconciliation" 2>/dev/null); then
+      landed=$(p4b_reconcile_posted_review "$landed" "$REVIEWER" "$HEAD" "$P4B_ACCT_RUN_ID") || landed=""
+    else
+      landed=""
+    fi
+    if [ -z "$landed" ]; then
+      p4b_acct_mark_unposted "review POST failed (gh exit $review_rc)"
+      return "$review_rc"
+    fi
+    p4b_warn "review POST exited $review_rc, but the review landed on GitHub (id $(printf '%s' "$landed" | jq -r '.id')); adopting it instead of reporting a failure (#2663)"
+    review_response="$landed"
+  fi
+  POSTED_REVIEW_ID="$(printf '%s' "$review_response" | jq -r '.id // empty' 2>/dev/null || true)"
+  created_commit="$(printf '%s' "$review_response" | jq -r '.commit_id // empty' 2>/dev/null || true)"
+  printf '%s' "$review_response" | jq -e --rawfile body "$BODY_FILE" '.body == $body' >/dev/null \
+    || { p4b_acct_mark_unposted "created review body differs from bound review input"; p4b_die 3 "created review body did not preserve input binding"; }
+  [ "$created_commit" = "$HEAD" ] || { p4b_acct_mark_unposted "created review not pinned to reviewed head"; p4b_die 3 "created review was not pinned to reviewed head (expected $HEAD, got ${created_commit:-unknown})"; }
+}
+
+# Account only for this invocation's APPROVED body. Its optional findings
+# already passed step 9; prior/unrelated findings and CHANGES_REQUESTED still
+# need their own dispositions. Let the existing gate supply the token rather
+# than duplicating its classification, JSON fingerprint, or evidence rules.
+acknowledge_approval() {
+  local accounting accounting_rc missing token payload_file post_rc expected_findings summary_tiers
+  if accounting=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO"); then
+    accounting_rc=0
+  else
+    accounting_rc=$?
+  fi
+  [ "$accounting_rc" -le 1 ] || return 1
+  # Freeform summary findings have no structured step-9 disposition. Reuse
+  # the gate's marker classifier and leave nonignored ones for manual repair.
+  [ -r "$ROOT/lib/feedback-policy-helpers.sh" ] || return 1
+  # shellcheck source=lib/feedback-policy-helpers.sh
+  . "$ROOT/lib/feedback-policy-helpers.sh"
+  summary_tiers=$(codex_tiers_of "$SUMMARY" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
+  printf '%s' "$accounting" | jq -e --argjson tiers "$summary_tiers" '
+    .feedback_policy as $policy | all($tiers[]; . as $tier |
+      ($policy.mode // "by-priority") == "by-priority" and $policy.priorities[$tier] == "ignore")
+    ' >/dev/null || return 1
+  # Only rendered findings nonignored by the governing policy require an
+  # inventory row. Local issue filing may reflect an older, stricter policy.
+  expected_findings=$(printf '%s' "$accounting" | jq -er --argjson verdict "$VERDICT_JSON" '
+    .feedback_policy as $policy |
+    if ($verdict.findings | length) == 0 then 0
+    elif ($policy | type) != "object" then error("missing governing policy") else
+      [$verdict.findings[] | select(($policy.mode // "by-priority") == "address-all"
+        or $policy.priorities[(.severity | ascii_downcase)] != "ignore")] | length
+    end') || return 1
+  if [ "$expected_findings" -gt 0 ]; then
+    printf '%s' "$accounting" | jq -e --arg id "$POSTED_REVIEW_ID" --rawfile body "$BODY_FILE" '
+      any(.findings[]; .kind == "review-body" and (.review_id | tostring) == $id
+        and .body == $body)' >/dev/null || return 1
+  fi
+  [ "$accounting_rc" != 0 ] || return 0
+  case "$POSTED_REVIEW_ID" in ''|*[!0-9]*) return 1 ;; esac
+  missing=$(printf '%s' "$accounting" | jq -c --arg id "$POSTED_REVIEW_ID" '
+    [.missing[] | select(.kind == "review-body" and (.review_id | tostring) == $id)]') || return 1
+  [ "$missing" != '[]' ] || return 0
+  # The gate resolves the governing base policy independently of this
+  # checkout. A stricter policy cannot inherit local step-9 dispositions.
+  printf '%s' "$accounting" | jq -e --argjson missing "$missing" \
+    --argjson verdict "$VERDICT_JSON" --argjson filed "${FILE_JSON:-null}" '
+      .feedback_policy as $policy |
+      def disposition($tier): $policy.priorities[$tier] //
+        (if $tier == "p0" or $tier == "p1" then "required" else "discretionary" end);
+      ($policy | type) == "object"
+      and ($policy.mode // "by-priority") == "by-priority"
+      and all($missing[]; disposition(.tier) == "discretionary")
+      and all($verdict.findings[]; . as $finding |
+        disposition(.severity | ascii_downcase) as $d |
+        $d == "ignore" or ($d == "discretionary" and any($filed.findings[]?; . == $finding)))
+    ' >/dev/null || return 1
+  # A review edit does not move its id. Never acknowledge a body the adapter
+  # did not produce, including edits consisting only of trailing newlines.
+  token=$(printf '%s' "$missing" | jq -er --rawfile body "$BODY_FILE" '
+    if length == 1 and .[0].body == $body then .[0].ack_token else empty end') || return 1
+  payload_file=$(mktemp "${TMPDIR:-/tmp}/p4b-approval-ack.XXXXXX") || return 1
+  jq -n --arg token "$token" --arg refs "$POST_REVIEW_ISSUE_REFS" '
+    {body: ($token + "\n\nThis APPROVED review has no required-tier findings. " +
+      (if $refs == "" then "No advisory findings required follow-up issues."
+       else "Follow-up issues filed before approval: " + $refs + "." end))}' \
+    > "$payload_file" || { rm -f "$payload_file"; return 1; }
+  # Accounting deliberately requires a strictly later GitHub second. The
+  # review POST has completed, so wait a second before the acknowledgment POST.
+  sleep 1
+  if env -u OP_PREFLIGHT_REVIEWER_PAT GH_AS_REVIEWER_IDENTITY="$REVIEWER" \
+    "$GH_AS_REVIEWER" -- gh api "repos/$REPO/issues/$PR/comments" --method POST --input "$payload_file" >/dev/null; then
+    post_rc=0
+  else
+    post_rc=$?
+  fi
+  rm -f "$payload_file"
+  [ "$post_rc" = 0 ] || return 1
+  # This readback re-reads GitHub's comments and applies identity, body and
+  # timestamp rules. Other findings arriving meanwhile do not authorize us to
+  # acknowledge them and do not invalidate evidence for this exact review.
+  if accounting=$("$FEEDBACK_ACCOUNTING_GATE" "$PR" "$REPO"); then
+    accounting_rc=0
+  else
+    accounting_rc=$?
+  fi
+  [ "$accounting_rc" -le 1 ] || return 1
+  printf '%s' "$accounting" | jq -e --arg id "$POSTED_REVIEW_ID" --rawfile body "$BODY_FILE" '
+    any(.findings[]; .kind == "review-body" and (.review_id | tostring) == $id
+      and .body == $body and .accounted == true)' >/dev/null || return 1
+  REVIEW_ACKNOWLEDGMENT=accounted
+}
+
+POSTED_REVIEW_ID=""
+REVIEW_ACKNOWLEDGMENT=not-needed
+EXIT_CODE=0
+case "$VERDICT" in
+  APPROVED)
+    if [ "$DRY_RUN" = true ]; then
+      p4b_log "[dry-run] would post APPROVED as $REVIEWER on $REPO#$PR (HEAD ${HEAD:-?})"
+    else
+      post_review --approve || p4b_die 3 "failed to post APPROVED review"
+      REVIEW_POSTED=true
+      # Phase two of the accounting ledger commit (#615 Codex): the review is
+      # confirmed on GitHub, so the staged record may now enter the ledger.
+      if p4b_acct_on 2>/dev/null; then
+        p4b_acct_hook_commit_posted_record || true
+      fi
+      p4b_log "posted APPROVED as $REVIEWER — Phase 4b substitute clearance is now on HEAD"
+      if ! acknowledge_approval; then
+        REVIEW_ACKNOWLEDGMENT=failed
+        EXIT_CODE=7
+        p4b_warn "approval review $POSTED_REVIEW_ID was posted, but its acknowledgment could not be verified; account for that review without repeating the review run"
+      fi
+    fi
+    ;;
+  CHANGES_REQUESTED)
+    if [ "$DRY_RUN" = true ]; then
+      p4b_log "[dry-run] would post CHANGES_REQUESTED as $REVIEWER on $REPO#$PR"
+    else
+      post_review --request-changes || p4b_die 3 "failed to post CHANGES_REQUESTED review"
+      REVIEW_POSTED=true
+      p4b_log "posted CHANGES_REQUESTED as $REVIEWER — author addresses findings, then re-run"
+    fi
+    EXIT_CODE=1
+    ;;
+  *)
+    fall_back_to_manual "unexpected verdict '$VERDICT' (schema should prevent this)"
+    ;;
+esac
+
+# --- emit machine-readable summary -----------------------------------------
+printf '%s\n' "$P4B_VALIDATED_VERDICT" | jq -s \
+  --argjson pr "$PR" \
+  --arg repo "$REPO" \
+  --arg head "${HEAD:-}" \
+  --arg direction "$DIRECTION" \
+  --arg reviewer "$REVIEWER" \
+  --arg adapter "$ADAPTER" \
+  --arg verdict "$VERDICT" \
+  --argjson review_posted "$REVIEW_POSTED" \
+  --arg review_acknowledgment "$REVIEW_ACKNOWLEDGMENT" \
+  --argjson dry_run "$DRY_RUN" \
+  --arg token_count "${TOKEN_COUNT:-}" \
+  --arg usage_source "$USAGE_SOURCE" \
+  --argjson adapter_timeout "$ADAPTER_TIMEOUT" \
+  --arg effort "$EFFECTIVE_EFFORT" \
+  --argjson findings_count "$FINDINGS_COUNT" \
+  --argjson ao "$(admin_override_summary)" \
+  --argjson round_cap "$P4B_ROUND_CAP_JSON" \
+  --arg enabled_via "$ENABLED_VIA" '
+  if length == 1 and (.[0] | type == "object") then .[0]
+  else error("expected exactly one validated verdict object") end
+  | . as $validated_verdict
+  | {
+    pr_number: $pr,
+    repo: $repo,
+    head_sha: $head,
+    direction: $direction,
+    reviewer_identity: $reviewer,
+    adapter: $adapter,
+    verdict: $verdict,
+    review_posted: $review_posted,
+    review_acknowledgment: $review_acknowledgment,
+    dry_run: $dry_run,
+    findings_count: $findings_count,
+    adapter_timeout_seconds: $adapter_timeout,
+    reviewer_effort: (if $effort == "" then null else $effort end),
+    token_count: (if $token_count == "" then null else ($token_count | tonumber) end),
+    usage_source: (if $usage_source == "" then null else $usage_source end),
+    fell_back_to_manual: false,
+    round_cap: $round_cap,
+    automation_enabled: true,
+    enabled_via: $enabled_via
+  } + $ao
+  | if $dry_run then . + {validated_verdict: $validated_verdict} else . end'
+
+# Read by the optional sourced heartbeat module during the composed EXIT.
+# shellcheck disable=SC2034
+P4B_HB_SUMMARY_EMITTED=true
+exit "$EXIT_CODE"

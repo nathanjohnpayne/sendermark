@@ -1,0 +1,673 @@
+#!/usr/bin/env bash
+# scripts/codex-p1-gate.sh — Codex blocking-tier unresolved-thread merge gate
+#
+# Reports "Codex blocking-tier unresolved: N" for a pull request and fails
+# (exit 1) when N > 0. Read-only. Never merges, labels, or comments.
+#
+# Context: per nathanjohnpayne/mergepath#235, the 2026-05-13 sweep of
+# unresolved reviewer feedback (#234) found 62 Codex P1 items sitting
+# on merged PRs across 9 repos. P1 is Codex's "blocking" severity tag;
+# 62 P1s riding through to closed state is evidence that the label was
+# advisory, not enforced. This script is the v1 enforcement.
+#
+# Generalization (nathanjohnpayne/mergepath#574, sub-issue #577): the gate
+# no longer hard-codes P1. It enforces the BLOCKING TIER SET resolved by
+# scripts/lib/feedback-policy-helpers.sh's resolve_required_tiers from the
+# `feedback_policy` block in .github/review-policy.yml, and classifies each
+# Codex inline comment with codex_tier_of. When the feedback_policy block is
+# ABSENT, resolve_required_tiers returns "p1" only, so the gate stays
+# byte-identical to its original P1-only behavior. The required-check NAME
+# (`Codex P1 Gate / Codex P1 unresolved threads`) is UNCHANGED — branch
+# protection depends on it — even though the gate now spans the resolved
+# tier set.
+#
+# Usage:
+#   scripts/codex-p1-gate.sh <PR_NUMBER> [REPO]
+#   scripts/codex-p1-gate.sh                       # env-only mode
+#
+# Arguments:
+#   PR_NUMBER  Required (positional or via $PR_NUMBER env). Integer.
+#   REPO       Optional. "owner/repo". Falls back to $REPO env, then
+#              to the current repo via `gh repo view`.
+#
+# Environment:
+#   GH_TOKEN   Required. Needs pull_requests:read.
+#   PR_NUMBER  Optional fallback for the positional arg. The
+#              scheduled-sweep job in .github/workflows/codex-p1-
+#              gate.yml passes PR_NUMBER positionally per iteration,
+#              but other callers (workflow_dispatch, ad-hoc CLI use,
+#              CI matrix jobs) may find it easier to set it as env.
+#   REPO       Optional fallback for the positional REPO arg. Same
+#              motivation as PR_NUMBER above.
+#
+# Algorithm:
+#   1. Reconcile all inline and top-level review-body findings against durable
+#      disposition evidence. Any missing disposition blocks before the
+#      current-HEAD P1 scan (#1000).
+#   2. Read .github/review-policy.yml `codex.p1_gate.enabled`. If false
+#      (the default everywhere except mergepath), exit 0 after accounting;
+#      only the legacy current-HEAD thread scan is disabled.
+#   3. Fetch all inline review comments on the PR via
+#      `repos/{repo}/pulls/{pr}/comments`.
+#   4. Filter to comments authored by `chatgpt-codex-connector[bot]`
+#      (or whatever `codex.bot_login` is configured to) whose Codex
+#      tier (codex_tier_of: the badge image `![Pn Badge]` or the text
+#      fallback `**Pn`) is in the resolved BLOCKING tier set. With the
+#      feedback_policy block absent the set is {p1}, so this matches the
+#      original `![P1 Badge]` / `**P1` filter exactly.
+#   5. For each candidate, fetch its review thread state via GraphQL
+#      `reviewThreads` and check `isResolved`. The author or any
+#      collaborator can resolve a thread via the GitHub UI or
+#      `resolveReviewThread` mutation; this script does NOT fight
+#      against a human-or-agent-marked-resolved state.
+#   6. SHA scope: a P1 finding only gates if its comment was attached
+#      to the PR's current HEAD. A P1 from an earlier SHA that is now
+#      either resolved OR no longer on HEAD does not count.
+#   7. Print one line per unresolved blocking-tier finding to stdout for
+#      CI visibility, then the summary "Codex blocking-tier unresolved: N".
+#
+# Exit codes:
+#   0   Feedback accounted and no unresolved blocking-tier findings on current
+#       HEAD (or the legacy thread scan is disabled).
+#   1   Feedback unaccounted or one or more unresolved blocking-tier findings
+#       on current HEAD — gate blocks.
+#   2   Usage / config error. Error message on stderr.
+#
+# Pending verdict (#2618, extending #2247's treatment of Merge clearance gate):
+# exit 1 also covers a head whose only blocker is a NON-blocking finding (for
+# example a Codex P2 or a CodeRabbit Minor) still awaiting its disposition.
+# Every caller keeps treating that as exit 1. A caller that needs to tell it
+# apart sets MERGEPATH_GATE_VERDICT_FILE to a path it owns. Only then, when
+# feedback accounting answers "unaccounted", the script classifies every
+# undispositioned finding (accounting_missing_nonblocking below), and when all
+# of them are non-blocking it does NOT stop there: it goes on through the
+# head-drift fence and the legacy current-HEAD blocking-tier thread scan, and
+# writes exactly `pending` to the file only when both found nothing. Any
+# blocking-tier finding (p0, p1, or a tier the gate or the governing policy
+# requires), an unknown tier, a malformed accounting answer, or a read or API
+# error leaves the file untouched, so an absent, empty or different file means
+# "not pending" and the caller must fail as before. Without the variable the
+# script stops at the accounting failure exactly as it always has. With it, a
+# drift or scan read error after a non-blocking accounting failure exits 2
+# rather than 1; both fail every caller. Only the event-driven job of
+# codex-p1-gate.yml asks, through scripts/workflow/codex-p1-snapshot-retry.py.
+#
+# Design notes:
+#   - Read-only. Only GETs against the GitHub API.
+#   - bash 3.2 portable (`#!/usr/bin/env bash`, no associative arrays
+#     or [[ ]] regex features beyond what 3.2 supports).
+#   - PATH-shimmable: tests substitute a `gh` stub on PATH that returns
+#     canned payloads. See tests/test_codex_p1_gate.sh.
+#   - The override pattern from #235 (`p1-already-fixed`,
+#     `p1-rejected`, `p1-moot`, `p1-deferred`) is NOT implemented in
+#     v1 — instead, the override path is "mark the thread resolved
+#     via the GitHub UI or GraphQL". The structured taxonomy lands in
+#     a follow-up once we see how the basic gate behaves in practice.
+#
+# References:
+#   - nathanjohnpayne/mergepath#235 — this script
+#   - nathanjohnpayne/mergepath#234 — the sweep that motivated it
+#   - REVIEW_POLICY.md § Phase 4a merge gate — the companion script
+#     `codex-review-check.sh` covers Codex clearance more broadly;
+#     this script is a narrower per-thread enforcement that exists
+#     specifically to catch the "Codex flagged P1 but author shipped
+#     anyway" failure mode.
+
+set -euo pipefail
+
+# --- argument parsing -------------------------------------------------------
+
+if [ $# -gt 2 ]; then
+  echo "Usage: $0 [PR_NUMBER] [REPO]" >&2
+  echo "       PR_NUMBER and REPO may also be set via env." >&2
+  exit 2
+fi
+
+# --- config readers ---------------------------------------------------------
+
+CONFIG=".github/review-policy.yml"
+
+# Shared blocking-tier resolver + Codex tier classifier (#576 foundation).
+# resolve_required_tiers reads CONFIG (the global set above) and prints the
+# blocking tier set one per line — "p1" when the feedback_policy block is
+# absent, preserving this gate's original behavior. codex_tier_of maps a
+# Codex finding body to p0..p3. Sourced by absolute-ish path relative to
+# this script so it resolves regardless of cwd (the script runs from the
+# trusted default-branch checkout root, but lib lives under scripts/).
+__P1_GATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/feedback-policy-helpers.sh
+. "$__P1_GATE_DIR/lib/feedback-policy-helpers.sh"
+
+# Shared paginated-list reader (#1008) — the fetch → capture → flatten
+# algorithm fetch_api_array below used to carry inline, alongside seven other
+# copies. Hard-required: this is a REQUIRED status check, and an undefined
+# reader would surface as `command not found` on the read whose fail-closed
+# contract keeps an unreadable inline surface from being graded as "no
+# findings".
+if [ ! -r "$__P1_GATE_DIR/lib/gh-api-array.sh" ]; then
+  echo "ERROR: gh-api-array helper missing: $__P1_GATE_DIR/lib/gh-api-array.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-array.sh
+. "$__P1_GATE_DIR/lib/gh-api-array.sh"
+
+# The issue-comment head-drift fence reads one SHA. Keep gh's stderr separate
+# from that machine-readable value through the shared scalar contract (#799,
+# #1008); benign retry/deprecation chatter on a successful request must not
+# turn this required check into a false hard failure.
+if [ ! -r "$__P1_GATE_DIR/lib/gh-api-scalar.sh" ]; then
+  echo "ERROR: gh-api-scalar helper missing: $__P1_GATE_DIR/lib/gh-api-scalar.sh" >&2
+  exit 2
+fi
+# shellcheck source=lib/gh-api-scalar.sh
+. "$__P1_GATE_DIR/lib/gh-api-scalar.sh"
+
+# The policy, parsed once (#2913). The earlier line-oriented awk readers
+# matched only an unquoted, block-style `field:` key, so a quoted key or a flow
+# mapping (`codex: {p1_gate: {enabled: true}}`) read as unset and took the
+# default, and a custom bot_login was missed. A missing file keeps the
+# defaults; a file that cannot be parsed is a config error (exit 2).
+P1_POLICY_JSON=""
+if [ -f "$CONFIG" ]; then
+  P1_POLICY_JSON=$(policy_yaml_to_json "$CONFIG") && [ -n "$P1_POLICY_JSON" ] || {
+    echo "ERROR: $CONFIG could not be parsed; codex.* settings are unknown" >&2
+    exit 2
+  }
+fi
+
+# codex_field <dotted.field> <kind> -- one field under codex: (`bot_login`,
+# `p1_gate.enabled`). Prints nothing when the key, an enclosing block or the
+# file is absent; returns 1 with a reason on stderr for a value not of <kind>.
+codex_field() {
+  [ -n "$P1_POLICY_JSON" ] || return 0
+  policy_json_field "$P1_POLICY_JSON" "codex.$1" "$2"
+}
+
+# Legacy thread-gate knob: codex.p1_gate.enabled. Default false everywhere
+# except mergepath itself. It controls only the current-HEAD required-tier
+# thread scan; complete-history feedback accounting is independent and
+# default-on in every consumer (#1000).
+P1_GATE_ENABLED=$(codex_field p1_gate.enabled bool) || exit 2
+P1_GATE_ENABLED=${P1_GATE_ENABLED:-false}
+case "$P1_GATE_ENABLED" in
+  true|false) ;;
+  *)
+    echo "ERROR: codex.p1_gate.enabled must be true|false; got '$P1_GATE_ENABLED'" >&2
+    exit 2
+    ;;
+esac
+
+# --- PR context (required for default-on feedback accounting) ---------------
+
+# Positional args take precedence; env fallbacks support the
+# workflow_dispatch / scheduled-sweep paths where it's more
+# ergonomic to set env than to build a positional arg list.
+PR_NUMBER=${1:-${PR_NUMBER:-}}
+if [ -z "$PR_NUMBER" ]; then
+  echo "ERROR: PR_NUMBER required (positional arg or \$PR_NUMBER env)" >&2
+  exit 2
+fi
+if ! echo "$PR_NUMBER" | grep -qE '^[0-9]+$'; then
+  echo "ERROR: PR_NUMBER must be an integer; got '$PR_NUMBER'" >&2
+  exit 2
+fi
+
+# Verify GH_TOKEN BEFORE auto-detecting REPO via `gh repo view` — a
+# missing/invalid token otherwise surfaces as a misleading "could not
+# detect current repo" instead of the real auth error (CodeRabbit on #463).
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "ERROR: GH_TOKEN is required. See REVIEW_POLICY.md § PAT lookup table." >&2
+  exit 2
+fi
+
+REPO=${2:-${REPO:-}}
+if [ -z "$REPO" ]; then
+  REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+  if [ -z "$REPO" ]; then
+    echo "ERROR: could not detect current repo via 'gh repo view'. Pass REPO explicitly." >&2
+    exit 2
+  fi
+fi
+
+BOT_LOGIN=$(codex_field bot_login string) || exit 2
+BOT_LOGIN=${BOT_LOGIN:-"chatgpt-codex-connector[bot]"}
+
+# Resolve the BLOCKING tier set from the feedback_policy block (#577). Absent
+# block -> "p1" (byte-identical to the original P1-only gate). Only rc 2 is
+# the documented "malformed mode/tier" signal — fail closed as a config error
+# (exit 2), the same posture as the p1_gate.enabled validation above. A
+# non-2 non-zero rc is NOT a failure: resolve_required_tiers' by-priority
+# branch inherits the exit status of its final loop iteration (e.g. rc 1 when
+# the last tier, nitpick, is not `required`), which is benign. Capture the
+# output regardless and branch on the rc explicitly so that benign tail
+# status does not get misread as malformed.
+set +e
+REQUIRED_TIERS=$(resolve_required_tiers "$CONFIG")
+RT_RC=$?
+set -e
+if [ "$RT_RC" -eq 2 ]; then
+  echo "ERROR: malformed feedback_policy block in $CONFIG (resolve_required_tiers exit 2)" >&2
+  exit 2
+fi
+
+# Return 0 iff $1 (a tier like p0..p3) is in the resolved REQUIRED_TIERS set.
+# Newline-delimited exact match — mirrors login_is_available_reviewer.
+tier_is_required() {
+  local needle=$1 t
+  [ -n "$needle" ] || return 1
+  while IFS= read -r t; do
+    [ "$t" = "$needle" ] && return 0
+  done <<< "$REQUIRED_TIERS"
+  return 1
+}
+
+# --- logging helpers --------------------------------------------------------
+
+log() {
+  echo "[codex-p1-gate] $*" >&2
+}
+
+die() {
+  local code=$1
+  shift
+  echo "[codex-p1-gate] ERROR: $*" >&2
+  exit "$code"
+}
+
+# accounting_missing_nonblocking <accounting JSON>: exit 0 ONLY when the
+# answer is a well-formed "unaccounted" result and EVERY undispositioned
+# finding in it is non-blocking (#2618). A finding is non-blocking only when
+# its tier is p2, p3 or nitpick, the tier is not in this gate's own blocking
+# set (REQUIRED_TIERS, from the trusted config), and the governing policy the
+# accounting resolved does not require it (address-all requires every tier).
+# p0 and p1 always block. A missing, unknown or non-string tier, an unknown
+# finding kind or policy mode, a count that disagrees with the list, or JSON
+# that does not parse is not non-blocking, so the caller fails as before.
+accounting_missing_nonblocking() {
+  local answer=$1 tiers tier
+  tiers=$(printf '%s' "$answer" | jq -r '
+    if type == "object"
+       and .status == "unaccounted"
+       and (.missing | type) == "array"
+       and (.missing | length) > 0
+       and .missing_count == (.missing | length)
+       and ((.feedback_policy // {}) | type) == "object"
+       and (((.feedback_policy // {}).mode // "by-priority") as $mode
+         | $mode == "by-priority" or $mode == "address-all")
+       and ((.feedback_policy // {}).mode // "by-priority") != "address-all"
+       and all(.missing[];
+         type == "object"
+         and (.kind | type) == "string"
+         and (.kind as $k | ["inline", "inline-archive", "review-body",
+           "review-body-archive", "issue-comment", "issue-comment-archive"]
+           | index($k)) != null
+         and (.tier | type) == "string")
+    then
+      (.feedback_policy // {}) as $policy
+      | .missing[]
+      | .tier as $tier
+      | if (["p2", "p3", "nitpick"] | index($tier)) != null
+           and (($policy.priorities // {})[$tier] // "") != "required"
+        then $tier
+        else "BLOCKING"
+        end
+    else "MALFORMED"
+    end
+  ' 2>/dev/null) || return 1
+  [ -n "$tiers" ] || return 1
+  while IFS= read -r tier; do
+    case "$tier" in
+      p2|p3|nitpick) ;;
+      *) return 1 ;;
+    esac
+    ! tier_is_required "$tier" || return 1
+  done <<< "$tiers"
+  return 0
+}
+
+# Set when a caller asked for the pending distinction and accounting failed
+# only on non-blocking findings; the rest of the gate then still runs, and
+# finish_clear/finish_blocked decide (#2618).
+ACCOUNTING_PENDING=false
+ACCOUNTING_OUTPUT=""
+
+run_feedback_accounting_gate() {
+  local gate output rc=0
+  gate="${MERGEPATH_REVIEW_FEEDBACK_ACCOUNTING_CMD:-$__P1_GATE_DIR/review-feedback-accounting.sh}"
+  command -v "$gate" >/dev/null 2>&1 \
+    || die 2 "review feedback accounting gate unavailable: $gate"
+  output=$("$gate" "$PR_NUMBER" "$REPO") || rc=$?
+  case "$rc" in
+    0) log "review feedback accounting clear" ;;
+    1)
+      if [ -n "${MERGEPATH_GATE_VERDICT_FILE:-}" ] \
+         && accounting_missing_nonblocking "$output"; then
+        log "review feedback is unaccounted, but only on non-blocking findings; ruling out blocking-tier findings before reporting pending (#2618)"
+        ACCOUNTING_PENDING=true
+        ACCOUNTING_OUTPUT=$output
+        return 0
+      fi
+      printf '%s\n' "$output"
+      die 1 "review feedback is unaccounted; disposition every finding before merge"
+      ;;
+    *)
+      printf '%s\n' "$output" >&2
+      die 2 "review feedback accounting gate failed with exit $rc"
+      ;;
+  esac
+}
+
+# The two ends of an evaluation once accounting has spoken. Without a pending
+# accounting result they are the gate's historical exits. With one, nothing
+# else blocked: report the accounting failure exactly as before (same stdout
+# and die message), and write `pending` only on the clear end (#2618).
+finish_clear() {
+  if [ "$ACCOUNTING_PENDING" = true ]; then
+    printf 'pending\n' 2>/dev/null >"$MERGEPATH_GATE_VERDICT_FILE" || true
+    printf '%s\n' "$ACCOUNTING_OUTPUT"
+    die 1 "review feedback is unaccounted; disposition every finding before merge"
+  fi
+  exit 0
+}
+
+finish_blocked() {
+  if [ "$ACCOUNTING_PENDING" = true ]; then
+    printf '%s\n' "$ACCOUNTING_OUTPUT"
+    log "ERROR: review feedback is unaccounted; disposition every finding before merge"
+  fi
+  exit 1
+}
+
+run_feedback_accounting_gate
+
+# The issue_comment workflow captures the PR head before evaluation and passes
+# it here. Refuse an evaluation that crossed a synchronize boundary; otherwise
+# an old-head success could be published against the new head commit (#1000).
+if [ -n "${CODEX_P1_EXPECTED_HEAD_SHA:-}" ]; then
+  OBSERVED_HEAD_SHA=$(gh_api_scalar --shape sha "PR head for drift check" \
+    "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha // empty') \
+    || die 2 "failed to re-read PR head for drift check"
+  [ -n "$OBSERVED_HEAD_SHA" ] || die 2 "PR head was empty during drift check"
+  [ "$OBSERVED_HEAD_SHA" = "$CODEX_P1_EXPECTED_HEAD_SHA" ] \
+    || die 2 "PR head drifted during gate evaluation (expected $CODEX_P1_EXPECTED_HEAD_SHA, observed $OBSERVED_HEAD_SHA)"
+fi
+
+if [ "$P1_GATE_ENABLED" != "true" ]; then
+  if [ "$ACCOUNTING_PENDING" = true ]; then
+    log "codex.p1_gate.enabled=false — no legacy current-HEAD thread scan to rule out"
+    finish_clear
+  fi
+  echo "[codex-p1-gate] feedback accounting clear; codex.p1_gate.enabled=false — skipping legacy current-HEAD thread scan"
+  echo "Codex blocking-tier unresolved: 0"
+  exit 0
+fi
+
+# Paginated fetch helper. The algorithm lives in scripts/lib/gh-api-array.sh
+# (#1008); what stays here is this gate's failure ACTION — `die 2`, the
+# config/usage code the workflow maps to a hard gate failure.
+fetch_api_array() {
+  gh_api_array "$1" "$2" || die 2 "$GH_API_ARRAY_ERROR"
+}
+
+# --- fetch PR metadata ------------------------------------------------------
+
+log "PR $REPO#$PR_NUMBER — fetching metadata"
+
+PR_JSON=$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>&1) \
+  || die 2 "failed to fetch PR metadata: $PR_JSON"
+
+HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha')
+if [ -z "$HEAD_SHA" ] || [ "$HEAD_SHA" = "null" ]; then
+  die 2 "could not determine HEAD sha for PR #$PR_NUMBER"
+fi
+log "HEAD = $HEAD_SHA    bot_login = $BOT_LOGIN"
+
+# --- fetch Codex blocking-tier inline comments ------------------------------
+
+COMMENTS_JSON=$(fetch_api_array "repos/$REPO/pulls/$PR_NUMBER/comments" "inline comments")
+
+log "blocking tier set: $(echo "$REQUIRED_TIERS" | tr '\n' ' ')"
+
+# Stage 1 (jq): narrow to bot-authored comments on the current HEAD —
+#   - author == bot_login
+#   - on the current HEAD: original_commit_id == HEAD or commit_id == HEAD.
+#     A finding from an earlier SHA that was addressed in a later commit
+#     has commit_id != HEAD; we treat it as out-of-scope for this gate
+#     regardless of thread state (already resolved by not being on HEAD).
+# We keep the FULL body here so stage 2 can classify each candidate with
+# the shared codex_tier_of — no tier filter in jq, to avoid re-implementing
+# (and drifting from) the classifier in scripts/lib/feedback-policy-helpers.sh.
+CANDIDATES=$(echo "$COMMENTS_JSON" | jq -c \
+  --arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" '
+  [ .[]
+    | select(.user.login == $bot)
+    | select((.commit_id == $sha) or (.original_commit_id == $sha))
+    | {
+        id: .id,
+        path: .path,
+        line: (.line // .original_line // 0),
+        body: (.body // "")
+      }
+  ]
+')
+
+# Stage 2 (bash): classify each candidate via codex_tier_of and keep only
+# those whose tier is in the resolved blocking set. With the feedback_policy
+# block absent the set is {p1}, so this reproduces the original
+# `![P1 Badge]` / `**P1` filter exactly (codex_tier_of matches those two
+# markers). Re-assemble the kept comments into a JSON array of
+# {id, path, line, body_snippet} (trimmed first line for log readability).
+BLOCKING_COMMENTS="[]"
+CAND_COUNT=$(echo "$CANDIDATES" | jq 'length')
+i=0
+while [ "$i" -lt "$CAND_COUNT" ]; do
+  c=$(echo "$CANDIDATES" | jq -c ".[$i]")
+  body=$(echo "$c" | jq -r '.body')
+  tier=$(codex_tier_of "$body")
+  if tier_is_required "$tier"; then
+    BLOCKING_COMMENTS=$(echo "$BLOCKING_COMMENTS" | jq -c \
+      --argjson c "$c" --arg tier "$tier" '
+      . + [ {
+        id: $c.id,
+        path: $c.path,
+        line: $c.line,
+        tier: $tier,
+        body_snippet: ($c.body | split("\n")[0] | .[0:120])
+      } ]
+    ')
+  fi
+  i=$((i + 1))
+done
+
+BLOCKING_COUNT=$(echo "$BLOCKING_COMMENTS" | jq 'length')
+log "found $BLOCKING_COUNT blocking-tier comment(s) on HEAD"
+
+if [ "$BLOCKING_COUNT" -eq 0 ]; then
+  echo "Codex blocking-tier unresolved: 0"
+  finish_clear
+fi
+
+# --- fetch review-thread resolution state via GraphQL ----------------------
+
+# Build a mapping (comment_id → isResolved) across ALL review threads and ALL
+# comments in each thread, then look each blocking-tier comment up.
+#
+# PAGINATION (#592). The GraphQL `reviewThreads` connection and each thread's
+# nested `comments` connection each cap at 100 items per page. A PR with >100
+# review threads, or a thread with >100 comments, would truncate the map — a
+# blocking comment id beyond the cap would be absent, fall to `// false` in the
+# classification below, and be counted as unresolved. That is already fail-SAFE
+# (over-block, never false-clear), but it turns an extreme-but-legitimate PR
+# into a hard exit 2. So instead of erroring, we PAGINATE both connections with
+# a cursor loop and classify precisely.
+#
+# FAIL-CLOSED POSTURE IS PRESERVED (#592). The loop fails closed (die 2, the
+# same exit code as the pre-pagination hard error) on ANY of: a GraphQL error,
+# a null/malformed page (missing reviewThreads), or exceeding the max-page
+# safety cap. It never treats a partial or failed scan as complete, so a
+# truncated map can NEVER silently under-count blocking findings. This block is
+# mirrored verbatim (bar the log prefix) in scripts/coderabbit-severity-gate.sh
+# — keep the two in lockstep; a shared paginator was considered but the shared
+# lib (scripts/lib/feedback-policy-helpers.sh) is contractually gh/network-free.
+
+OWNER=${REPO%/*}
+NAME=${REPO#*/}
+
+# Safety cap: 100 threads/page × 100 pages = 10k threads; 100 comments/page ×
+# 100 pages = 10k comments/thread. Far beyond any real PR; a loop that reaches
+# it indicates a cursor-stall / non-terminating pagination bug, so we fail
+# closed rather than spin.
+MAX_PAGES=100
+
+# Top-level reviewThreads query (paged via $cursor). Each thread carries its
+# first page of comments plus that connection's pageInfo so we can detect a
+# >100-comment thread and page it separately below.
+THREADS_QUERY=$(cat <<'EOF'
+query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes { databaseId }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+)
+
+# Per-thread comments query (paged via $cursor) for a thread whose comments
+# connection overflowed 100. Keyed by the thread node id.
+THREAD_COMMENTS_QUERY=$(cat <<'EOF'
+query($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { databaseId }
+      }
+    }
+  }
+}
+EOF
+)
+
+# Accumulate every thread node (with a fully-paginated comment id list) into
+# ALL_THREADS as a JSON array of { isResolved, comment_ids: [databaseId,...] }.
+ALL_THREADS='[]'
+CURSOR=""
+PAGE=0
+while :; do
+  PAGE=$((PAGE + 1))
+  if [ "$PAGE" -gt "$MAX_PAGES" ]; then
+    die 2 "reviewThreads pagination exceeded $MAX_PAGES pages (#592 safety cap) — failing closed."
+  fi
+  if [ -z "$CURSOR" ]; then
+    THREADS_JSON=$(gh api graphql -F owner="$OWNER" -F name="$NAME" \
+      -F pr="$PR_NUMBER" -F cursor=null -f query="$THREADS_QUERY" 2>&1) \
+      || die 2 "failed to query reviewThreads (page $PAGE): $THREADS_JSON"
+  else
+    THREADS_JSON=$(gh api graphql -F owner="$OWNER" -F name="$NAME" \
+      -F pr="$PR_NUMBER" -f cursor="$CURSOR" -f query="$THREADS_QUERY" 2>&1) \
+      || die 2 "failed to query reviewThreads (page $PAGE): $THREADS_JSON"
+  fi
+  # Fail closed on a malformed / null page: a missing reviewThreads object
+  # means the scan cannot be trusted complete.
+  if ! echo "$THREADS_JSON" | jq -e '.data.repository.pullRequest.reviewThreads.nodes' >/dev/null 2>&1; then
+    die 2 "malformed reviewThreads response (page $PAGE) — failing closed."
+  fi
+
+  # For each thread on this page, resolve its comment id list — paginating the
+  # nested comments connection if it overflowed 100.
+  PAGE_NODE_COUNT=$(echo "$THREADS_JSON" | jq '.data.repository.pullRequest.reviewThreads.nodes | length')
+  n=0
+  while [ "$n" -lt "$PAGE_NODE_COUNT" ]; do
+    NODE=$(echo "$THREADS_JSON" | jq -c ".data.repository.pullRequest.reviewThreads.nodes[$n]")
+    NODE_RESOLVED=$(echo "$NODE" | jq '.isResolved')
+    NODE_ID=$(echo "$NODE" | jq -r '.id')
+    COMMENT_IDS=$(echo "$NODE" | jq -c '[.comments.nodes[].databaseId]')
+    C_HAS_NEXT=$(echo "$NODE" | jq -r '.comments.pageInfo.hasNextPage')
+    C_CURSOR=$(echo "$NODE" | jq -r '.comments.pageInfo.endCursor')
+    C_PAGE=1
+    while [ "$C_HAS_NEXT" = "true" ]; do
+      C_PAGE=$((C_PAGE + 1))
+      if [ "$C_PAGE" -gt "$MAX_PAGES" ]; then
+        die 2 "thread comments pagination exceeded $MAX_PAGES pages (#592 safety cap) — failing closed."
+      fi
+      CJSON=$(gh api graphql -F id="$NODE_ID" -f cursor="$C_CURSOR" \
+        -f query="$THREAD_COMMENTS_QUERY" 2>&1) \
+        || die 2 "failed to query thread comments (thread $NODE_ID, page $C_PAGE): $CJSON"
+      if ! echo "$CJSON" | jq -e '.data.node.comments.nodes' >/dev/null 2>&1; then
+        die 2 "malformed thread comments response (thread $NODE_ID, page $C_PAGE) — failing closed."
+      fi
+      COMMENT_IDS=$(jq -c -n --argjson acc "$COMMENT_IDS" --argjson pg \
+        "$(echo "$CJSON" | jq -c '[.data.node.comments.nodes[].databaseId]')" '$acc + $pg')
+      C_HAS_NEXT=$(echo "$CJSON" | jq -r '.data.node.comments.pageInfo.hasNextPage')
+      C_CURSOR=$(echo "$CJSON" | jq -r '.data.node.comments.pageInfo.endCursor')
+    done
+    ALL_THREADS=$(jq -c -n --argjson acc "$ALL_THREADS" \
+      --argjson resolved "$NODE_RESOLVED" --argjson ids "$COMMENT_IDS" \
+      '$acc + [{ isResolved: $resolved, comment_ids: $ids }]')
+    n=$((n + 1))
+  done
+
+  HAS_NEXT=$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
+  [ "$HAS_NEXT" = "true" ] || break
+  CURSOR=$(echo "$THREADS_JSON" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
+  if [ -z "$CURSOR" ] || [ "$CURSOR" = "null" ]; then
+    die 2 "reviewThreads reported hasNextPage but no endCursor — failing closed."
+  fi
+done
+
+# Build a JSON object: { "<comment_id>": isResolved, ... } from the fully
+# paginated thread set.
+RESOLUTION_MAP=$(echo "$ALL_THREADS" | jq '
+  map(
+      (.isResolved) as $resolved
+      | .comment_ids
+      | map({ key: (. | tostring), value: $resolved })
+    )
+  | flatten
+  | from_entries
+')
+
+# --- classify blocking-tier comments by resolution -------------------------
+
+UNRESOLVED_BLOCKING=$(echo "$BLOCKING_COMMENTS" | jq \
+  --argjson map "$RESOLUTION_MAP" '
+  [ .[]
+    | . as $c
+    | ($map[($c.id | tostring)] // false) as $resolved
+    | select($resolved != true)
+  ]
+')
+
+UNRESOLVED_COUNT=$(echo "$UNRESOLVED_BLOCKING" | jq 'length')
+
+# --- report ----------------------------------------------------------------
+
+if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
+  echo ""
+  echo "Unresolved Codex blocking-tier findings on current HEAD ($HEAD_SHA):"
+  echo "$UNRESOLVED_BLOCKING" | jq -r '
+    .[] | "  - [\(.tier | ascii_upcase)] \(.path):\(.line) (comment id \(.id))\n      \(.body_snippet)"
+  '
+  echo ""
+  echo "Resolve each thread via the GitHub UI (or GraphQL"
+  echo "resolveReviewThread mutation) once the finding is addressed."
+  echo ""
+fi
+
+echo "Codex blocking-tier unresolved: $UNRESOLVED_COUNT"
+
+if [ "$UNRESOLVED_COUNT" -gt 0 ]; then
+  finish_blocked
+fi
+finish_clear

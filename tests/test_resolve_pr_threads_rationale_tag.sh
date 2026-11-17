@@ -1,0 +1,2956 @@
+#!/usr/bin/env bash
+# tests/test_resolve_pr_threads_rationale_tag.sh
+#
+# Tests the mergepath#305 `[mergepath-resolve: <class>] <rationale>`
+# tag-emission flow in scripts/resolve-pr-threads.sh
+# --auto-resolve-bots.
+#
+# Strategy: stub `gh` via PATH-prepend so the script's mutation calls
+# (addPullRequestReviewThreadReply for the tag, resolveReviewThread
+# for the resolve) are captured into a side log file we can inspect.
+# Each case shapes the GraphQL response so derive_tag_class lands on
+# the expected class, then asserts the captured argv contains the
+# matching `[mergepath-resolve: <class>]` tag body.
+#
+# Tag format MUST match exactly what the v1 rollup classifier's
+# regex in scripts/lib/daily-feedback-rollup-helpers.sh expects:
+#   \[mergepath-resolve:[[:space:]]*[a-z-]+[[:space:]]*\]
+#
+# Cases (matching the spec's class taxonomy):
+#   1. addressed-elsewhere  fix-commit by agent author after createdAt
+#                           touching the comment's anchored file
+#   2. canonical routing → deferred-to-followup: a NON-ACTIONED thread
+#                           on a manifest path is an explicit deferral
+#                           and must resurface in the daily rollup,
+#                           which SKIPS routing classes (#616 finding
+#                           3509930338); the routing context is logged
+#                           as an INFO line, the recorded class is
+#                           deferred-to-followup
+#   3. nitpick-noted        Nitpick severity, no stronger signal
+#   4. deferred-to-followup default fallback
+#   5. --rationale override emits deferred-to-followup with custom text
+#   6. --no-tag-reply suppresses tag emission while still resolving
+#   7. rebuttal-recorded    ≥30-char agent-authored reply on thread
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
+[ -f "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 1; }
+
+pass=0
+fail=0
+
+# tag_before_resolve <argv-log> → 0 if reply call appears before resolve
+# call in the cumulative argv log, 1 otherwise. The script's contract
+# is "post tag reply BEFORE resolveReviewThread"; without this check,
+# tests would pass even if the helper accidentally inverted the order
+# (CodeRabbit Major r2 on #308). Uses grep -n line numbers because the
+# argv log preserves call sequence by append-only writes.
+tag_before_resolve() {
+  local log="$1"
+  local reply_line resolve_line
+  reply_line=$(grep -n 'addPullRequestReviewThreadReply' "$log" 2>/dev/null | head -1 | cut -d: -f1)
+  resolve_line=$(grep -n 'resolveReviewThread' "$log" 2>/dev/null | head -1 | cut -d: -f1)
+  if [ -z "$reply_line" ] || [ -z "$resolve_line" ]; then
+    return 1
+  fi
+  [ "$reply_line" -lt "$resolve_line" ]
+}
+
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+# Build a fixture .mergepath-sync.yml the script will read for the
+# canonical-coverage classification. We point the script at this
+# fixture by faking REPO_ROOT_FOR_MANIFEST via a symlink-style
+# wrapper. The simplest path: copy the real script into the
+# fixture tree and run it from there, so its
+# `$(dirname BASH_SOURCE)/..` resolution picks up our manifest.
+FIXTURE_ROOT="$SCRATCH/repo"
+mkdir -p "$FIXTURE_ROOT/scripts/lib" "$FIXTURE_ROOT/scripts/ci" "$FIXTURE_ROOT/tests"
+cp "$SCRIPT" "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh"
+# The script auto-sources scripts/lib/preflight-helpers.sh if present;
+# ship a no-op stub so the source line doesn't fail in the fixture.
+cat > "$FIXTURE_ROOT/scripts/lib/preflight-helpers.sh" <<'STUB'
+auto_source_preflight() { :; }
+STUB
+# Also ship a stub identity-check.sh that always passes (we test
+# tag emission, not identity verification — that has its own suite).
+cat > "$FIXTURE_ROOT/scripts/identity-check.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$FIXTURE_ROOT/scripts/identity-check.sh"
+
+# Fixture manifest — only the entries the test asserts against.
+cat > "$FIXTURE_ROOT/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - name: test-consumer
+    repo: test/consumer
+    visibility: public
+paths:
+  - path: scripts/resolve-pr-threads.sh
+    type: canonical
+    consumers: all
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+YAML
+
+# Common gh stub. Routes by ($1, $2) and the rest of argv:
+#   `gh api graphql -f query=...` → branch on query body for resolveReviewThread / addPullRequestReviewThreadReply / reviewThreads
+#   `gh api repos/.../pulls/N` → HEAD oid
+#   `gh api repos/.../pulls/N/files?...` → PR file list
+#   `gh api repos/.../pulls/N/commits?...` → PR commits
+#   `gh repo view --json nameWithOwner` → fixture repo slug
+make_gh_stub() {
+  local stub_path="$1"
+  local threads_json="$2"
+  local files_json="$3"
+  local commits_json="$4"
+  # #565: per-commit file map (sha -> [filenames]) for the
+  # addressed-elsewhere commit_touches_file check. Defaults to empty so the
+  # many call sites that never reach a per-commit fetch need not pass it.
+  local commit_files_map="${5:-{}}"
+  cat > "$stub_path" <<GH_STUB
+#!/usr/bin/env bash
+echo "ARGV: \$*" >> "\$GH_ARGV_LOG"
+# Capture the body of any -F (typed) field so we can grep for the
+# mergepath-resolve tag in the addPullRequestReviewThreadReply body
+# field. Iterate a COPY of argv via an indexed array — shifting the
+# real \$@ here would empty it before the case statement below can
+# dispatch on \$1/\$2.
+__ARGS=("\$@")
+__i=0
+while [ "\$__i" -lt "\${#__ARGS[@]}" ]; do
+  case "\${__ARGS[\$__i]}" in
+    -F|--field)
+      __next_i=\$((__i + 1))
+      echo "FIELD: \${__ARGS[\$__next_i]}" >> "\$GH_ARGV_LOG"
+      __i=\$((__i + 2)) ;;
+    -f|--raw-field)
+      __next_i=\$((__i + 1))
+      echo "RAWFIELD: \${__ARGS[\$__next_i]}" >> "\$GH_ARGV_LOG"
+      __i=\$((__i + 2)) ;;
+    *) __i=\$((__i + 1)) ;;
+  esac
+done
+
+case "\$1" in
+  api)
+    case "\$2" in
+      graphql)
+        # Pull out the query body from argv (already logged above);
+        # branch on substring matches.
+        if grep -q "viewer { login }" "\$GH_ARGV_LOG.lastcall"; then
+          # #2726: the CI-app identity read (identity-check.sh
+          # --expect-thread-resolution-app); --jq is not applied here.
+          echo "\${STUB_VIEWER_LOGIN:-}"
+        elif grep -q "addPullRequestReviewThreadReply" "\$GH_ARGV_LOG.lastcall"; then
+          # A failed marker write must not resolve an explicit selection.
+          [ "\${GH_STUB_TAG_FAIL:-}" = tag-failure ] && exit 1
+          if [ "\${GH_STUB_TAG_FAIL:-}" = tag-stdout-failure ]; then echo 'marker write refused'; exit 1; fi
+          if [ "\${GH_STUB_TAG_FAIL:-}" = tag-stderr-failure ]; then echo 'marker write refused' >&2; exit 1; fi
+          [ "\${GH_STUB_TAG_FAIL:-}" != tag-warning ] || echo 'gh diagnostic warning' >&2
+          if [ "\${GH_STUB_TAG_FAIL:-}" = tag-null ]; then echo '{"data":{"addPullRequestReviewThreadReply":null},"errors":[{"message":"refused"}]}'; exit 0; fi
+          # Tag-reply mutation — return a minimal success response.
+          echo '{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"C_kwT1"}}}}'
+        elif grep -q "resolveReviewThread" "\$GH_ARGV_LOG.lastcall"; then
+          echo '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
+        elif grep -q "nodes(ids:" "\$GH_ARGV_LOG.lastcall"; then
+          # #564 post-resolve readback. The script re-reads each resolved
+          # thread via the top-level nodes(ids:) lookup. Return ONLY the ids
+          # the readback query actually requested (parsed from the recorded
+          # argv) so a wrong nodes(ids:) list built by the script is caught
+          # — CodeRabbit on #565 — each resolved unless
+          # GH_STUB_READBACK_UNRESOLVED names it (which exercises the
+          # fail-closed readback path).
+          __req=\$(grep -oE 'nodes\(ids: \[[^]]*\]' "\$GH_ARGV_LOG.lastcall" | head -1 | sed -E 's/^nodes\(ids: //')
+          [ -z "\$__req" ] && __req='[]'
+          cat <<'JSON_READBACK' | jq -c --argjson req "\$__req" --arg kf "\${GH_STUB_READBACK_UNRESOLVED:-}" '{data:{nodes:[.data.repository.pullRequest.reviewThreads.nodes[] | select(.id as \$i | \$req | index(\$i)) | {id, isResolved: (if .id == \$kf then false else true end)}]}}'
+${threads_json}
+JSON_READBACK
+        else
+          # reviewThreads pagination query.
+          cat <<'JSON_THREADS'
+${threads_json}
+JSON_THREADS
+        fi
+        ;;
+      user)
+        # #2726: the reviewer-PAT identity read (identity-check.sh
+        # --expect-write-identity); --jq is not applied here.
+        echo "\${STUB_USER_LOGIN:-}"
+        ;;
+      "repos/"*"/pulls/"*"/files"*)
+        # The script calls this with --jq '[.[].filename]' which
+        # transforms the API response to a flat list of paths. Our
+        # stub doesn't actually parse --jq, so we return the
+        # already-transformed shape (a JSON array of path strings).
+        cat <<'JSON_FILES'
+${files_json}
+JSON_FILES
+        ;;
+      "repos/"*"/pulls/"*"/commits"*)
+        # Same shape note as /files: stub returns the already-jq-
+        # transformed shape (array of {sha,login,date} objects)
+        # because the script reads --jq output, not raw API JSON.
+        cat <<'JSON_COMMITS'
+${commits_json}
+JSON_COMMITS
+        ;;
+      "repos/"*"/commits/"*)
+        # #565 per-commit files: extract the sha (last path segment) and
+        # return its file list from the provided sha->[filenames] map (or []
+        # if absent). The script calls this with --jq '[.files[].filename]',
+        # so (like the /files and /commits stubs) return the already-
+        # transformed array of filenames directly.
+        __sha="\${2##*/}"
+        printf '%s' '${commit_files_map}' | jq -c --arg s "\$__sha" '.[\$s] // []'
+        ;;
+      "repos/"*"/pulls/"*)
+        # HEAD oid fetch — the script calls this with --jq .head.sha
+        # and captures stdout; the stub doesn't actually parse --jq,
+        # so we return the bare sha directly. Same pattern the
+        # existing tests in scripts/ci/check_resolve_pr_threads use.
+        # #2727: --bind-head (implied by --ci-app-identity) reads the
+        # head/base pair with a second --jq; serve STUB_PAIR there.
+        case "\$*" in
+          *".base.sha"*) echo "\${STUB_PAIR:-HEADCURRENT HEADBASE main open}" ;;
+          *) echo "\${STUB_HEAD:-HEADCURRENT}" ;;
+        esac
+        ;;
+      "repos/test/repo")
+        # #2727: --bind-head's default-branch read (--jq .default_branch).
+        echo "\${STUB_DEFAULT_BRANCH:-main}"
+        ;;
+      *)
+        echo "{}" ;;
+    esac
+    ;;
+  repo)
+    printf '{"nameWithOwner":"test/repo"}\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+exit 0
+GH_STUB
+  chmod +x "$stub_path"
+}
+
+# The stub uses .lastcall to remember the most-recent call's argv
+# (so it can branch on which graphql mutation was sent). A second
+# pre-hook stub wraps the main one to populate it.
+make_gh_wrapper() {
+  local wrapper_path="$1"
+  local real_stub="$2"
+  cat > "$wrapper_path" <<WRAP_STUB
+#!/usr/bin/env bash
+# Capture this call's argv into .lastcall before dispatching to the
+# real stub, so the real stub can branch on which mutation was sent.
+printf '%s\n' "\$*" > "\$GH_ARGV_LOG.lastcall"
+exec "$real_stub" "\$@"
+WRAP_STUB
+  chmod +x "$wrapper_path"
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 1: helper detects fix-commit → emits addressed-elsewhere
+# ─────────────────────────────────────────────────────────────────────
+echo "Test 1: addressed-elsewhere class (fix-commit detection)"
+
+# Thread: comment created 2026-01-01, anchored at scripts/foo.sh.
+# PR files include scripts/foo.sh. PR commits include one by
+# nathanpayne-claude on 2026-01-02 (after createdAt).
+# The short agent reply is the #990 finding-bound evidence: the fix-commit
+# proxy alone no longer concludes "actioned" anywhere, so the fixture carries
+# the per-finding artifact that makes this thread genuinely dispositioned.
+# It is deliberately <30 chars so rebuttal-recorded cannot fire and the case
+# still exercises the addressed-elsewhere fix-commit path it was written for.
+THREADS_T1='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":1001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in abc1234.","databaseId":1002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T1='["scripts/foo.sh","scripts/bar.sh"]'
+COMMITS_T1='[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+
+GH_ARGV_LOG="$SCRATCH/t1.log"; : > "$GH_ARGV_LOG"
+# #565: the fix commit abc1234567 must be shown to TOUCH scripts/foo.sh for
+# addressed-elsewhere to hold (per-commit file verification).
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T1" "$FILES_T1" "$COMMITS_T1" '{"abc1234567":["scripts/foo.sh"]}'
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: addressed-elsewhere]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: addressed-elsewhere tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# Regression: synth_rationale's PR_COMMITS_CACHE must be populated
+# in the parent shell so the addressed-elsewhere rationale cites
+# the SPECIFIC matched commit SHA instead of falling back to the
+# generic "addressed by a follow-up commit on this PR" text. If
+# fetch_pr_tag_data only runs inside derive_tag_class's command-
+# substitution subshell, synth_rationale (also subshelled) sees an
+# empty PR_COMMITS_CACHE → emits `[: : integer expression expected`
+# on its commit_count loop guard → silently degrades to the generic
+# rationale. nathanpayne-codex Phase 4b r4 on #308 reproduced this
+# with a page-2 files fixture; gate added at the call site by
+# warming the cache in the parent shell before the subshells.
+if [ "$rc" -eq 0 ] \
+   && ! grep -q 'integer expression expected' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\] addressed by commit abc1234' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: addressed-elsewhere rationale cites matched commit (no subshell-cache regression)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: addressed-elsewhere rationale degraded — subshell-cache regression?" >&2
+  echo "    expected rationale: 'addressed by commit abc1234 (touching ...)'" >&2
+  echo "    script output (looking for 'integer expression expected'):" >&2
+  echo "$out" | grep -E '(integer expression|abc1234|follow-up commit)' | sed 's/^/      /' >&2 || true
+  echo "    captured tag-reply field:" >&2
+  grep 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" | sed 's/^/      /' >&2 || true
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 2: a NON-ACTIONED thread on a canonical manifest path is recorded
+# as deferred-to-followup, NOT canonical-coverage (#616 finding
+# 3509930338). --auto-resolve-bots is THE explicit-deferral tool and the
+# daily rollup SKIPS routing classes — tagging the routing class here
+# would bury the deliberate deferral so it never resurfaces. The ladder
+# still derives canonical-coverage (locking the manifest classification,
+# which the INFO line surfaces); the disposition of record is deferred.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 2: canonical-path non-actioned deferral records deferred-to-followup (#616)"
+
+# scripts/resolve-pr-threads.sh IS in the fixture manifest as canonical.
+THREADS_T2='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_2","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":2001}]}
+  }
+]}}}}}'
+FILES_T2='["scripts/resolve-pr-threads.sh"]'
+COMMITS_T2='[]'
+
+GH_ARGV_LOG="$SCRATCH/t2.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T2" "$FILES_T2" "$COMMITS_T2"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'INFO: routing class canonical-coverage recorded as deferred-to-followup' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: canonical routing logged (INFO) but the recorded tag is deferred-to-followup"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: non-actioned canonical-path thread not recorded as deferred-to-followup (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 3: nitpick-noted on Nitpick severity, no fix, no canonical path
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 3: nitpick-noted class (Nitpick severity, no other signals)"
+
+# Path NOT in manifest. Body carries CodeRabbit Nitpick badge.
+# No commits (empty PR_COMMITS_CACHE).
+THREADS_T3='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_3","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/random.md","body":"_🧹 Nitpick (assertive)_ minor wording issue","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"_🧹 Nitpick (assertive)_ minor wording issue","databaseId":3001}]}
+  }
+]}}}}}'
+FILES_T3='[]'
+COMMITS_T3='[]'
+
+GH_ARGV_LOG="$SCRATCH/t3.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T3" "$FILES_T3" "$COMMITS_T3"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: nitpick-noted\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: nitpick-noted]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: nitpick-noted tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 4: deferred-to-followup default fallback
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 4: deferred-to-followup class (default fallback)"
+
+# Path NOT in manifest. Body has no severity markers. No commits.
+# No agent reply. → falls through to deferred-to-followup.
+THREADS_T4='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_4","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/random.md","body":"Some opaque finding without a badge","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some opaque finding without a badge","databaseId":4001}]}
+  }
+]}}}}}'
+FILES_T4='[]'
+COMMITS_T4='[]'
+
+GH_ARGV_LOG="$SCRATCH/t4.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T4" "$FILES_T4" "$COMMITS_T4"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: deferred-to-followup]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: deferred-to-followup tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 5: --rationale override emits deferred-to-followup with the
+#         custom rationale text appended verbatim.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 5: --rationale override (deferred-to-followup + custom text)"
+
+# Same thread as Test 2 (canonical path) — would normally classify
+# as canonical-coverage; the override must beat the auto-class.
+# FILES_T5 mirrors FILES_T2 ("scripts/resolve-pr-threads.sh") so the
+# would-be auto-class actually evaluates to canonical-coverage and
+# the test genuinely exercises --rationale's precedence over the
+# ladder. With an empty FILES_T5 the auto-class would fall through
+# to deferred-to-followup anyway, making the override untestable.
+THREADS_T5="$THREADS_T2"
+FILES_T5='["scripts/resolve-pr-threads.sh"]'
+COMMITS_T5='[]'
+
+GH_ARGV_LOG="$SCRATCH/t5.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T5" "$FILES_T5" "$COMMITS_T5"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+CUSTOM_RATIONALE="P2 noted; deferred to mergepath canonical follow-up #280"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots \
+    --rationale "$CUSTOM_RATIONALE" 2>&1
+)
+rc=$?
+set -e
+
+# Both the class and the custom rationale must appear in the SAME
+# tag-reply field. The stub log writes one `FIELD:` line per -F arg
+# (the body is one such line: `FIELD: body=[mergepath-resolve: deferred-to-followup] P2 noted; ...`).
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -qF "FIELD: body=[mergepath-resolve: deferred-to-followup] $CUSTOM_RATIONALE" "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: override emitted deferred-to-followup tag with custom rationale text"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rationale override not emitted as expected (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 6: --no-tag-reply suppresses the addPullRequestReviewThreadReply
+#         mutation entirely (resolve still runs).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 6: --no-tag-reply suppresses tag emission"
+
+GH_ARGV_LOG="$SCRATCH/t6.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T4" "$FILES_T4" "$COMMITS_T4"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots --no-tag-reply 2>&1
+)
+rc=$?
+set -e
+
+# Tightened assertions (CodeRabbit Major r2 on #308):
+#   - rc == 0 — script exited cleanly
+#   - addPullRequestReviewThreadReply mutation NEVER ran — proves
+#     reply path is fully short-circuited (the prior body-text check
+#     was weaker: a reply with a non-tag body would have slipped past)
+#   - resolveReviewThread mutation DID run — proves "suppress tag,
+#     still resolve" contract
+if [ "$rc" -eq 0 ] \
+   && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: --no-tag-reply skipped reply mutation and still resolved thread"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --no-tag-reply behavior incorrect (rc=$rc, missing suppression or resolve)" >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 7: rebuttal-recorded — ≥30-char agent-authored reply on the
+#         thread bumps the class above nitpick / deferred-to-followup
+#         when no addressed-elsewhere/canonical signal applies.
+#         (CodeRabbit Major on #308 — the ladder's rebuttal step had
+#         no fixture coverage before.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 7: rebuttal-recorded class (≥30-char agent reply on thread)"
+
+# Path NOT in manifest, no commits, but allComments has an
+# agent-authored reply ≥30 chars. The reply MUST be authored by an
+# agent identity (nathanpayne-claude / -codex / -cursor) — the
+# bot-author of the original comment is skipped (index 0).
+THREADS_T7='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_7","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/notes.md","body":"Some non-canonical finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some non-canonical finding","databaseId":7001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — this is intentional for the propagation path; see #200 for context.","databaseId":7002}
+   ]}
+  }
+]}}}}}'
+FILES_T7='[]'
+COMMITS_T7='[]'
+
+GH_ARGV_LOG="$SCRATCH/t7.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T7" "$FILES_T7" "$COMMITS_T7"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: tag body contains [mergepath-resolve: rebuttal-recorded]"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rebuttal-recorded tag not emitted (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 8 (#467): templated-render class survives a SCALAR `consumers:
+# all` templated entry. The pre-fix fetch_manifest_templated_dests did
+# `.consumers // [] | map(...)`, which on the scalar `all` tried to map
+# over a string — a yq error that (under `|| true`) blanked the WHOLE
+# templated-dest cache, so NO templated dest classified as
+# templated-render. Here a thread anchored on a templated `dest:` whose
+# entry is `consumers: all` must classify as templated-render.
+#
+# Post-#616 (finding 3509930338) the CLASSIFICATION is asserted via the
+# INFO line ("routing class templated-render recorded as
+# deferred-to-followup") and the recorded tag is deferred-to-followup:
+# a non-actioned templated-dest thread auto-resolved here is an explicit
+# deferral, and routing classes are rollup-skip classes. A blanked
+# templated-dest cache (the #467 regression this test locks) would skip
+# the INFO line entirely and fall straight to deferred-to-followup.
+#
+# This test REWRITES the shared fixture manifest, so it must run LAST
+# (all earlier tests have already executed against the original
+# manifest). It adds a second consumer whose repo is `test/repo` so the
+# `consumers: all` set resolves to include the --repo under test.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 8: templated-render class on a scalar consumers: all templated dest"
+
+cat > "$FIXTURE_ROOT/.mergepath-sync.yml" <<'YAML'
+version: 1
+consumers:
+  - name: test-consumer
+    repo: test/consumer
+    visibility: public
+  - name: this-repo
+    repo: test/repo
+    visibility: public
+paths:
+  - path: scripts/resolve-pr-threads.sh
+    type: canonical
+    consumers: all
+  - path: scripts/ci/
+    type: kit
+    consumers: all
+  - path: examples/foo.tpl
+    type: templated
+    dest: rendered/foo.cfg
+    consumers: all
+YAML
+
+# Thread anchored on the templated DEST (not a .path entry, so step-1
+# canonical-coverage does not fire — only step-1b templated-render).
+THREADS_T8='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_8","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"rendered/foo.cfg","body":"A finding on the rendered output","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"A finding on the rendered output","databaseId":8001}]}
+  }
+]}}}}}'
+FILES_T8='["rendered/foo.cfg"]'
+COMMITS_T8='[]'
+
+GH_ARGV_LOG="$SCRATCH/t8.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T8" "$FILES_T8" "$COMMITS_T8"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'INFO: routing class templated-render recorded as deferred-to-followup' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: templated-render classified (scalar consumers: all resolved), recorded as deferred-to-followup"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: templated-render not classified for scalar consumers: all dest, or wrong recorded tag (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 8b (#521): the same scalar `consumers: all` templated dest must
+# ALSO classify as templated-render on the NO-YQ fallback path. We force
+# that path by running with a PATH that excludes yq (and keeps only the
+# stub gh + minimal coreutils). The awk fallback now emits a dedicated
+# `__AWK_CONSUMERS_ALL__` sentinel that path_matches_templated_dest treats
+# as match-any — before this fix the awk path emitted the cautious
+# no-scope sentinel for EVERY templated entry, so a `consumers: all` dest
+# never classified as templated-render without yq.
+# Reuses the Test 8 fixture manifest (still on disk) + the same threads.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 8b: templated-render on consumers: all dest via NO-YQ awk fallback (#521)"
+
+# Sanity: confirm the fixture manifest still carries the consumers: all
+# templated entry (Test 8 wrote it; we depend on it here).
+if ! grep -q 'consumers: all' "$FIXTURE_ROOT/.mergepath-sync.yml"; then
+  fail=$((fail + 1))
+  echo "  FAIL: Test 8b precondition — fixture manifest missing consumers: all entry" >&2
+fi
+
+GH_ARGV_LOG_B="$SCRATCH/t8b.log"; : > "$GH_ARGV_LOG_B"
+# Stub gh in its own dir. Force the no-yq fallback via the script's test
+# hook (RESOLVE_PR_THREADS_FORCE_NO_YQ=1) rather than curating yq out of
+# PATH: CI installs yq into /usr/bin, so a fixed-PATH exclusion is not
+# portable (it false-failed the setup on the runner). The hook exercises
+# the exact grep/awk branch regardless of where yq is installed.
+T8B_BIN="$SCRATCH/t8b-bin"; mkdir -p "$T8B_BIN"
+make_gh_stub "$T8B_BIN/gh-real" "$THREADS_T8" "$FILES_T8" "$COMMITS_T8"
+make_gh_wrapper "$T8B_BIN/gh" "$T8B_BIN/gh-real"
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG_B" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  RESOLVE_PR_THREADS_FORCE_NO_YQ=1 \
+  PATH="$T8B_BIN:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG_B" \
+   && grep -q 'INFO: routing class templated-render recorded as deferred-to-followup' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG_B" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: templated-render\]' "$GH_ARGV_LOG_B"; then
+  pass=$((pass + 1))
+  echo "  PASS: no-yq awk fallback classifies consumers: all dest as templated-render (#521), recorded as deferred-to-followup"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: no-yq fallback did not classify templated-render for consumers: all dest, or wrong recorded tag (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG_B" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 9 (#564): post-resolve readback confirms isResolved:true. After a
+# successful resolve, the script must re-read the thread via the top-level
+# nodes(ids:) lookup and report the confirmation. Assert (a) the readback
+# query was actually issued, (b) the confirmation line is printed, and
+# (c) the script exits 0.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 9: post-resolve readback confirms isResolved:true (#564)"
+
+# Non-manifest path → deferred-to-followup class; readback is independent
+# of the class, so any resolvable bot thread on current HEAD exercises it.
+THREADS_T9='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_9","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/readback.md","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":9001}]}
+  }
+]}}}}}'
+FILES_T9='[]'
+COMMITS_T9='[]'
+
+GH_ARGV_LOG="$SCRATCH/t9.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T9" "$FILES_T9" "$COMMITS_T9"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'nodes(ids:' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: readback query issued and confirmed isResolved:true (rc=0)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: post-resolve readback did not confirm as expected (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 10 (#564): post-resolve readback FAILS CLOSED. If the readback
+# reports isResolved:false for a thread the mutation claimed to resolve
+# (state drift / eventual-consistency lag / a write that did not stick),
+# the script must NOT report success: it prints a READBACK FAILED line and
+# exits 2. Drive this by forcing the stub's readback branch to return
+# isResolved:false for the resolved thread id via GH_STUB_READBACK_UNRESOLVED.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 10: post-resolve readback fails closed on unconfirmed resolve (#564)"
+
+THREADS_T10='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_10","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/readback.md","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":10001}]}
+  }
+]}}}}}'
+FILES_T10='[]'
+COMMITS_T10='[]'
+
+GH_ARGV_LOG="$SCRATCH/t10.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T10" "$FILES_T10" "$COMMITS_T10"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  GH_STUB_READBACK_UNRESOLVED="PRT_10" \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --auto-resolve-bots 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 2 ] \
+   && grep -q 'READBACK FAILED \[PRT_10\]' <<<"$out" \
+   && grep -q 'failing closed' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: unconfirmed readback → READBACK FAILED + exit 2 (fail closed)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: readback did not fail closed on isResolved:false (rc=$rc, expected 2)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 11 (#564): --resolve-actioned RESOLVES a demonstrably-actioned
+# thread. A ≥30-char agent reply classifies as rebuttal-recorded (an
+# actioned skip-set class, manifest-independent), so --resolve-actioned
+# must tag, resolve, and confirm it via the readback — exit 0.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 11: --resolve-actioned resolves an actioned-class thread (#564)"
+
+THREADS_T11='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_11","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/notes.md","body":"Some non-canonical finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some non-canonical finding","databaseId":11001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — this is intentional for the propagation path; see #200 for context.","databaseId":11002}
+   ]}
+  }
+]}}}}}'
+FILES_T11='[]'
+COMMITS_T11='[]'
+
+GH_ARGV_LOG="$SCRATCH/t11.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T11" "$FILES_T11" "$COMMITS_T11"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out" \
+   && ! grep -q 'not demonstrably actioned' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: actioned (rebuttal-recorded) thread resolved + confirmed under --resolve-actioned"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --resolve-actioned did not resolve the actioned thread (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 12 (#564): --resolve-actioned SKIPS a non-actioned thread. A bot
+# finding with no badge, no fix commit, and no agent reply classifies as
+# deferred-to-followup (a surface-set class). --resolve-actioned must LEAVE
+# IT UNRESOLVED: no resolveReviewThread mutation, a "not demonstrably
+# actioned" skip line, and exit 3 (work remains) so the sweep still sees it.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 12: --resolve-actioned skips a non-actioned (deferred) thread (#564)"
+
+THREADS_T12='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_12","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/random.md","body":"Some opaque finding without a badge","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Some opaque finding without a badge","databaseId":12001}]}
+  }
+]}}}}}'
+FILES_T12='[]'
+COMMITS_T12='[]'
+
+GH_ARGV_LOG="$SCRATCH/t12.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T12" "$FILES_T12" "$COMMITS_T12"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: non-actioned thread left unresolved (no mutation), exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --resolve-actioned did not skip the non-actioned thread (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 13 (#564, Codex P2 on #565): a deferred-marked thread with no real
+# action evidence is left unresolved by --resolve-actioned. The GATE ignores
+# recorded markers and re-derives fresh evidence (#565): the marker reply is
+# ≥30 chars and agent-authored, but step 3's marker guard excludes it, so the
+# ladder finds no fix/rebuttal and classifies deferred-to-followup → skipped
+# (no mutation, exit 3). (It must NOT be mis-read as rebuttal-recorded.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 13: --resolve-actioned leaves a deferred-marked, unfixed thread unresolved (#564 / Codex #565)"
+
+THREADS_T13='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_13","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/marked.md","body":"Some finding deferred earlier","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some finding deferred earlier","databaseId":13001},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred to follow-up; resolving for branch-protection conversation gate.","databaseId":13002}
+   ]}
+  }
+]}}}}}'
+FILES_T13='[]'
+COMMITS_T13='[]'
+
+GH_ARGV_LOG="$SCRATCH/t13.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T13" "$FILES_T13" "$COMMITS_T13"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: existing deferred marker honored — thread left unresolved (no mutation), exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: deferred marker not honored under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# #1677: both persisted marker spellings override the nitpick heuristic.
+# This catches alias loss; merely checking the generic surface default cannot.
+for alias in deferred-to-followup deferred-to-follow-up; do
+  alias_threads=$(printf '%s' "$THREADS_T13" | jq -c --arg alias "$alias" '
+    .data.repository.pullRequest.reviewThreads.nodes[0]
+      |= (.commentsFirst.nodes[0].body = "🧹 Nitpick: something deferred earlier"
+          | .allComments.nodes[1].body = ("[mergepath-resolve: " + $alias + "] deferred earlier"))')
+  GH_ARGV_LOG="$SCRATCH/t1677-$alias.log"; : > "$GH_ARGV_LOG"
+  make_gh_stub "$SCRATCH/gh-real" "$alias_threads" '[]' '[]'
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+    env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" = 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+    pass=$((pass + 1)); echo "  PASS: persisted $alias marker is honored and emits canonical deferral"
+  else fail=$((fail + 1)); echo "  FAIL: persisted $alias marker lost explicit deferral (rc=$rc)" >&2; echo "$out" >&2; fi
+done
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 14 (#564, CodeRabbit Major on #565): a STALE actioned marker is NOT
+# honored when the bot posts fresh feedback after it. Thread: finding →
+# agent rebuttal → [mergepath-resolve: rebuttal-recorded] marker → bot
+# RE-RAISES. The marker (and the rebuttal) predate the bot's last word, so
+# --resolve-actioned must NOT resolve — it classifies deferred-to-followup
+# and leaves the thread unresolved (no mutation, exit 3).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 14: --resolve-actioned ignores a stale actioned marker after a bot re-raise (#565)"
+
+THREADS_T14='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_14","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/stale.md","body":"Original finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Original finding","databaseId":14001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — intentional for the propagation path; see #200 for the rationale.","databaseId":14002},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: rebuttal-recorded] agent rebuttal posted on thread; resolving.","databaseId":14003},
+     {"author":{"login":"coderabbitai"},"body":"Still a problem after your rebuttal — please reconsider.","databaseId":14004}
+   ]}
+  }
+]}}}}}'
+FILES_T14='[]'
+COMMITS_T14='[]'
+
+GH_ARGV_LOG="$SCRATCH/t14.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T14" "$FILES_T14" "$COMMITS_T14"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale actioned marker after a bot re-raise is not honored — thread left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale actioned marker was honored under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 15 (#564, CodeRabbit Major on #565): the same staleness rule on the
+# rebuttal heuristic (no marker). Thread: finding → agent rebuttal → bot
+# RE-RAISES. The rebuttal predates the bot's last word, so it must NOT count
+# as rebuttal-recorded; --resolve-actioned leaves the thread unresolved.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 15: --resolve-actioned ignores a stale rebuttal after a bot re-raise (#565)"
+
+THREADS_T15='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_15","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/stale2.md","body":"Original finding two","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Original finding two","databaseId":15001},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — intentional for the propagation path; see #200 for the rationale.","databaseId":15002},
+     {"author":{"login":"coderabbitai"},"body":"Still a problem after your rebuttal — please reconsider.","databaseId":15003}
+   ]}
+  }
+]}}}}}'
+FILES_T15='[]'
+COMMITS_T15='[]'
+
+GH_ARGV_LOG="$SCRATCH/t15.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T15" "$FILES_T15" "$COMMITS_T15"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale rebuttal after a bot re-raise is not counted — thread left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale rebuttal was counted as actioned under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 16 (#564, nathanpayne-codex CHANGES_REQUESTED on #565): the
+# addressed-elsewhere staleness guard. A fix commit that post-dates the
+# ORIGINAL finding but PRE-dates a later bot re-raise must NOT count as
+# actioning the thread. Thread: finding @ T0 → fix commit @ T1 (T0<T1) →
+# bot re-raise @ T2 (T1<T2). --resolve-actioned must classify
+# deferred-to-followup (not addressed-elsewhere) and leave it unresolved.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 16: --resolve-actioned ignores a fix commit that predates a bot re-raise (#565)"
+
+THREADS_T16='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_16","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Original finding on foo","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Original finding on foo","databaseId":16001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"coderabbitai"},"body":"Your fix did not address this — still broken.","databaseId":16002,"createdAt":"2026-01-03T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+# Agent fix commit at 2026-01-02 — AFTER the finding (T0) but BEFORE the
+# re-raise (T2=2026-01-03). Touches the anchored file.
+FILES_T16='["scripts/foo.sh"]'
+COMMITS_T16='[{"sha":"def4567890","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+
+GH_ARGV_LOG="$SCRATCH/t16.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T16" "$FILES_T16" "$COMMITS_T16"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale fix commit (predates bot re-raise) is not addressed-elsewhere — left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale fix commit was treated as addressed-elsewhere under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 17 (#564, nathanpayne-codex CHANGES_REQUESTED on #565): a later
+# agent commit on an UNRELATED file must NOT make addressed-elsewhere hold
+# for a thread anchored on a different file. Thread on scripts/foo.sh; the
+# PR's overall file list includes foo.sh (so the old PR-level check passed),
+# but the only qualifying agent commit touched scripts/bar.sh — NOT foo.sh.
+# Per-commit verification must reject it → --resolve-actioned leaves the
+# thread unresolved (no mutation, exit 3).
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 17: --resolve-actioned rejects addressed-elsewhere when the commit touched another file (#565)"
+
+THREADS_T17='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_17","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Finding on foo, never fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding on foo, never fixed","databaseId":17001,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+# PR overall touched BOTH files; the later agent commit touched only bar.sh.
+FILES_T17='["scripts/foo.sh","scripts/bar.sh"]'
+COMMITS_T17='[{"sha":"bar9999999","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+# Per-commit map: bar9999999 touched scripts/bar.sh ONLY (not foo.sh).
+CFILES_T17='{"bar9999999":["scripts/bar.sh"]}'
+
+GH_ARGV_LOG="$SCRATCH/t17.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T17" "$FILES_T17" "$COMMITS_T17" "$CFILES_T17"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned: deferred-to-followup)' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: commit on an unrelated file is not addressed-elsewhere — thread left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unrelated-file commit was treated as addressed-elsewhere (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 18 (#564, nathanpayne-codex P1 CHANGES_REQUESTED on #565): a fresh
+# bot finding on a canonical manifest path with NO fix commit and NO
+# rebuttal must be LEFT UNRESOLVED by --resolve-actioned. The GATE skips
+# routing (skip_routing), so the thread no longer short-circuits to
+# canonical-coverage; it falls through to a non-actioned class (here
+# deferred-to-followup) and is skipped — routing alone never resolves.
+# (The fixture manifest, rewritten by Test 8, marks
+# scripts/resolve-pr-threads.sh canonical.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 18: --resolve-actioned does NOT resolve a fresh, unfixed canonical-path thread (#565)"
+
+THREADS_T18='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_18","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Fresh unfixed finding on a canonical path","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Fresh unfixed finding on a canonical path","databaseId":18001,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+FILES_T18='["scripts/resolve-pr-threads.sh"]'
+COMMITS_T18='[]'
+
+GH_ARGV_LOG="$SCRATCH/t18.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T18" "$FILES_T18" "$COMMITS_T18"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] \
+   && grep -q 'SKIP (not demonstrably actioned:' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: routing-only canonical thread left unresolved (no mutation), exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: routing-only canonical thread was treated as actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 19 (#564, nathanpayne-codex P1 CHANGES_REQUESTED on #565): the
+# counterpart to Test 18 — a canonical-path thread that WAS actually fixed
+# MUST resolve. Before the skip_routing gate path, derive_tag_class returned
+# canonical-coverage (routing, step 1) before checking the fix commit
+# (step 2), so a real fix on a canonical path was masked and skipped. With
+# routing skipped in the gate, the fix commit touching the anchored
+# canonical file classifies as addressed-elsewhere → resolved + readback.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 19: --resolve-actioned DOES resolve a fixed canonical-path thread (#565)"
+
+THREADS_T19='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_19","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Finding on a canonical path that we then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding on a canonical path that we then fixed","databaseId":19001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in can1234.","databaseId":19002,"createdAt":"2026-01-02T06:00:00Z"}
+   ]}
+  }
+]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
+FILES_T19='["scripts/resolve-pr-threads.sh"]'
+# Agent fix commit AFTER the finding, touching the anchored canonical file.
+COMMITS_T19='[{"sha":"can1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+CFILES_T19='{"can1234567":["scripts/resolve-pr-threads.sh"]}'
+
+GH_ARGV_LOG="$SCRATCH/t19.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T19" "$FILES_T19" "$COMMITS_T19" "$CFILES_T19"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(
+  GH_ARGV_LOG="$GH_ARGV_LOG" \
+  RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 \
+  PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 \
+    --repo test/repo --resolve-actioned 2>&1
+)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && grep -q 'Readback: all 1 resolved thread(s) confirmed isResolved:true' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: fixed canonical-path thread resolved as addressed-elsewhere + readback-confirmed"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: fixed canonical-path thread was NOT resolved under --resolve-actioned (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 20 (#565 Codex P2 "let later fixes override stale surface markers"):
+# a thread with a stale [mergepath-resolve: deferred-to-followup] marker BUT
+# a later fix commit touching the anchored file must RESOLVE — the GATE
+# ignores the marker and re-derives addressed-elsewhere from the fix.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 20: --resolve-actioned lets a later fix override a stale deferred marker (#565)"
+
+THREADS_T20='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_20","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/x.md","body":"Finding later fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding later fixed","databaseId":20001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":20002,"createdAt":"2026-01-02T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in fix2020.","databaseId":20003,"createdAt":"2026-01-03T06:00:00Z"}
+   ]}
+  }
+]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
+FILES_T20='["docs/x.md"]'
+COMMITS_T20='[{"sha":"fix2020abc","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+CFILES_T20='{"fix2020abc":["docs/x.md"]}'
+
+GH_ARGV_LOG="$SCRATCH/t20.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T20" "$FILES_T20" "$COMMITS_T20" "$CFILES_T20"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: later fix overrides the stale deferred marker — resolved as addressed-elsewhere"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale deferred marker masked the later fix (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 21 (#565 Codex P2 "re-verify actioned markers before resolving"): a
+# thread carrying an [mergepath-resolve: addressed-elsewhere] marker but NO
+# actual qualifying commit must NOT resolve — the GATE re-derives evidence
+# and finds none.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 21: --resolve-actioned re-verifies a stale addressed-elsewhere marker, skips (#565)"
+
+THREADS_T21='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_21","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/y.md","body":"Finding never actually fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding never actually fixed","databaseId":21001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: addressed-elsewhere] addressed by commit deadbeef.","databaseId":21002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T21='[]'
+COMMITS_T21='[]'
+
+GH_ARGV_LOG="$SCRATCH/t21.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T21" "$FILES_T21" "$COMMITS_T21"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 3 ] && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale addressed-elsewhere marker without a real commit is re-verified and skipped"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale addressed-elsewhere marker resolved without re-verification (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 22 (#565 Codex P2 "reject rationale overrides in actioned mode"):
+# --resolve-actioned with --rationale is rejected (exit 1), never resolves.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 22: --resolve-actioned --rationale is rejected (#565)"
+
+GH_ARGV_LOG="$SCRATCH/t22.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T4" "$FILES_T4" "$COMMITS_T4"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned --rationale "manual note" 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 1 ] \
+   && grep -q 'not valid with --resolve-actioned' <<<"$out" \
+   && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: --resolve-actioned --rationale rejected with exit 1, no mutation"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: --rationale not rejected under --resolve-actioned (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 23 (#565 Codex P2 "allow later fix commits past the stale-thread
+# gate"): a fixed-by-commit thread whose bot comment is on an OLDER commit
+# (commit_oid != HEAD) must still RESOLVE under --resolve-actioned — the
+# gate bypasses the current-HEAD stale skip and relies on the fix evidence.
+# (--auto-resolve-bots would skip this thread as stale-HEAD.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 23: --resolve-actioned resolves a fixed thread whose bot comment is on an older commit (#565)"
+
+THREADS_T23='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_23","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/z.md","body":"Finding fixed by a later commit","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"OLDCOMMIT0"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding fixed by a later commit","databaseId":23001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in fix2323.","databaseId":23002,"createdAt":"2026-01-02T06:00:00Z"}
+   ]}
+  }
+]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
+FILES_T23='["docs/z.md"]'
+COMMITS_T23='[{"sha":"fix2323abc","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+CFILES_T23='{"fix2323abc":["docs/z.md"]}'
+
+GH_ARGV_LOG="$SCRATCH/t23.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T23" "$FILES_T23" "$COMMITS_T23" "$CFILES_T23"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'SKIP (stale' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: stale-HEAD fixed thread resolved via evidence (current-HEAD gate bypassed)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale-HEAD fixed thread not resolved under --resolve-actioned (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 24 (#565 round-8 P1): commit-cache login normalization. GitHub
+# returns author.login=null for commits whose author email is not linked to
+# a GitHub account — THIS repo's normal case (commits are authored as
+# nathanjohnpayne with a placeholder .example email). The commit-cache login
+# projection must fall back to .commit.author.name (= nathanjohnpayne, an
+# agent author) BEFORE the unlinked email, or fixed-by-commit feedback is
+# never recognized as agent-authored and addressed-elsewhere never fires.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 24: commit-cache login falls back to .commit.author.name when author.login is null (#565)"
+
+# (a) The exact projection both builders use must map a null-author commit to
+#     the git author name (the #565-round-8 reviewer's live shape).
+RAW_COMMITS_T24='[{"sha":"deadbeef","author":null,"commit":{"author":{"name":"nathanjohnpayne","email":"nathan@nathanjohnpayne.example","date":"2026-01-02T00:00:00Z"}}}]'
+PROJECTED_LOGIN=$(printf '%s' "$RAW_COMMITS_T24" | jq -r '[.[] | {login: (.author.login // .commit.author.name // .commit.author.email // "")}][0].login')
+if [ "$PROJECTED_LOGIN" = "nathanjohnpayne" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: null author.login -> .commit.author.name (nathanjohnpayne)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: projection gave [$PROJECTED_LOGIN], expected nathanjohnpayne" >&2
+fi
+
+# (b) BOTH commit-cache builders in the script carry the .commit.author.name
+#     fallback (regression guard against either reverting).
+BUILDER_HITS=$(grep -c '\.author\.login // \.commit\.author\.name // \.commit\.author\.email' "$SCRIPT")
+if [ "$BUILDER_HITS" -ge 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both commit-cache builders include the .commit.author.name fallback ($BUILDER_HITS)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected >=2 builders with .commit.author.name fallback, found $BUILDER_HITS" >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 25 (#575 guard, auto-derive path): --auto-resolve-bots on a
+# demonstrably-ACTIONED thread must AUTO-UPGRADE the deferred tag to the
+# truthful class. Thread: bot finding → stale recorded
+# [mergepath-resolve: deferred-to-followup] marker → LATER agent fix commit
+# touching the anchored file. The TAG ladder honors the surface marker
+# (deferred-to-followup), but the guard re-derives with the GATE
+# classification (skip-routing, marker-blind) which proves
+# addressed-elsewhere — so the emitted tag is the truthful
+# addressed-elsewhere, with an INFO line. (The negative case — a
+# genuinely-deferred thread keeping deferred-to-followup — is locked by
+# Tests 4 and 5 above, which run through the same guard and stay deferred.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 25: --auto-resolve-bots auto-upgrades a demonstrably-actioned deferred tag (#575)"
+
+THREADS_T25='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_25","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/upgraded.md","body":"Finding deferred earlier, then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding deferred earlier, then fixed","databaseId":25001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: deferred-to-followup] deferred earlier; resolving for the gate.","databaseId":25002,"createdAt":"2026-01-02T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in fix2525.","databaseId":25003,"createdAt":"2026-01-03T06:00:00Z"}
+   ]}
+  }
+]}}}}}'
+# The trailing short agent reply is the #990 finding-bound artifact: the
+# fix-commit proxy alone no longer concludes "actioned" anywhere, so the
+# fixture states outright that this finding was dispositioned. The case's
+# original subject is untouched — Test 28 locks the complement.
+FILES_T25='["docs/upgraded.md"]'
+COMMITS_T25='[{"sha":"fix2525abc","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+CFILES_T25='{"fix2525abc":["docs/upgraded.md"]}'
+
+GH_ARGV_LOG="$SCRATCH/t25.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T25" "$FILES_T25" "$COMMITS_T25" "$CFILES_T25"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded deferred-to-followup → addressed-elsewhere' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: actioned thread auto-upgraded deferred-to-followup → addressed-elsewhere with INFO line"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actioned thread was not auto-upgraded (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 26 (#575 guard, --rationale path): the explicit-deferral override is
+# exactly how the #571 mis-marking happened, so the guard applies there
+# too. A thread carrying a substantive agent rebuttal, resolved via
+# `--auto-resolve-bots --rationale`, must emit the truthful
+# rebuttal-recorded CLASS while keeping the operator's rationale TEXT.
+# (Test 5 above locks the negative case: a non-actioned thread keeps
+# deferred-to-followup with the custom text.)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 26: --auto-resolve-bots --rationale auto-upgrades the class on an actioned thread (#575)"
+
+THREADS_T26='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_26","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"docs/rebutted.md","body":"Finding that was rebutted on-thread","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Finding that was rebutted on-thread","databaseId":26001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Disagree — this is intentional for the propagation path; see #200 for context.","databaseId":26002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T26='[]'
+COMMITS_T26='[]'
+
+GH_ARGV_LOG="$SCRATCH/t26.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T26" "$FILES_T26" "$COMMITS_T26"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+T26_RATIONALE="bulk pass over the sync backlog; see the follow-up issue"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots \
+  --rationale "$T26_RATIONALE" 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded deferred-to-followup → rebuttal-recorded' <<<"$out" \
+   && grep -qF "FIELD: body=[mergepath-resolve: rebuttal-recorded] $T26_RATIONALE" "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: rationale override kept the operator text but upgraded the class to rebuttal-recorded"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rationale-path guard did not upgrade the class (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 27 (#616 finding 3509930338, actioned side): a ROUTING-class
+# thread that IS demonstrably actioned gets the truthful actioned tag,
+# not deferred-to-followup and not the routing tag. The anchored path is
+# canonical in the fixture manifest (Test 8 rewrote the manifest but kept
+# the scripts/resolve-pr-threads.sh canonical entry) AND an agent fix
+# commit touching it post-dates the finding → the #575 auto-upgrade now
+# also runs for routing classes: INFO line `canonical-coverage →
+# addressed-elsewhere`, tag addressed-elsewhere. (Tests 2/8/8b lock the
+# NON-actioned side: routing class → deferred-to-followup.)
+# The short agent reply supplies the #990 finding-bound evidence the upgrade
+# now requires; Test 32 locks the complement — same shape WITHOUT the reply
+# keeps the honest deferred-to-followup tag.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 27: actioned canonical-path thread auto-upgrades routing → addressed-elsewhere (#616)"
+
+THREADS_T27='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_27","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/resolve-pr-threads.sh","body":"Canonical-path finding that was then fixed","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Canonical-path finding that was then fixed","databaseId":27001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed upstream.","databaseId":27002,"createdAt":"2026-01-02T06:00:00Z"}
+   ]}
+  }
+]}}}}}'
+FILES_T27='["scripts/resolve-pr-threads.sh"]'
+COMMITS_T27='[{"sha":"fix2727abc","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"}]'
+CFILES_T27='{"fix2727abc":["scripts/resolve-pr-threads.sh"]}'
+
+GH_ARGV_LOG="$SCRATCH/t27.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T27" "$FILES_T27" "$COMMITS_T27" "$CFILES_T27"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'INFO: tag auto-upgraded canonical-coverage → addressed-elsewhere' <<<"$out" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: canonical-coverage\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: routing class auto-upgraded to addressed-elsewhere on fix-commit evidence"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: actioned canonical-path thread was not upgraded to addressed-elsewhere (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Tests 28–32 (#990): --resolve-actioned must bind its evidence to the
+# FINDING, not to the anchored FILE.
+#
+# The reproduction is a single-file PR — the shape of every docs, spec,
+# wireframe and config PR, and the shape of gaycruisebingo#778 where 13
+# Codex findings (three P1) were resolved and tagged addressed-elsewhere
+# without ever being triaged. Two threads sit on the same one file; one
+# fix commit touches it; the file proxy therefore reports BOTH as actioned.
+# Exactly one thread carries a per-finding artifact.
+#
+# Shared fixture for 28/29/30/31 — thread B is identical in every case
+# except for the disposition artifact under test.
+# ─────────────────────────────────────────────────────────────────────
+
+# t990_threads <B-allComments-json> → the two-thread single-file fixture.
+t990_threads() {
+  local b_comments="$1"
+  cat <<JSON
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_990A","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the state machine drops the error branch","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the state machine drops the error branch","databaseId":99001,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanpayne-claude"},"body":"Fixed in c0ffee1.","databaseId":99002,"createdAt":"2026-01-02T00:00:00Z"}
+   ]}
+  },
+  {"id":"PRT_990B","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the retry loop has no backoff","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":${b_comments}}
+  }
+]}}}}}
+JSON
+}
+T990_B_BARE='[{"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"}]'
+FILES_T990='["wireframes/app.md"]'
+COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+CFILES_T990='{"c0ffee1234":["wireframes/app.md"]}'
+
+# run_t990 <log> <threads-json> [env KEY=VAL ...] → script stdout+stderr,
+# with $rc set by the caller. Always --resolve-actioned on a 1-file PR.
+run_t990() {
+  local log="$1" threads="$2"; shift 2
+  : > "$log"
+  make_gh_stub "$SCRATCH/gh-real" "$threads" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  GH_ARGV_LOG="$log" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+    env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN "$@" \
+    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --resolve-actioned 2>&1
+}
+
+# resolved_threads <log> → the thread ids that were actually resolved.
+#
+# Read from the post-resolve readback query, whose `nodes(ids: [...])` literal
+# is exactly RESOLVED_IDS — the ids the script confirmed it mutated. The tag
+# reply and the resolve mutation both pass `-F id=`, so a field-based count
+# cannot tell them apart, and the multi-line mutation bodies in the argv log
+# defeat per-line matching. No readback means nothing was resolved.
+resolved_threads() {
+  grep -oE 'nodes\(ids: \[[^]]*\]' "$1" 2>/dev/null \
+    | grep -oE 'PRT_[A-Za-z0-9_]+' \
+    | sort -u
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 28: the reproduction. Both threads pass the file proxy; only the
+# one with an on-thread agent reply may be resolved. The never-triaged
+# P1 stays open, is counted as never-dispositioned, and forces exit 3 so
+# the caller sees that work remains.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 28: single-file PR — only the dispositioned finding resolves (#990)"
+
+set +e
+out=$(run_t990 "$SCRATCH/t28.log" "$(t990_threads "$T990_B_BARE")")
+rc=$?
+set -e
+
+t28_resolved=$(resolved_threads "$SCRATCH/t28.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t28_resolved" = "PRT_990A " ] \
+   && grep -q 'SKIP (never dispositioned: addressed-elsewhere rests on file-level evidence only)' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && grep -q 'Resolved: 1 ' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: PRT_990A resolved, the never-triaged P1 (PRT_990B) left unresolved, exit 3"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: single-file sweep not contained (rc=$rc, resolved='$t28_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 29: a per-finding LEDGER verdict is the other admissible artifact.
+# Thread B gets no reply but does get a codex-record-feedback.sh row for
+# its own comment id, recorded after the finding → both threads resolve.
+# This is the path that keeps the normal Phase 4a loop working, where
+# dispositions are recorded as 👍/👎 rather than as prose replies.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 29: a ledger verdict for the finding's comment id counts as evidence (#990)"
+
+T29_LEDGER="$SCRATCH/t29-codex-ledger.jsonl"
+jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"+1",
+         reaction:"+1",location:"pull_request_review_comment",action:"posted",
+         reviewer_identity:"nathanpayne-claude",reason:null,
+         recorded_at:"2026-01-04T00:00:00Z"}' > "$T29_LEDGER"
+
+set +e
+out=$(run_t990 "$SCRATCH/t29.log" "$(t990_threads "$T990_B_BARE")" \
+        CODEX_FEEDBACK_LEDGER="$T29_LEDGER")
+rc=$?
+set -e
+
+t29_resolved=$(resolved_threads "$SCRATCH/t29.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] \
+   && [ "$t29_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'verdict for finding 99101 recorded in t29-codex-ledger.jsonl' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 0' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: ledger verdict admitted; both threads resolved, exit 0"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: ledger verdict not admitted as finding-bound evidence (rc=$rc, resolved='$t29_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 30: the ledger row must post-date the latest re-raise. A verdict
+# recorded against an EARLIER round dispositioned that round, not the
+# live one — same staleness floor the rest of the gate uses (#565). Here
+# thread B carries a bot re-raise at 2026-01-05 and the ledger row is
+# from 2026-01-04, so the evidence is stale and B stays unresolved.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 30: a ledger verdict older than the latest re-raise is stale evidence (#990)"
+
+T990_B_RERAISED='[
+  {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"chatgpt-codex-connector"},"body":"Re-raise: backoff still missing on the second call path.","databaseId":99102,"createdAt":"2026-01-05T00:00:00Z"}
+]'
+T30_LEDGER="$SCRATCH/t30-codex-ledger.jsonl"
+jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"+1",
+         reaction:"+1",location:"pull_request_review_comment",action:"posted",
+         reviewer_identity:"nathanpayne-claude",reason:null,
+         recorded_at:"2026-01-04T00:00:00Z"}' > "$T30_LEDGER"
+COMMITS_T990_SAVE="$COMMITS_T990"
+COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t30.log" "$(t990_threads "$T990_B_RERAISED")" \
+        CODEX_FEEDBACK_LEDGER="$T30_LEDGER")
+rc=$?
+set -e
+COMMITS_T990="$COMMITS_T990_SAVE"
+
+t30_resolved=$(resolved_threads "$SCRATCH/t30.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t30_resolved" = "PRT_990A " ] \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: pre-re-raise ledger row rejected; re-raised thread left unresolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: stale ledger row accepted (rc=$rc, resolved='$t30_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 30a: a verdict recorded against the current re-raise must count.
+# The original finding's stale negative row is deliberately also present:
+# the resolver must ignore that old id and find the post-re-raise verdict.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 30a: a current re-raise ledger verdict is finding-bound evidence (#1007)"
+
+T30A_LEDGER="$SCRATCH/t30a-codex-ledger.jsonl"
+cat > "$T30A_LEDGER" <<'JSON'
+{"pr_number":778,"repo":"test/repo","comment_id":99101,"priority":"P1","verdict":"-1","reaction":"-1","location":"pull_request_review_comment","action":"posted","reviewer_identity":"nathanpayne-claude","reason":null,"recorded_at":"2026-01-04T00:00:00Z"}
+{"pr_number":778,"repo":"test/repo","comment_id":99102,"priority":"P1","verdict":"+1","reaction":"+1","location":"pull_request_review_comment","action":"posted","reviewer_identity":"nathanpayne-claude","reason":null,"recorded_at":"2026-01-06T00:00:00Z"}
+JSON
+COMMITS_T990_SAVE="$COMMITS_T990"
+COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t30a.log" "$(t990_threads "$T990_B_RERAISED")" \
+        CODEX_FEEDBACK_LEDGER="$T30A_LEDGER")
+rc=$?
+set -e
+COMMITS_T990="$COMMITS_T990_SAVE"
+
+t30a_resolved=$(resolved_threads "$SCRATCH/t30a.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] \
+   && [ "$t30a_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'verdict for finding 99102 recorded in t30a-codex-ledger.jsonl' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 0' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: current re-raise verdict admitted; stale original row ignored"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: current re-raise ledger verdict was not admitted (rc=$rc, resolved='$t30a_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 31: this script's OWN [mergepath-resolve: ...] marker is not
+# evidence. A marker is the resolver's output — counting it would let a
+# tagged-but-readback-failed run from the old file-proxy behavior
+# bootstrap the evidence for the next run and re-sweep the same
+# never-triaged finding.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 31: a [mergepath-resolve:] marker reply is not disposition evidence (#990)"
+
+T990_B_MARKER='[
+  {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"nathanpayne-claude"},"body":"[mergepath-resolve: addressed-elsewhere] addressed by commit c0ffee1 (touching wireframes/app.md).","databaseId":99103,"createdAt":"2026-01-02T00:00:00Z"}
+]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t31.log" "$(t990_threads "$T990_B_MARKER")")
+rc=$?
+set -e
+
+t31_resolved=$(resolved_threads "$SCRATCH/t31.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t31_resolved" = "PRT_990A " ] \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: marker reply rejected as self-produced; thread left unresolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: marker reply accepted as evidence (rc=$rc, resolved='$t31_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 32: complement of Test 27 on the --auto-resolve-bots side. That
+# mode's blunt contract is unchanged — it still resolves every current-
+# HEAD bot thread, because the operator invoking it has made the
+# disposition decision. What changes is the TAG: without finding-bound
+# evidence the honest deferred-to-followup stands instead of being
+# auto-upgraded to addressed-elsewhere. The distinction matters because
+# the daily rollup SKIPS the actioned classes, so a file-proxy upgrade
+# would stop the finding resurfacing exactly as a false resolve does.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 32: --auto-resolve-bots still resolves but keeps deferred-to-followup without finding evidence (#990)"
+
+THREADS_T32='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_32","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the retry loop has no backoff","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99201,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+
+GH_ARGV_LOG="$SCRATCH/t32.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T32" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'auto-upgraded' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: thread resolved under the deferral contract, tag stayed deferred-to-followup"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: file-proxy upgrade still relabels an undispositioned deferral (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 33 (#990): the ledger arm must be bound to THIS finding in THIS
+# repo, and must carry a real verdict.
+#
+# Test 29 proves a qualifying row is admitted; on its own that is
+# satisfied by "the ledger file exists and has any row", which would let
+# a ledger written for a DIFFERENT finding — the ordinary case on a
+# multi-round PR, where earlier rounds are recorded and the live one is
+# not — resolve an unread finding. That is the #990 failure with a
+# different proxy, so each conjunct of the row predicate needs its own
+# negative.
+#
+# One ledger, three non-qualifying rows, each targeting one conjunct:
+#   99999 / test/repo  / "+1"  → right repo, right verdict, WRONG finding
+#   99101 / other/repo / "+1"  → right finding+verdict, WRONG repo
+#   99101 / test/repo  / ""    → right finding+repo, NO verdict
+# Deleting any single conjunct from ledger_verdict_for_finding makes the
+# corresponding row qualify and resolves PRT_990B, so this one case is a
+# live assertion for all three.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 33: ledger rows for another finding, another repo, or no verdict are not evidence (#990)"
+
+T33_LEDGER="$SCRATCH/t33-codex-ledger.jsonl"
+{
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99999,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  jq -nc '{pr_number:778,repo:"other/repo",comment_id:99101,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"",
+           reaction:"",location:"pull_request_review_comment",action:"skipped",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+} > "$T33_LEDGER"
+
+set +e
+out=$(run_t990 "$SCRATCH/t33.log" "$(t990_threads "$T990_B_BARE")" \
+        CODEX_FEEDBACK_LEDGER="$T33_LEDGER")
+rc=$?
+set -e
+
+t33_resolved=$(resolved_threads "$SCRATCH/t33.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 3 ] \
+   && [ "$t33_resolved" = "PRT_990A " ] \
+   && grep -q 'SKIP (never dispositioned: addressed-elsewhere rests on file-level evidence only)' <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 1' <<<"$out" \
+   && ! grep -q 'verdict for finding' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: none of the three near-miss rows admitted; PRT_990B left unresolved"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a non-matching ledger row was accepted as finding-bound evidence (rc=$rc, resolved='$t33_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 34 (#990, Codex P2 round 1 of #998): the marker exclusion rejects
+# the GENERATED marker reply, not every reply that mentions one.
+#
+# Test 31 locks the exclusion itself. Its complement is that the
+# exclusion must not over-reach: a substantive agent reply whose text
+# quotes an earlier marker — the natural way to write "that tag is stale,
+# here is what actually happened" — is a real disposition of the finding,
+# and a substring test discarded the whole reply as if this script had
+# emitted it. The finding was then reported never-dispositioned and left
+# unresolved, which is #990's own failure mode running backwards: a read
+# finding treated as unread.
+#
+# post_tag_reply emits "[mergepath-resolve: $class] $rationale", so the
+# generated form is the marker at the START of the body. Anchoring there
+# separates the two cases exactly.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 34: a reply that mentions a marker mid-sentence is still disposition evidence (#998 r1)"
+
+T990_B_QUOTES_MARKER='[
+  {"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"nathanpayne-claude"},"body":"The [mergepath-resolve: deferred-to-followup] tag on this thread is stale — the backoff landed in c0ffee1.","databaseId":99104,"createdAt":"2026-01-02T00:00:00Z"}
+]'
+
+set +e
+out=$(run_t990 "$SCRATCH/t34.log" "$(t990_threads "$T990_B_QUOTES_MARKER")")
+rc=$?
+set -e
+
+t34_resolved=$(resolved_threads "$SCRATCH/t34.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] \
+   && [ "$t34_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'Skipped (never-dispositioned): 0' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: marker-quoting reply admitted; both threads resolved, exit 0"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a substantive reply was discarded because it mentions a marker (rc=$rc, resolved='$t34_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 35 (#1002): a malformed ledger line reads as "no evidence" (fail
+# closed, unchanged) but now WARNS naming the file, instead of looking
+# identical to "the ledger simply has no row for this finding".
+#
+# `jq -e -s` slurps the WHOLE file before the predicate runs, so one bad
+# line anywhere in an append-only, multi-writer JSONL log costs every row
+# in it, not just the malformed one. The ledger below carries one VALID
+# row for a different finding (99999, proving the file is otherwise
+# readable data, not just empty) plus one line that is not JSON at all.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 35: an unparseable ledger WARNs naming the file, instead of reading as silent no-evidence (#1002)"
+
+T35_LEDGER="$SCRATCH/t35-codex-ledger.jsonl"
+{
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99999,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  echo 'not a json line at all'
+} > "$T35_LEDGER"
+
+set +e
+out=$(run_t990 "$SCRATCH/t35.log" "$(t990_threads "$T990_B_BARE")" \
+        CODEX_FEEDBACK_LEDGER="$T35_LEDGER")
+rc=$?
+set -e
+
+t35_resolved=$(resolved_threads "$SCRATCH/t35.log" | sort -u | tr '\n' ' ' || true)
+if [ "$rc" -eq 3 ] \
+   && [ -z "$t35_resolved" ] \
+   && grep -qF "WARN: ledger $T35_LEDGER could not be parsed" <<<"$out" \
+   && grep -q 'Skipped (never-dispositioned): 2' <<<"$out" \
+   && ! grep -q 'verdict for finding' <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: malformed ledger fails closed AND warns naming the file"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: malformed ledger did not warn or did not fail closed correctly (rc=$rc, resolved='$t35_resolved')" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# Test 36 (#1002, Codex P2 on #1110): the malformed-ledger WARN must
+# survive thread_is_actioned, not just the direct finding_dispositioned
+# call path Test 35 exercises. --resolve-actioned calls
+# finding_dispositioned directly; --auto-resolve-bots and
+# --resolve-verified-propagation route through thread_is_actioned, whose
+# `finding_dispositioned "$tj" >/dev/null 2>&1` discarded stderr along
+# with the stdout evidence description it has no use for — silently
+# downgrading the diagnostic to invisible on exactly those two paths.
+# Exercises --auto-resolve-bots, modeled on Test 32's invocation, with a
+# malformed ledger for the thread's finding id. The blunt --auto-
+# resolve-bots contract is unchanged (still resolves; Test 32 already
+# locks that), so this only needs to add the WARN assertion.
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "Test 36: the malformed-ledger WARN survives thread_is_actioned (--auto-resolve-bots), not only finding_dispositioned direct callers (#1002)"
+
+THREADS_T36='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_36","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"wireframes/app.md","body":"P1: the retry loop has no backoff","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"body":"P1: the retry loop has no backoff","databaseId":99301,"createdAt":"2026-01-01T00:00:00Z"}]}
+  }
+]}}}}}'
+
+T36_LEDGER="$SCRATCH/t36-codex-ledger.jsonl"
+{
+  jq -nc '{pr_number:778,repo:"test/repo",comment_id:99999,priority:"P1",verdict:"+1",
+           reaction:"+1",location:"pull_request_review_comment",action:"posted",
+           reviewer_identity:"nathanpayne-claude",reason:null,
+           recorded_at:"2026-01-04T00:00:00Z"}'
+  echo 'not a json line at all'
+} > "$T36_LEDGER"
+
+GH_ARGV_LOG="$SCRATCH/t36.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$THREADS_T36" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  CODEX_FEEDBACK_LEDGER="$T36_LEDGER" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --auto-resolve-bots 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" -eq 0 ] \
+   && grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+   && grep -qF "WARN: ledger $T36_LEDGER could not be parsed" <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: --auto-resolve-bots still resolves AND surfaces the malformed-ledger WARN"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: thread_is_actioned still swallows the malformed-ledger WARN (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+fi
+
+# #1010: deferral must not become actioned through an older fixed row or
+# a prose reply. Only a later superseding fix restores that evidence.
+T1010_LEDGER="$SCRATCH/t1010-coderabbit-ledger.jsonl"
+T1010_REPLIED=$(printf '%s' "$T990_B_BARE" | jq '. + [{author:{login:"nathanpayne-claude"},body:"Tracked in test/repo#42; intentionally deferred from this PR.",databaseId:99103,createdAt:"2026-01-02T00:00:00Z"}]')
+T1010_COMMITS_SAVE="$COMMITS_T990"
+for variant in legacy-bare legacy-replied legacy-fixed bare replied same-second fixed fixed-equal reraised-fixed reraised-equal reraised-fixed-equal tied-fixed tied-deferred tied-unhandled skew-deferred skew-fixed incomplete incomplete-replied incomplete-restored; do
+  COMMITS_T990="$T1010_COMMITS_SAVE"
+  cat > "$T1010_LEDGER" <<'JSON'
+{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-02T00:00:00Z"}
+{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-04T00:00:00Z"}
+JSON
+  case "$variant" in legacy-*)
+    jq -c 'if .disposition == "deferred-to-followup" then .disposition = "deferred-to-follow-up" else . end' "$T1010_LEDGER" > "$T1010_LEDGER.tmp"
+    mv "$T1010_LEDGER.tmp" "$T1010_LEDGER" ;;
+  esac
+  comments="$T990_B_BARE"; expected_rc=3; expected_resolved="PRT_990A "
+  if [ "$variant" = replied ] || [ "$variant" = same-second ] || [ "$variant" = legacy-replied ]; then comments="$T1010_REPLIED"; fi
+  if [ "$variant" = same-second ]; then
+    printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-01T00:00:00Z"}' >> "$T1010_LEDGER"
+  fi
+  if [ "$variant" = fixed ] || [ "$variant" = legacy-fixed ]; then
+    printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+    expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+  fi
+  if [ "$variant" = fixed-equal ]; then
+    jq -nc '{repo:"test/repo",comment_id:99101,verdict:"deferred",disposition:"deferred-to-followup",recorded_at:"2026-01-01T00:00:00Z"}' > "$T1010_LEDGER"
+    jq -nc '{repo:"test/repo",comment_id:99101,verdict:"fixed",disposition:"fixed",recorded_at:"2026-01-01T00:00:00Z"}' >> "$T1010_LEDGER"
+    expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+  fi
+  if [ "$variant" = reraised-fixed ] || [ "$variant" = reraised-equal ] || [ "$variant" = reraised-fixed-equal ]; then
+    comments="$T990_B_RERAISED"; expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+    COMMITS_T990='[{"sha":"c0ffee1234","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]'
+    deferred_at=2026-01-06T00:00:00Z
+    [ "$variant" != reraised-equal ] || deferred_at=2026-01-05T00:00:00Z
+    printf '{"repo":"test/repo","comment_id":99101,"disposition":"deferred-to-followup","recorded_at":"%s"}\n' "$deferred_at" >> "$T1010_LEDGER"
+    fixed_at=2026-01-06T00:00:00Z
+    if [ "$variant" = reraised-fixed-equal ]; then
+      fixed_at=2026-01-05T00:00:00Z
+      printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+    fi
+    printf '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"%s"}\n' "$fixed_at" >> "$T1010_LEDGER"
+  fi
+  case "$variant" in
+    incomplete*)
+      # A parseable partial row must not hide the preceding deferral and
+      # resurrect an older fixed verdict, even with an agent reply.
+      printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed"}' >> "$T1010_LEDGER"
+      if [ "$variant" = incomplete-replied ]; then comments="$T1010_REPLIED"; fi
+      if [ "$variant" = incomplete-restored ]; then
+        printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+        expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+      fi
+      ;;
+    skew-*)
+      # Matching the selected finding ID proves the recorder observed it,
+      # even when its local clock lags GitHub by a second.
+      jq -nc '{repo:"test/repo",comment_id:99101,verdict:"deferred",disposition:"deferred-to-followup",recorded_at:"2025-12-31T23:59:59Z"}' > "$T1010_LEDGER"
+      if [ "$variant" = skew-deferred ]; then
+        comments="$T1010_REPLIED"
+      else
+        jq -nc '{repo:"test/repo",comment_id:99101,verdict:"fixed",disposition:"fixed",recorded_at:"2025-12-31T23:59:59Z"}' >> "$T1010_LEDGER"
+        expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+      fi
+      ;;
+    tied-*)
+      comments=$(printf '%s' "$T990_B_RERAISED" | jq 'map(.createdAt = "2026-01-01T00:00:00Z")')
+      if [ "$variant" = tied-fixed ]; then
+        printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"fixed","disposition":"fixed","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+        expected_rc=0; expected_resolved="PRT_990A PRT_990B "
+      else
+        # An older fixed finding must not clear a newer deferral or an
+        # undispositioned re-raise in the same timestamp second.
+        jq -nc '{repo:"test/repo",comment_id:99101,verdict:"fixed",disposition:"fixed",recorded_at:"2026-01-05T00:00:00Z"}' > "$T1010_LEDGER"
+        if [ "$variant" = tied-deferred ]; then
+          printf '%s\n' '{"repo":"test/repo","comment_id":99102,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-05T00:00:00Z"}' >> "$T1010_LEDGER"
+        fi
+      fi
+      ;;
+  esac
+  set +e
+  out=$(run_t990 "$SCRATCH/t1010-$variant.log" "$(t990_threads "$comments")" CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER")
+  rc=$?
+  set -e
+  actual_resolved=$(resolved_threads "$SCRATCH/t1010-$variant.log" | sort -u | tr '\n' ' ')
+  if [ "$rc" -eq "$expected_rc" ] && [ "$actual_resolved" = "$expected_resolved" ]; then
+    pass=$((pass + 1)); echo "  PASS: #1010 latest deferred/fixed disposition governs $variant evidence"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #1010 $variant rc=$rc resolved='$actual_resolved'" >&2
+    echo "$out" >&2
+  fi
+done
+
+COMMITS_T990="$T1010_COMMITS_SAVE"
+
+# The explicit deferral path must keep the truthful class rather than
+# upgrading it to addressed-elsewhere through the older row/reply.
+printf '%s\n' '{"repo":"test/repo","comment_id":99101,"verdict":"deferred","disposition":"deferred-to-followup","recorded_at":"2026-01-06T00:00:00Z"}' >> "$T1010_LEDGER"
+GH_ARGV_LOG="$SCRATCH/t1010-defer.log"; : > "$GH_ARGV_LOG"
+make_gh_stub "$SCRATCH/gh-real" "$(t990_threads "$T1010_REPLIED")" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER" \
+  bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo \
+    --auto-resolve-bots --rationale 'Tracked in test/repo#42; deferred from this PR.' 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "  PASS: #1010 explicit deferral retains deferred-to-followup tag"
+else
+  fail=$((fail + 1)); echo "  FAIL: #1010 deferral tag was lost (rc=$rc)" >&2; echo "$out" >&2
+fi
+
+# A partial append cannot erase a previously explicit current deferral,
+# including when the thread carries a substantive agent reply.
+printf '%s\n' '{"partial"' >> "$T1010_LEDGER"
+set +e
+out=$(run_t990 "$SCRATCH/t1010-malformed.log" "$(t990_threads "$T1010_REPLIED")" CODERABBIT_FEEDBACK_LEDGER="$T1010_LEDGER")
+rc=$?
+set -e
+malformed_resolved=$(resolved_threads "$SCRATCH/t1010-malformed.log" | tr '\n' ' ' || true)
+if [ "$rc" -eq 3 ] && [ -z "$malformed_resolved" ] \
+  && grep -qF "WARN: ledger $T1010_LEDGER could not be parsed" <<<"$out"; then
+  pass=$((pass + 1)); echo "  PASS: #1010 partial ledger append holds actioned replies and preserves deferral"
+else
+  fail=$((fail + 1)); echo "  FAIL: #1010 malformed ledger erased a deferral (rc=$rc)" >&2; echo "$out" >&2
+fi
+
+
+# #2196: explicit single-thread disposition must survive conflicting file
+# proxies, leave its neighbor alone, and retain all write/readback guards.
+TARGET_THREADS=$(jq -c '
+  .data.repository.pullRequest.reviewThreads.nodes[0].commentsFirst.nodes[0].databaseId=1001
+  | .data.repository.pullRequest.reviewThreads.nodes[0].commentsLast.nodes[0].commit.oid="OLDHEAD"
+  | .data.repository.pullRequest.reviewThreads.nodes += [
+      (.data.repository.pullRequest.reviewThreads.nodes[0] | .id="PRT_OTHER"
+       | .commentsFirst.nodes[0].databaseId=2001)]
+  | .data.repository.pullRequest.reviewThreads.totalCount=2
+' <<<"$THREADS_T1")
+for scenario in deferred-touched deferred-alias missing-alias-issue invalid-alias-issue fixed-cross-file rebuttal node-selector missing-issue invalid-issue invalid-commit unknown-selector ambiguous-selector human agent tag-failure tag-stdout-failure tag-stderr-failure tag-warning tag-null readback-failure dry-run bulk-conflict list-conflict no-tag orphan already-resolved; do
+  fixture="$TARGET_THREADS"
+  args=(--thread 1001 --disposition fixed --commit abc1234567)
+  expected_tag=addressed-elsewhere
+  expected_rc=0
+  case "$scenario" in
+    deferred-touched) args=(--thread 1001 --disposition deferred-to-followup --issue 2196); expected_tag=deferred-to-followup ;;
+    deferred-alias) args=(--thread 1001 --disposition deferred-to-follow-up --issue 2196); expected_tag=deferred-to-followup ;;
+    missing-alias-issue) args=(--thread 1001 --disposition deferred-to-follow-up); expected_rc=1 ;;
+    invalid-alias-issue) args=(--thread 1001 --disposition deferred-to-follow-up --issue 0); expected_rc=1 ;;
+    fixed-cross-file) args+=(--rationale 'Fixed the shared caller in another file.') ;;
+    rebuttal) args=(--thread 1001 --disposition rebuttal --rationale 'The finding assumes an input this interface cannot accept.'); expected_tag=rebuttal-recorded ;;
+    node-selector) args=(--thread PRT_1 --disposition addressed-elsewhere) ;;
+    missing-issue) args=(--thread 1001 --disposition deferred-to-followup); expected_rc=1 ;;
+    invalid-issue) args=(--thread 1001 --disposition deferred-to-followup --issue abc); expected_rc=1 ;;
+    invalid-commit) args=(--thread 1001 --disposition fixed --commit bogus); expected_rc=1 ;;
+    unknown-selector) args=(--thread 9999 --disposition fixed); expected_rc=1 ;;
+    ambiguous-selector) fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[1].commentsFirst.nodes[0].databaseId=1001' <<<"$fixture"); expected_rc=1 ;;
+    human|agent) login=real-human; [ "$scenario" = agent ] && login=nathanpayne-claude
+      fixture=$(jq -c --arg login "$login" '.data.repository.pullRequest.reviewThreads.nodes[0].commentsFirst.nodes[0].author.login=$login' <<<"$fixture"); expected_rc=3 ;;
+    tag-failure|tag-stdout-failure|tag-stderr-failure|tag-null|readback-failure) expected_rc=2 ;;
+    dry-run) expected_rc=3; args+=(--dry-run) ;;
+    bulk-conflict) args+=(--auto-resolve-bots); expected_rc=1 ;;
+    list-conflict) args+=(--list); expected_rc=1 ;;
+    no-tag) args+=(--no-tag-reply); expected_rc=1 ;;
+    orphan) args=(--disposition fixed); expected_rc=1 ;;
+    already-resolved) fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[0].isResolved=true' <<<"$fixture") ;;
+  esac
+  GH_ARGV_LOG="$SCRATCH/target-$scenario.log"; : > "$GH_ARGV_LOG"
+  commit_map='{"abc1234567":["scripts/bar.sh"]}'
+  [ "$scenario" != deferred-touched ] || commit_map='{"abc1234567":["scripts/foo.sh"]}'
+  make_gh_stub "$SCRATCH/gh-real" "$fixture" "$FILES_T1" "$COMMITS_T1" "$commit_map"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  mkdir -p "$SCRATCH/target-tag-tmp"
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" GH_STUB_TAG_FAIL="$scenario" \
+    TMPDIR="$SCRATCH/target-tag-tmp" \
+    GH_STUB_READBACK_UNRESOLVED="$([ "$scenario" = readback-failure ] && echo PRT_1)" \
+    PATH="$SCRATCH:$PATH" env -u GH_TOKEN -u OP_PREFLIGHT_REVIEWER_PAT \
+    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo "${args[@]}" 2>&1)
+  rc=$?
+  set -e
+  ok=true
+  [ "$rc" -eq "$expected_rc" ] || ok=false
+  if compgen -G "$SCRATCH/target-tag-tmp/resolve-pr-thread-tag-stderr.*" >/dev/null; then ok=false; fi
+  if [ "$scenario" = tag-warning ] && ! grep -Fq 'gh diagnostic warning' <<<"$out"; then ok=false; fi
+  if [ "$expected_rc" -eq 0 ] && [ "$scenario" != already-resolved ]; then
+    tag_before_resolve "$GH_ARGV_LOG" || ok=false
+    grep -q "FIELD: body=\[mergepath-resolve: $expected_tag\]" "$GH_ARGV_LOG" || ok=false
+    grep -q 'FIELD: id=PRT_1' "$GH_ARGV_LOG" || ok=false
+    if grep -q 'FIELD: id=PRT_OTHER' "$GH_ARGV_LOG"; then ok=false; fi
+    if [ "$scenario" = deferred-touched ]; then grep -q '#2196' "$GH_ARGV_LOG" || ok=false; fi
+    if [ "$scenario" = fixed-cross-file ]; then grep -q 'abc1234567' "$GH_ARGV_LOG" || ok=false; fi
+  elif [ "$scenario" != readback-failure ]; then
+    if grep -q 'resolveReviewThread' "$GH_ARGV_LOG"; then ok=false; fi
+    case "$scenario" in
+      tag-failure|tag-stdout-failure|tag-stderr-failure|tag-null) ;; # The marker attempt fails before resolution.
+      *) if grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG"; then ok=false; fi ;;
+    esac
+  fi
+  if $ok; then
+    pass=$((pass+1)); echo "  PASS: #2196 targeted $scenario"
+  else
+    fail=$((fail+1)); echo "  FAIL: #2196 targeted $scenario (rc=$rc expected=$expected_rc)" >&2; echo "$out" >&2
+  fi
+done
+
+# ─────────────────────────────────────────────────────────────────────
+# #2555 (and #1610): a fix that lands in a file other than the anchored one
+# cannot satisfy step 2 (addressed-elsewhere needs an agent commit touching
+# thread.path), and step 3 then recorded the agent's "Fixed in <sha>" reply
+# as rebuttal-recorded: a wrong disposition of record for the thread, the
+# daily rollup and the Codex review ledger. A reply that leads with "Fixed"
+# is a fix claim, not a rebuttal, so without an agent commit touching the
+# anchored file it now proves nothing: the resolver warns, names the explicit
+# single-thread mode that records a cross-file fix (--thread <id>
+# --disposition fixed, #2196), and leaves the thread for it. A commit that
+# touches the anchored file still records addressed-elsewhere, and a later
+# reply that does not lead with "Fixed" still records rebuttal-recorded.
+# ─────────────────────────────────────────────────────────────────────
+
+# t2555_threads <agent-reply> [<later-agent-reply>]: one unresolved Codex
+# thread on specs/hostnames-lookup.md, raised 2026-01-01, with the agent
+# reply (and optionally a second, later one) after it.
+t2555_threads() {
+  local reply="$1" later=""
+  if [ -n "${2:-}" ]; then
+    later=',{"author":{"login":"nathanjohnpayne"},"body":"'"$2"'","databaseId":25560,"createdAt":"2026-01-07T00:00:00Z"}'
+  fi
+  printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_2555","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"chatgpt-codex-connector"},"path":"specs/hostnames-lookup.md","body":"![P2 Badge] The glossary in CONTEXT.md conflicts with this definition.","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"chatgpt-codex-connector"},"body":"![P2 Badge] The glossary in CONTEXT.md conflicts with this definition.","databaseId":25551,"createdAt":"2026-01-01T00:00:00Z"},
+     {"author":{"login":"nathanjohnpayne"},"body":"'"$reply"'","databaseId":25559,"createdAt":"2026-01-06T00:00:00Z"}'"$later"'
+   ]}
+  }
+]}}}}}'
+}
+
+# t2555_run <argv-log> <threads-json> <commit-files-map> <mode-args...>
+# → sets out and rc. The PR touches the anchored spec and CONTEXT.md and
+# carries one agent commit, a4c3e4ca, authored after the finding.
+t2555_run() {
+  GH_ARGV_LOG="$1"; : > "$GH_ARGV_LOG"
+  local threads="$2" files_map="$3"
+  shift 3
+  make_gh_stub "$SCRATCH/gh-real" "$threads" '["specs/hostnames-lookup.md","CONTEXT.md"]' \
+    '[{"sha":"a4c3e4ca0123456789abcdef0123456789abcdef","login":"nathanjohnpayne","date":"2026-01-02T00:00:00Z"}]' "$files_map"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(
+    GH_ARGV_LOG="$GH_ARGV_LOG" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" \
+    env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN \
+    bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "$@" 2>&1
+  )
+  rc=$?
+  set -e
+}
+CROSS_FILE_FIX='{"a4c3e4ca0123456789abcdef0123456789abcdef":["CONTEXT.md"]}'
+ANCHORED_FIX='{"a4c3e4ca0123456789abcdef0123456789abcdef":["specs/hostnames-lookup.md"]}'
+T2555_WARN="WARN: .*leads with 'Fixed'.*--thread <id> --disposition fixed.*#2555"
+
+echo
+echo "Test 2555-A: a 'Fixed' reply with the fix in another file is not recorded as a rebuttal"
+for reply in \
+  'Fixed in a4c3e4ca (head ab17bfa2). Disposition: required; the glossary entry now lives in CONTEXT.md.' \
+  '  fixed by moving the glossary entry to CONTEXT.md in a4c3e4ca; nothing else changed here.' \
+  'FIXED in a4c3e4ca (head ab17bfa2); the glossary entry now lives in CONTEXT.md.' \
+  '**Fixed** in a4c3e4ca; the glossary entry now lives in CONTEXT.md.' \
+  '_Fixed_: the glossary entry now lives in CONTEXT.md, see a4c3e4ca on this PR.' \
+  'Fixed: the glossary entry now lives in CONTEXT.md, see a4c3e4ca on this PR.'; do
+  t2555_run "$SCRATCH/t2555a.log" "$(t2555_threads "$reply")" "$CROSS_FILE_FIX" --resolve-actioned
+  if [ "$rc" -eq 3 ] \
+     && ! grep -q 'addPullRequestReviewThreadReply' "$GH_ARGV_LOG" \
+     && ! grep -q 'resolveReviewThread' "$GH_ARGV_LOG" \
+     && grep -q 'SKIP (not demonstrably actioned' <<<"$out" \
+     && grep -q "$T2555_WARN" <<<"$out"; then
+    pass=$((pass + 1)); echo "  PASS: --resolve-actioned leaves it unresolved and names the explicit fixed mode: ${reply:0:40}..."
+  else
+    fail=$((fail + 1)); echo "  FAIL: cross-file 'Fixed' reply under --resolve-actioned (rc=$rc): ${reply:0:40}..." >&2
+    echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+    echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+  fi
+done
+# --auto-resolve-bots resolves on the operator's instruction, but the recorded
+# class is the honest fallback the rollup re-surfaces, never a rebuttal.
+t2555_run "$SCRATCH/t2555a2.log" \
+  "$(t2555_threads 'Fixed in a4c3e4ca (head ab17bfa2). Disposition: required; the glossary entry now lives in CONTEXT.md.')" \
+  "$CROSS_FILE_FIX" --auto-resolve-bots
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: deferred-to-followup\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG" \
+   && grep -q "$T2555_WARN" <<<"$out"; then
+  pass=$((pass + 1)); echo "  PASS: --auto-resolve-bots records deferred-to-followup, not a rebuttal, and warns"
+else
+  fail=$((fail + 1)); echo "  FAIL: cross-file 'Fixed' reply under --auto-resolve-bots (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+echo
+echo "Test 2555-B: a 'Fixed' reply whose commit touches the anchored file still records addressed-elsewhere"
+t2555_run "$SCRATCH/t2555b.log" \
+  "$(t2555_threads 'Fixed in a4c3e4ca (head ab17bfa2); the definition on this line now matches the glossary.')" \
+  "$ANCHORED_FIX" --resolve-actioned
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\] addressed by commit a4c3e4c' "$GH_ARGV_LOG" \
+   && ! grep -q "$T2555_WARN" <<<"$out"; then
+  pass=$((pass + 1)); echo "  PASS: anchored-file fix keeps addressed-elsewhere with no warning"
+else
+  fail=$((fail + 1)); echo "  FAIL: anchored-file 'Fixed' reply (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+echo
+echo "Test 2555-C: a later genuine rebuttal after a 'Fixed' reply still records rebuttal-recorded"
+t2555_run "$SCRATCH/t2555c.log" \
+  "$(t2555_threads 'Fixed in a4c3e4ca (head ab17bfa2); the glossary entry now lives in CONTEXT.md.' 'Disagree with the remaining point: the spec definition is canonical and CONTEXT.md defers to it.')" \
+  "$CROSS_FILE_FIX" --resolve-actioned
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG" \
+   && ! grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "  PASS: the scan continues past the 'Fixed' reply to the rebuttal"
+else
+  fail=$((fail + 1)); echo "  FAIL: 'Fixed' reply followed by a rebuttal (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+echo
+echo "Test 2555-D: the explicit mode the warning names records the cross-file fix"
+t2555_run "$SCRATCH/t2555d.log" \
+  "$(t2555_threads 'Fixed in a4c3e4ca (head ab17bfa2). Disposition: required; the glossary entry now lives in CONTEXT.md.')" \
+  "$CROSS_FILE_FIX" --thread PRT_2555 --disposition fixed --commit a4c3e4ca0123456789abcdef0123456789abcdef \
+  --rationale 'the glossary entry now lives in CONTEXT.md'
+if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+   && grep -q 'FIELD: body=\[mergepath-resolve: addressed-elsewhere\]' "$GH_ARGV_LOG" \
+   && grep -q 'a4c3e4ca' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1)); echo "  PASS: --thread --disposition fixed tags addressed-elsewhere citing the commit"
+else
+  fail=$((fail + 1)); echo "  FAIL: explicit fixed disposition on the cross-file thread (rc=$rc)" >&2
+  echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+  echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+fi
+
+echo
+echo "Test 2555-E: a rebuttal that merely begins with the letters of 'Fixed' is still a rebuttal (Codex P2 on #2599)"
+for reply in \
+  'Fixed-width inputs cannot reach this branch; the finding does not apply to this spec line.' \
+  'Fixedly anchored definitions are the point of this spec; the glossary defers to it, no change.' \
+  '`fixed_width` inputs cannot reach this branch; the finding does not apply here.' \
+  'fixed_width inputs cannot reach this branch; the finding does not apply here.'; do
+  t2555_run "$SCRATCH/t2555e.log" "$(t2555_threads "$reply")" "$CROSS_FILE_FIX" --resolve-actioned
+  if [ "$rc" -eq 0 ] && tag_before_resolve "$GH_ARGV_LOG" \
+     && grep -q 'FIELD: body=\[mergepath-resolve: rebuttal-recorded\]' "$GH_ARGV_LOG" \
+     && ! grep -q "$T2555_WARN" <<<"$out"; then
+    pass=$((pass + 1)); echo "  PASS: not a fix claim, recorded as a rebuttal with no warning: ${reply:0:30}..."
+  else
+    fail=$((fail + 1)); echo "  FAIL: '${reply:0:30}...' was treated as a fix claim (rc=$rc)" >&2
+    echo "    script output:" >&2; echo "$out" | sed 's/^/      /' >&2
+    echo "    captured argv (tail):" >&2; tail -20 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+  fi
+done
+
+
+# #1001: disposition polarity must survive an incidental anchored-file touch.
+# These are real CLI probes against the existing fake-gh mutation/readback net.
+for scenario in defer long-defer deferring deferred follow-up tracked-local tracked-cross wontfix structured-defer defer-auto rebuttal-reply structured-rebuttal negative canonical-negative positive canonical-positive negative-then-positive positive-then-negative unknown unknown-after-positive malformed stale-negative wrong-repo reraised-negative reraised-positive defer-then-fixed fixed-then-defer rebuttal-then-fixed unproven-later-fixed unknown-prose unknown-prefix explicit-fixed-negative human stale-head; do
+  reply=""; later_reply=""; verdict=""; disposition=""; mode=(--resolve-actioned)
+  expected_tag=addressed-elsewhere; expected_rc=0
+  comments=$(jq -nc '[{author:{login:"coderabbitai"},body:"Finding on the anchored file",databaseId:1001,createdAt:"2026-01-01T00:00:00Z"}]')
+  case "$scenario" in
+    defer|defer-auto) reply='Defer this to #997; it is not fixed in this PR.'; expected_tag=deferred-to-followup ;;
+    long-defer) printf -v padding '%60000s' x; reply="Deferring this to #997, not fixing here. $padding"; expected_tag=deferred-to-followup ;;
+    deferring) reply='Deferring this to #997, not fixing here.'; expected_tag=deferred-to-followup ;;
+    deferred) reply='Deferred to #997; no implementation change here.'; expected_tag=deferred-to-followup ;;
+    follow-up) reply='Follow-up: #997 owns this change after the present PR.'; expected_tag=deferred-to-followup ;;
+    tracked-local) reply='Tracked in #997; intentionally left for that follow-up.'; expected_tag=deferred-to-followup ;;
+    tracked-cross) reply='Tracked in test/repo#997; intentionally deferred.'; expected_tag=deferred-to-followup ;;
+    wontfix) reply='Wontfix: deferred to the explicitly tracked follow-up.'; expected_tag=deferred-to-followup ;;
+    structured-defer) reply='Disposition: deferred-to-follow-up; tracked in #997.'; expected_tag=deferred-to-followup ;;
+    rebuttal-reply) reply='Rebuttal: this requirement is already covered; no change is needed here.'; expected_tag=rebuttal-recorded ;;
+    structured-rebuttal) reply='Disposition: rebutted; the existing boundary already covers this case.'; expected_tag=rebuttal-recorded ;;
+    negative|explicit-fixed-negative) verdict=-1; expected_tag=rebuttal-recorded ;;
+    canonical-negative) verdict=false-positive; disposition=rebutted; expected_tag=rebuttal-recorded ;;
+    positive) verdict=+1 ;;
+    canonical-positive) verdict=useful; disposition=fixed ;;
+    negative-then-positive) verdict=-1 ;;
+    positive-then-negative) verdict=+1; expected_tag=rebuttal-recorded ;;
+    unknown|unknown-after-positive) verdict=maybe; expected_rc=3; expected_tag="" ;;
+    malformed) verdict=+1; expected_rc=3; expected_tag="" ;;
+    stale-negative|wrong-repo) verdict=-1; reply='Fixed in abc1234.' ;;
+    reraised-negative) verdict=-1; expected_rc=3; expected_tag="" ;;
+    reraised-positive) verdict=-1 ;;
+    defer-then-fixed) reply='Deferred to #997; not fixed in this PR.'; later_reply='Fixed in abc1234.' ;;
+    fixed-then-defer) reply='Fixed in abc1234.'; later_reply='Deferring this to #997, not fixing here.'; expected_tag=deferred-to-followup ;;
+    rebuttal-then-fixed|unproven-later-fixed) reply='Disagree with the requirement; no CI check is needed here.'; later_reply='Fixed in abc1234.' ;;
+    unknown-prose) reply='The quoted example contains the word defer but is ordinary explanatory prose.' ;;
+    unknown-prefix) reply='Deferredness is a category label and does not match the finite leading vocabulary.' ;;
+    human|stale-head) verdict=+1; expected_rc=3; expected_tag="" ;;
+  esac
+  case "$scenario" in
+    defer|long-defer|deferring|deferred|follow-up|tracked-local|tracked-cross|wontfix|structured-defer|fixed-then-defer) expected_rc=3; expected_tag="" ;;
+    defer-auto|stale-head) mode=(--auto-resolve-bots) ;;
+    explicit-fixed-negative) mode=(--thread PRT_1001 --disposition fixed); expected_tag=addressed-elsewhere ;;
+    unproven-later-fixed) expected_rc=3; expected_tag="" ;;
+  esac
+  if [ -n "$reply" ]; then comments=$(jq -c --arg b "$reply" '. + [{author:{login:"nathanpayne-claude"},body:$b,databaseId:1002,createdAt:"2026-01-02T00:00:00Z"}]' <<<"$comments"); fi
+  if [ -n "$later_reply" ]; then comments=$(jq -c --arg b "$later_reply" '. + [{author:{login:"nathanpayne-claude"},body:$b,databaseId:1004,createdAt:"2026-01-04T00:00:00Z"}]' <<<"$comments"); fi
+  case "$scenario" in
+    reraised-negative|reraised-positive)
+      comments=$(jq -c '. + [{author:{login:"coderabbitai"},body:"Finding re-raised",databaseId:1003,createdAt:"2026-01-04T00:00:00Z"}]' <<<"$comments") ;;
+  esac
+  fixture=$(jq -nc --argjson c "$comments" '{data:{repository:{pullRequest:{reviewThreads:{totalCount:1,pageInfo:{hasNextPage:false,endCursor:null},nodes:[{id:"PRT_1001",isResolved:false,isOutdated:false,commentsFirst:{nodes:[{author:{login:"coderabbitai"},path:"scripts/foo.sh",body:"Finding on the anchored file",databaseId:1001,createdAt:"2026-01-01T00:00:00Z"}]},commentsLast:{nodes:[{commit:{oid:"HEADCURRENT"}}]},allComments:{nodes:$c}}]}}}}}')
+  [ "$scenario" != stale-head ] || fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[0].commentsLast.nodes[0].commit.oid="OLDHEAD"' <<<"$fixture")
+  [ "$scenario" != human ] || fixture=$(jq -c '.data.repository.pullRequest.reviewThreads.nodes[0] |= (.commentsFirst.nodes[0].author.login="real-human" | .allComments.nodes[0].author.login="real-human")' <<<"$fixture")
+  ledger="$SCRATCH/t1001-$scenario.jsonl"; : > "$ledger"
+  if [ "$scenario" = unknown-after-positive ]; then jq -nc '{repo:"test/repo",comment_id:1001,verdict:"+1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger"; fi
+  if [ -n "$verdict" ]; then
+    jq -nc --arg v "$verdict" --arg d "$disposition" '{repo:"test/repo",comment_id:1001,verdict:$v,recorded_at:"2026-01-02T00:00:00Z"} + (if $d=="" then {} else {disposition:$d} end)' >> "$ledger"
+  fi
+  case "$scenario" in
+    negative-then-positive) jq -nc '{repo:"test/repo",comment_id:1001,verdict:"+1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger" ;;
+    positive-then-negative) jq -nc '{repo:"test/repo",comment_id:1001,verdict:"-1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger" ;;
+    stale-negative) jq -c '.comment_id=999' "$ledger" > "$ledger.tmp"; mv "$ledger.tmp" "$ledger" ;;
+    wrong-repo) jq -c '.repo="other/repo"' "$ledger" > "$ledger.tmp"; mv "$ledger.tmp" "$ledger" ;;
+    reraised-positive) jq -nc '{repo:"test/repo",comment_id:1003,verdict:"+1",recorded_at:"2020-01-01T00:00:00Z"}' >> "$ledger" ;;
+    malformed) printf '%s\n' 'not JSON' >> "$ledger" ;;
+  esac
+  GH_ARGV_LOG="$SCRATCH/t1001-$scenario.log"; : > "$GH_ARGV_LOG"
+  files_map='{"abc1234567":["scripts/foo.sh"]}'
+  [ "$scenario" != unproven-later-fixed ] || files_map='{"abc1234567":["scripts/bar.sh"]}'
+  make_gh_stub "$SCRATCH/gh-real" "$fixture" '["scripts/foo.sh","scripts/bar.sh"]' '[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]' "$files_map"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" CODEX_FEEDBACK_LEDGER="$ledger" CODERABBIT_FEEDBACK_LEDGER="$SCRATCH/t1001-absent" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "${mode[@]}" 2>&1)
+  rc=$?
+  set -e
+  okay=true
+  [ "$rc" -eq "$expected_rc" ] || okay=false
+  if [ -n "$expected_tag" ]; then
+    grep -q "FIELD: body=\[mergepath-resolve: $expected_tag\]" "$GH_ARGV_LOG" || okay=false
+    tag_before_resolve "$GH_ARGV_LOG" || okay=false
+    if [ "$scenario" = negative ] && ! grep -q 'negative/rebutted verdict recorded' "$GH_ARGV_LOG"; then okay=false; fi
+  else
+    if grep -q 'addPullRequestReviewThreadReply\|resolveReviewThread' "$GH_ARGV_LOG"; then okay=false; fi
+  fi
+  if $okay; then
+    pass=$((pass+1)); echo "  PASS: #1001 $scenario preserves finding disposition polarity"
+  else
+    fail=$((fail+1)); echo "  FAIL: #1001 $scenario (rc=$rc expected=$expected_rc tag=$expected_tag)" >&2
+    printf '%s\n' "$out" >&2; tail -15 "$GH_ARGV_LOG" >&2
+  fi
+done
+
+# #1001: actual recorder row formats retain raw verdict aliases. Codex adds
+# reaction, without disposition; CodeRabbit adds disposition, without reaction.
+for scenario in writer-codex-fixed writer-codex-real writer-codex-useful writer-codex-+1 writer-codex-thumbsup writer-codex-thumbs-up writer-codex-up writer-codex-rebutted writer-codex-false-positive writer-codex-false_positive writer-codex-falsepositive writer-codex-not-useful writer-codex-not_useful writer-codex-notuseful writer-codex--1 writer-codex-thumbsdown writer-codex-thumbs-down writer-codex-down writer-codex-REAL writer-cr-fixed writer-cr-rebutted writer-cr-deferred writer-cr-tracked writer-cr-split writer-cr-deferred-to-followup writer-cr-deferred-to-follow-up writer-positive-reaction-conflict writer-negative-reaction-conflict writer-positive-signed-conflict writer-negative-signed-conflict writer-disposition-conflict writer-deferred-reaction-conflict writer-unknown-verdict writer-unknown-reaction writer-unknown-disposition writer-no-anchor writer-defer-after-positive writer-defer-auto; do
+  writer=codex; verdict=real; reaction=+1; disposition=""; expected_tag=addressed-elsewhere; expected_rc=0; mode=(--resolve-actioned)
+  case "$scenario" in
+    writer-codex-*)
+      verdict="${scenario#writer-codex-}"
+      case "$verdict" in rebutted|false-positive|false_positive|falsepositive|not-useful|not_useful|notuseful|-1|thumbsdown|thumbs-down|down) reaction=-1; expected_tag=rebuttal-recorded ;; esac ;;
+    writer-cr-*)
+      writer=coderabbit; reaction=""; verdict="${scenario#writer-cr-}"; disposition=fixed
+      case "$verdict" in
+        rebutted) disposition=rebutted; expected_tag=rebuttal-recorded ;;
+        deferred|tracked|split|deferred-to-followup|deferred-to-follow-up) disposition=deferred-to-followup; expected_rc=3; expected_tag="" ;;
+      esac ;;
+    writer-positive-reaction-conflict) reaction=-1; expected_rc=3; expected_tag="" ;;
+    writer-negative-reaction-conflict) verdict=false-positive; expected_rc=3; expected_tag="" ;;
+    writer-positive-signed-conflict) verdict=+1; reaction=-1; expected_rc=3; expected_tag="" ;;
+    writer-negative-signed-conflict) verdict=-1; expected_rc=3; expected_tag="" ;;
+    writer-disposition-conflict) writer=coderabbit; reaction=""; disposition=rebutted; expected_rc=3; expected_tag="" ;;
+    writer-deferred-reaction-conflict) verdict=deferred; disposition=deferred-to-followup; expected_rc=3; expected_tag="" ;;
+    writer-unknown-verdict) verdict=maybe; expected_rc=3; expected_tag="" ;;
+    writer-unknown-reaction) reaction=maybe; expected_rc=3; expected_tag="" ;;
+    writer-unknown-disposition) writer=coderabbit; reaction=""; disposition=maybe; expected_rc=3; expected_tag="" ;;
+    writer-no-anchor) expected_rc=3; expected_tag="" ;;
+    writer-defer-after-positive|writer-defer-auto)
+      writer=coderabbit; reaction=""; verdict=tracked; disposition=deferred-to-followup; expected_rc=3; expected_tag=""
+      if [ "$scenario" = writer-defer-auto ]; then mode=(--auto-resolve-bots); expected_rc=0; expected_tag=deferred-to-followup; fi ;;
+  esac
+  # Keep a valid on-thread Fixed reply so an incompatible/contradictory row
+  # cannot silently disappear behind otherwise valid fix evidence.
+  fixture='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"PRT_1001","isResolved":false,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Finding on the anchored file","databaseId":1001,"createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},"allComments":{"nodes":[{"author":{"login":"coderabbitai"},"body":"Finding on the anchored file","databaseId":1001,"createdAt":"2026-01-01T00:00:00Z"},{"author":{"login":"nathanpayne-claude"},"body":"Fixed in abc1234.","databaseId":1002,"createdAt":"2026-01-02T00:00:00Z"}]}}]}}}}}'
+  ledger="$SCRATCH/t1001-$scenario.jsonl"; : > "$ledger"
+  if [ "$scenario" = writer-defer-after-positive ]; then
+    jq -nc '{pr_number:99999,repo:"test/repo",comment_id:1001,verdict:"real",reaction:"+1",recorded_at:"2026-01-02T00:00:00Z"}' >> "$ledger"
+  fi
+  jq -nc --arg w "$writer" --arg v "$verdict" --arg r "$reaction" --arg d "$disposition" '
+    {repo:"test/repo",comment_id:1001,verdict:$v,reason:null,recorded_at:"2026-01-02T00:00:00Z"}
+    + (if $w=="codex" then {pr_number:99999,priority:"P2",reaction:$r,location:"pull_request_review_comment",action:"posted",reviewer_identity:"nathanpayne-claude"}
+       else {pr:99999,head_sha:"HEADCURRENT",path:"scripts/foo.sh",line:1,tier:"P2",disposition:$d,resolved:false,superseded_prior:false} end)
+    + (if $d!="" then {disposition:$d} else {} end)' >> "$ledger"
+  GH_ARGV_LOG="$SCRATCH/t1001-$scenario.log"; : > "$GH_ARGV_LOG"
+  files_map='{"abc1234567":["scripts/foo.sh"]}'
+  [ "$scenario" != writer-no-anchor ] || files_map='{"abc1234567":["scripts/bar.sh"]}'
+  make_gh_stub "$SCRATCH/gh-real" "$fixture" '["scripts/foo.sh","scripts/bar.sh"]' '[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-06T00:00:00Z"}]' "$files_map"
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  set +e
+  out=$(GH_ARGV_LOG="$GH_ARGV_LOG" CODEX_FEEDBACK_LEDGER="$ledger" CODERABBIT_FEEDBACK_LEDGER="$SCRATCH/t1001-absent" RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 PATH="$SCRATCH:$PATH" env -u OP_PREFLIGHT_REVIEWER_PAT -u GH_TOKEN bash "$FIXTURE_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "${mode[@]}" 2>&1)
+  rc=$?
+  set -e
+  okay=true
+  [ "$rc" -eq "$expected_rc" ] || okay=false
+  if [ -n "$expected_tag" ]; then
+    grep -q "FIELD: body=\[mergepath-resolve: $expected_tag\]" "$GH_ARGV_LOG" || okay=false
+    tag_before_resolve "$GH_ARGV_LOG" || okay=false
+  elif grep -q 'addPullRequestReviewThreadReply\|resolveReviewThread' "$GH_ARGV_LOG"; then okay=false
+  fi
+  case "$scenario" in
+    *conflict|writer-unknown-*) grep -q 'unusable newest row' <<<"$out" || okay=false ;;
+  esac
+  if $okay; then pass=$((pass+1)); echo "  PASS: #1001 $scenario preserves writer-compatible polarity"
+  else fail=$((fail+1)); echo "  FAIL: #1001 $scenario (rc=$rc expected=$expected_rc tag=$expected_tag)" >&2; printf '%s\n' "$out" >&2; tail -15 "$GH_ARGV_LOG" >&2
+  fi
+done
+
+# ─────────────────────────────────────────────────────────────────────
+# #2726: the bounded CI-app identity mode. Runs the REAL identity checker
+# (not the always-pass stub above) in its own fixture tree, so each case
+# proves what the resolver and the checker decide together: the reviewer
+# PAT path is unchanged, the ONE configured app resolves actioned threads
+# under --resolve-actioned --ci-app-identity, and nothing else reaches a
+# mutation with an app token.
+# ─────────────────────────────────────────────────────────────────────
+echo "Test #2726: CI-app identity mode for thread resolution"
+
+APP_ROOT="$SCRATCH/app-repo"
+mkdir -p "$APP_ROOT/scripts/lib" "$APP_ROOT/.github"
+cp "$SCRIPT" "$APP_ROOT/scripts/resolve-pr-threads.sh"
+cp "$ROOT/scripts/identity-check.sh" "$APP_ROOT/scripts/identity-check.sh"
+cp "$ROOT/scripts/lib/credential-class.sh" "$ROOT/scripts/lib/reviewers-helpers.sh" "$APP_ROOT/scripts/lib/"
+cp "$FIXTURE_ROOT/scripts/lib/preflight-helpers.sh" "$APP_ROOT/scripts/lib/"
+cp "$FIXTURE_ROOT/.mergepath-sync.yml" "$APP_ROOT/.mergepath-sync.yml"
+CI_APP='mergepath-ci[bot]'
+app_policy_2726() {  # configured | unconfigured | undeclared | shared
+  # undeclared: the app is configured but missing from non_reviewer_identities.
+  # shared: the configured value is a reviewing bot, coderabbitai[bot]. Both
+  # are invalid, so the resolver must read them as unconfigured.
+  {
+    printf 'available_reviewers:\n  - nathanpayne-claude\n  - nathanpayne-codex\n'
+    case "$1" in
+      undeclared) printf 'non_reviewer_identities:\n  - nathanpayne-robot\n' ;;
+      shared) printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - coderabbitai[bot]\n' ;;
+      *) printf 'non_reviewer_identities:\n  - nathanpayne-robot\n  - %s\n' "$CI_APP" ;;
+    esac
+    case "$1" in
+      configured|undeclared) printf 'thread_resolution_ci_app_identity: "%s"\n' "$CI_APP" ;;
+      shared) printf 'thread_resolution_ci_app_identity: "coderabbitai[bot]"\n' ;;
+    esac
+  } >"$APP_ROOT/.github/review-policy.yml"
+}
+
+# Not actioned: a bot finding with no agent reply and no fix commit.
+THREADS_2726_OPEN='{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"PRT_1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+   "allComments":{"nodes":[
+     {"author":{"login":"coderabbitai"},"body":"Some finding","databaseId":1001}
+   ]}
+  }
+]}}}}}'
+
+H2726=1111111111111111111111111111111111111111
+B2726=2222222222222222222222222222222222222222
+COMMITS_2726='[{"sha":"abc1234567","login":"nathanpayne-claude","date":"2026-01-02T00:00:00Z"},{"sha":"'"$H2726"'","login":"nathanpayne-claude","date":"2026-01-03T00:00:00Z"}]'
+
+# case_2726 <label> <expected rc> <expect: resolved|untouched|no-gh> <threads>
+#           <policy> <token> <extra env, space-free KEY=VALUE or -> <resolver args...>
+case_2726() {
+  local label="$1" want="$2" expect="$3" threads="$4" policy="$5" token="$6" extra="$7" out rc okay=true
+  shift 7
+  app_policy_2726 "$policy"
+  GH_ARGV_LOG="$SCRATCH/t2726.log"; : > "$GH_ARGV_LOG"
+  # --ci-app-identity implies --bind-head (#2727): serve one bound pair, and
+  # end the commit list at its head, as GitHub does for an open PR.
+  make_gh_stub "$SCRATCH/gh-real" "$threads" "$FILES_T1" "$COMMITS_2726" '{"abc1234567":["scripts/foo.sh"]}'
+  make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+  [ "$extra" != - ] || extra=
+  set +e
+  # shellcheck disable=SC2086  # $extra is one space-free KEY=VALUE or empty
+  out=$(env -u OP_PREFLIGHT_REVIEWER_PAT -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY -u OP_PREFLIGHT_AGENT \
+    -u RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK -u GH_HOST \
+    GH_ARGV_LOG="$GH_ARGV_LOG" GH_TOKEN="$token" STUB_VIEWER_LOGIN="${STUB_VIEWER_LOGIN_2726:-$CI_APP}" \
+    STUB_HEAD="$H2726" STUB_PAIR="$H2726 $B2726 main open" \
+    STUB_USER_LOGIN=nathanpayne-claude $extra PATH="$SCRATCH:$PATH" \
+    bash "$APP_ROOT/scripts/resolve-pr-threads.sh" 99999 --repo test/repo "$@" 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -eq "$want" ] || okay=false
+  case "$expect" in
+    resolved)
+      grep -q 'resolveReviewThread' "$GH_ARGV_LOG" || okay=false
+      tag_before_resolve "$GH_ARGV_LOG" || okay=false ;;
+    untouched)
+      ! grep -q 'addPullRequestReviewThreadReply\|resolveReviewThread' "$GH_ARGV_LOG" || okay=false ;;
+    no-gh)
+      [ ! -s "$GH_ARGV_LOG" ] || okay=false ;;
+  esac
+  if $okay; then
+    pass=$((pass + 1)); echo "  PASS: #2726 $label"
+  else
+    fail=$((fail + 1)); echo "  FAIL: #2726 $label (rc=$rc, expected $want, $expect)" >&2
+    echo "$out" | sed 's/^/      /' >&2; tail -10 "$GH_ARGV_LOG" | sed 's/^/      /' >&2
+  fi
+}
+
+# The reviewer-PAT path is unchanged, with or without the app configured.
+case_2726 "reviewer PAT resolves an actioned thread (app unconfigured)" 0 resolved "$THREADS_T1" unconfigured ghp_x - --resolve-actioned
+case_2726 "reviewer PAT resolves an actioned thread (app configured)" 0 resolved "$THREADS_T1" configured ghp_x - --resolve-actioned
+# The configured app resolves an actioned thread, in the one bounded mode.
+case_2726 "configured CI app resolves an actioned thread" 0 resolved "$THREADS_T1" configured ghs_x - --resolve-actioned --ci-app-identity
+# The actioned-evidence checks are untouched: an unactioned thread stays open.
+case_2726 "configured CI app leaves an unactioned thread open" 3 untouched "$THREADS_2726_OPEN" configured ghs_x - --resolve-actioned --ci-app-identity
+# Unconfigured, the mode is inert and fails closed before any mutation.
+case_2726 "CI app with no configured identity is refused" 2 untouched "$THREADS_T1" unconfigured ghs_x - --resolve-actioned --ci-app-identity
+# Any other app is refused, configured or not.
+STUB_VIEWER_LOGIN_2726='other-app[bot]' \
+  case_2726 "another app's installation token is refused" 2 untouched "$THREADS_T1" configured ghs_x - --resolve-actioned --ci-app-identity
+# The dev opt-out does not reach the app mode: its check is mandatory.
+case_2726 "SKIP_IDENTITY_CHECK does not bypass the app mode" 2 untouched "$THREADS_T1" unconfigured ghs_x RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK=1 --resolve-actioned --ci-app-identity
+# Without the explicit mode, an app token takes the reviewer path, which
+# refuses every installation token: configuring the app widens nothing.
+case_2726 "app token without --ci-app-identity is refused" 2 untouched "$THREADS_T1" configured ghs_x - --resolve-actioned
+case_2726 "app token in deferral mode is refused" 2 untouched "$THREADS_T1" configured ghs_x - --auto-resolve-bots
+# A reviewer PAT cannot claim the app mode either.
+case_2726 "reviewer PAT with --ci-app-identity is refused" 2 untouched "$THREADS_T1" configured ghp_x - --resolve-actioned --ci-app-identity
+# The mode exists only for --resolve-actioned; every other operation is a
+# usage error before any gh call.
+case_2726 "--ci-app-identity with --auto-resolve-bots" 1 no-gh "$THREADS_T1" configured ghs_x - --auto-resolve-bots --ci-app-identity
+case_2726 "--ci-app-identity with --resolve-verified-propagation" 1 no-gh "$THREADS_T1" configured ghs_x - --resolve-verified-propagation --ci-app-identity
+case_2726 "--ci-app-identity with --list" 1 no-gh "$THREADS_T1" configured ghs_x - --list --ci-app-identity
+case_2726 "--ci-app-identity with the default (list) mode" 1 no-gh "$THREADS_T1" configured ghs_x - --ci-app-identity
+case_2726 "--ci-app-identity with an explicit --thread disposition" 1 no-gh "$THREADS_T1" configured ghs_x - --thread PRT_1 --disposition fixed --ci-app-identity
+
+# A retry after the app's OWN marker. THREADS_T1 (actioned by a fix commit
+# that touches the anchored file) plus a third comment posted after the fix:
+# the CI app's [mergepath-resolve: ...] reply from an earlier pass whose
+# resolve did not stick. That marker is the script's own output, so it must
+# not move the staleness floor past the fix commit, for the app or for the
+# reviewer PAT. Anything else stays non-agent feedback: the app is not an
+# agent author, a same-named user is not the app, and unconfigured nothing
+# changes.
+threads_2726_third() {  # <author json> <body>
+  jq -nc --argjson a "$1" --arg b "$2" '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+    {"id":"PRT_1","isResolved":false,"isOutdated":false,
+     "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/foo.sh","body":"Some finding","createdAt":"2026-01-01T00:00:00Z"}]},
+     "commentsLast":{"nodes":[{"commit":{"oid":"HEADCURRENT"}}]},
+     "allComments":{"nodes":[
+       {"author":{"login":"coderabbitai","__typename":"Bot"},"body":"Some finding","databaseId":1001},
+       {"author":{"login":"nathanpayne-claude","__typename":"User"},"body":"Fixed in abc1234.","databaseId":1002,"createdAt":"2026-01-02T00:00:00Z"},
+       {"author":$a,"body":$b,"databaseId":1003,"createdAt":"2026-01-03T00:00:00Z"}
+     ]}
+    }
+  ]}}}}}'
+}
+APP_MARKER='[mergepath-resolve: addressed-elsewhere] Addressed by abc1234, which touches scripts/foo.sh.'
+APP_GQL='{"login":"mergepath-ci","__typename":"Bot"}'
+T2726_APP_MARKER=$(threads_2726_third "$APP_GQL" "$APP_MARKER")
+case_2726 "retry after the app's own marker (GraphQL login), app mode" 0 resolved "$T2726_APP_MARKER" configured ghs_x - --resolve-actioned --ci-app-identity
+case_2726 "retry after the app's own marker (GraphQL login), reviewer PAT" 0 resolved "$T2726_APP_MARKER" configured ghp_x - --resolve-actioned
+case_2726 "retry after the app's own marker (REST login), reviewer PAT" 0 resolved \
+  "$(threads_2726_third '{"login":"mergepath-ci[bot]"}' "$APP_MARKER")" configured ghp_x - --resolve-actioned
+case_2726 "an indented app marker is still the app's own" 0 resolved \
+  "$(threads_2726_third "$APP_GQL" "
+  $APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity
+# Unconfigured, the app's marker is ordinary non-agent feedback (fail closed).
+case_2726 "app marker with the app unconfigured stays feedback" 3 untouched "$T2726_APP_MARKER" unconfigured ghp_x - --resolve-actioned
+# Configured but invalid reads as unconfigured: the login comes from the
+# validated read, so a value identity-check.sh would refuse never turns a
+# bot's marker into the resolver's own output.
+case_2726 "app marker with the app undeclared as a non-reviewer stays feedback" 3 untouched "$T2726_APP_MARKER" undeclared ghp_x - --resolve-actioned
+case_2726 "a reviewing bot configured as the app: its marker stays feedback" 3 untouched \
+  "$(threads_2726_third '{"login":"coderabbitai","__typename":"Bot"}' "$APP_MARKER")" shared ghp_x - --resolve-actioned
+# A user account with the app's bare slug is not the app.
+case_2726 "marker from a same-named User is feedback" 3 untouched \
+  "$(threads_2726_third '{"login":"mergepath-ci","__typename":"User"}' "$APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity
+# Another app's marker is feedback.
+case_2726 "marker from another app is feedback" 3 untouched \
+  "$(threads_2726_third '{"login":"other-app","__typename":"Bot"}' "$APP_MARKER")" configured ghs_x - --resolve-actioned --ci-app-identity
+# Any non-marker reply from the app is still non-agent: it cannot vouch.
+case_2726 "a non-marker reply from the app is feedback" 3 untouched \
+  "$(threads_2726_third "$APP_GQL" 'Resolving: this was fixed in abc1234 per the commit.')" configured ghs_x - --resolve-actioned --ci-app-identity
+
+# The ledger arm selects the CURRENT finding as the latest non-agent comment
+# at the floor. The app's own marker must not become that "current finding",
+# or the ledger verdict recorded against the real finding (99101) stops
+# matching and a dispositioned thread is skipped as never-dispositioned.
+# Test 29's fixture, run by the reviewer PAT in the configured app tree, with
+# the app's marker posted after the ledger verdict.
+app_policy_2726 configured
+T2726_LEDGER="$SCRATCH/t2726-codex-ledger.jsonl"
+jq -nc '{pr_number:778,repo:"test/repo",comment_id:99101,priority:"P1",verdict:"+1",
+         reaction:"+1",location:"pull_request_review_comment",action:"posted",
+         reviewer_identity:"nathanpayne-claude",reason:null,
+         recorded_at:"2026-01-04T00:00:00Z"}' > "$T2726_LEDGER"
+T2726_B='[{"author":{"login":"chatgpt-codex-connector","__typename":"Bot"},"body":"P1: the retry loop has no backoff","databaseId":99101,"createdAt":"2026-01-01T00:00:00Z"},
+  {"author":{"login":"mergepath-ci","__typename":"Bot"},"body":"[mergepath-resolve: addressed-elsewhere] Verdict for finding 99101 recorded.","databaseId":99103,"createdAt":"2026-01-05T00:00:00Z"}]'
+: > "$SCRATCH/t2726-ledger.log"
+make_gh_stub "$SCRATCH/gh-real" "$(t990_threads "$T2726_B")" "$FILES_T990" "$COMMITS_T990" "$CFILES_T990"
+make_gh_wrapper "$SCRATCH/gh" "$SCRATCH/gh-real"
+set +e
+out=$(env -u OP_PREFLIGHT_REVIEWER_PAT -u MERGEPATH_AGENT -u GH_AS_REVIEWER_IDENTITY -u OP_PREFLIGHT_AGENT \
+  -u RESOLVE_PR_THREADS_SKIP_IDENTITY_CHECK -u GH_HOST \
+  GH_ARGV_LOG="$SCRATCH/t2726-ledger.log" GH_TOKEN=ghp_x STUB_USER_LOGIN=nathanpayne-claude \
+  CODEX_FEEDBACK_LEDGER="$T2726_LEDGER" PATH="$SCRATCH:$PATH" \
+  bash "$APP_ROOT/scripts/resolve-pr-threads.sh" 778 --repo test/repo --resolve-actioned 2>&1)
+rc=$?
+set -e
+t2726_resolved=$(resolved_threads "$SCRATCH/t2726-ledger.log" | sort -u | tr '\n' ' ')
+if [ "$rc" -eq 0 ] && [ "$t2726_resolved" = "PRT_990A PRT_990B " ] \
+   && grep -q 'verdict for finding 99101 recorded in t2726-codex-ledger.jsonl' <<<"$out"; then
+  pass=$((pass + 1)); echo "  PASS: #2726 the app's marker does not displace the ledger's current finding"
+else
+  fail=$((fail + 1)); echo "  FAIL: #2726 ledger verdict lost behind the app's marker (rc=$rc, resolved='$t2726_resolved')" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "test_resolve_pr_threads_rationale_tag: PASS ($pass tests)"
+  exit 0
+else
+  echo "test_resolve_pr_threads_rationale_tag: FAIL ($fail of $((pass + fail)) tests)" >&2
+  exit 1
+fi

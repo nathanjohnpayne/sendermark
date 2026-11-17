@@ -1,0 +1,160 @@
+name: Daily deferred-feedback rollup
+
+# Daily end-of-day rollup of bot-review threads that were resolved on
+# yesterday's PRs without an associated fix commit or substantive
+# reply. Complements weekly-feedback-sweep.yml (which catches
+# longer-tail residuals on still-open PRs); this catches the
+# deferred-and-forgotten class while the agent's context is still
+# fresh. See mergepath#299.
+#
+# Auth model:
+#   - Same-repo reads + writes. GITHUB_TOKEN works for both, but
+#     REVIEWER_ASSIGNMENT_TOKEN (the nathanpayne-claude PAT already
+#     wired for weekly sweep) keeps the issue byline showing the
+#     agent identity instead of github-actions[bot].
+#
+# Idempotency:
+#   - daily-feedback-rollup.sh's self-throttling appends to the
+#     most-recently-opened track issue if that issue has ≥ N
+#     unchecked items, rather than opening a new one every day.
+#     v1 dedupe-against-prior-triaged-items is a documented follow-up.
+#   - Re-running on the same day for the same window posts a second
+#     issue (NOT idempotent yet — also a documented follow-up).
+
+on:
+  schedule:
+    # 55 23 * * *: 23:55 UTC daily = 4:55pm Pacific / 7:55pm Eastern,
+    # late enough to capture the day's merges but before the working-
+    # memory rolls over for that day's agent sessions.
+    - cron: '55 23 * * *'
+  workflow_dispatch:
+    inputs:
+      since:
+        description: 'Window start (YYYY-MM-DD, UTC). Default: yesterday.'
+        required: false
+      until:
+        description: 'Window end (YYYY-MM-DD, UTC). Default: today.'
+        required: false
+      dry_run:
+        description: 'If true, print NDJSON to logs and skip issue mutation.'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  rollup:
+    name: Classify + post rollup issues
+    # Reject manual dispatch from a non-default ref (#550 Codex P1): on
+    # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen
+    # ref, which the checkout pin cannot constrain — a feature branch could
+    # leak REVIEWER_ASSIGNMENT_TOKEN before checkout. Scheduled runs and
+    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        # Pin to the trusted default branch (#465): this workflow has
+        # issues:write and a workflow_dispatch trigger, so without an explicit
+        # ref the checkout would honor an attacker-influenceable GITHUB_REF and
+        # could run an untrusted version of the rollup scripts under the write
+        # token. Always run the canonical scripts from the default branch.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # The rollup only runs gh with REVIEWER_ASSIGNMENT_TOKEN (an explicit
+          # env token) and does no authenticated git, so don't leave the
+          # checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
+
+      - name: Ensure jq + gh present
+        run: |
+          for dep in gh jq shasum; do
+            if ! command -v "$dep" >/dev/null 2>&1; then
+              echo "ERROR: $dep not installed on runner" >&2
+              exit 1
+            fi
+          done
+
+      - name: Run rollup
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          REPO: ${{ github.repository }}
+          # Dispatch inputs reach the shell ONLY as environment values, never
+          # as `${{ }}` text spliced into the script: an interpolated input is
+          # parsed as shell source in a step that holds the reviewer PAT.
+          # Each is validated below before use.
+          INPUT_SINCE: ${{ github.event.inputs.since }}
+          INPUT_UNTIL: ${{ github.event.inputs.until }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: REVIEWER_ASSIGNMENT_TOKEN secret is empty. Daily rollup cannot run without a cross-repo-capable PAT." >&2
+            echo "       Set the secret in repo Settings → Secrets and variables → Actions." >&2
+            exit 1
+          fi
+
+          date_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          for pair in "since:${INPUT_SINCE:-}" "until:${INPUT_UNTIL:-}"; do
+            name=${pair%%:*}
+            value=${pair#*:}
+            if [ -n "$value" ]; then
+              if ! [[ "$value" =~ $date_re ]]; then
+                echo "ERROR: input '$name' must be YYYY-MM-DD; refusing to run." >&2
+                exit 1
+              fi
+
+              # Validate calendar semantics without depending on platform-
+              # specific date parsing. The shape check above makes each field
+              # safe for explicit base-10 arithmetic (including leading zeroes).
+              year=$((10#${value%%-*}))
+              date_tail=${value#*-}
+              month=$((10#${date_tail%%-*}))
+              day=$((10#${date_tail#*-}))
+              if (( year == 0 || month < 1 || month > 12 )); then
+                echo "ERROR: input '$name' must be a real calendar date; refusing to run." >&2
+                exit 1
+              fi
+              case "$month" in
+                4|6|9|11) max_day=30 ;;
+                2)
+                  if (( year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) )); then
+                    max_day=29
+                  else
+                    max_day=28
+                  fi
+                  ;;
+                *) max_day=31 ;;
+              esac
+              if (( day < 1 || day > max_day )); then
+                echo "ERROR: input '$name' must be a real calendar date; refusing to run." >&2
+                exit 1
+              fi
+            fi
+          done
+          case "${INPUT_DRY_RUN:-}" in
+            ""|true|false) ;;
+            *)
+              echo "ERROR: input 'dry_run' must be true or false; refusing to run." >&2
+              exit 1
+              ;;
+          esac
+
+          ARGS=()
+          if [ -n "${INPUT_SINCE:-}" ]; then
+            ARGS+=(--since "$INPUT_SINCE")
+          fi
+          if [ -n "${INPUT_UNTIL:-}" ]; then
+            ARGS+=(--until "$INPUT_UNTIL")
+          fi
+          if [ "${INPUT_DRY_RUN:-}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          chmod +x scripts/daily-feedback-rollup.sh
+          scripts/daily-feedback-rollup.sh "${ARGS[@]+"${ARGS[@]}"}"

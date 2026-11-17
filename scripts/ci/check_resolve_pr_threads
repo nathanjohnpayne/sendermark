@@ -1,0 +1,741 @@
+#!/usr/bin/env bash
+# check_resolve_pr_threads — regression tests for scripts/resolve-pr-threads.sh
+#
+# Closes the test gap that let PR #189's silent-undercount bug ship
+# (cursor passed as `-f cursor=null` → string "null" → API silently
+# returned wrong thread set). See #192 for the post-mortem.
+#
+# Tests stub `gh` via PATH-prepend so they exercise the script's
+# argument construction and exit-code paths without live API calls.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT="$ROOT/scripts/resolve-pr-threads.sh"
+
+# ── CI-only yq self-bootstrap (#616, Codex findings 3509734393 + 3509930342)
+# The delegated verified-propagation suite (Test 10 below) hard-requires
+# mikefarah/yq. On mergepath, repo_lint.yml's install_yq_for_sync_manifest
+# step installs it before this check runs — but consumers receive this
+# check via the manifest-synced scripts/ci kit while their repo_lint.yml
+# (with the install-step ordering) arrives separately on the
+# template-mirror lane (#601), so a skew window could run this check with
+# no yq — or the WRONG yq (e.g. the Python wrapper preinstalled on some
+# runners) — on the runner. ALWAYS delegate to the shared pinned installer:
+# ensure-yq.sh owns the implementation detection (its short-circuit greps
+# `yq --version` for mikefarah/yq), so a non-mikefarah yq on PATH still
+# bootstraps the pinned binary instead of failing later with parser
+# errors. Do NOT gate this on `command -v yq` — that skips the bootstrap
+# whenever ANY yq is present (finding 3509930342). CI-only: --ci-only
+# no-ops outside GITHUB_ACTIONS=true, so local runs keep the suite's own
+# hard "yq is required" error instead of a surprise sudo install. A
+# bootstrap that cannot run fails closed here rather than letting Test 10
+# produce a less obvious failure.
+ENSURE_YQ="$ROOT/scripts/lib/ensure-yq.sh"
+if [ -f "$ENSURE_YQ" ]; then
+  if ! bash "$ENSURE_YQ" --ci-only; then
+    echo "check_resolve_pr_threads: FAIL — yq bootstrap failed (scripts/lib/ensure-yq.sh)" >&2
+    exit 1
+  fi
+fi
+
+pass=0
+fail=0
+
+# ── Test 1: cursor-null typing
+# The script must send `-F cursor=null` (typed null) on the first
+# call, NOT `-f cursor=null` (string "null"). The stub captures
+# the gh argv to a side file so we can inspect what was actually sent.
+echo "resolve-pr-threads.sh cursor-null typing test (#192 regression)"
+
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+# Capture all argv to a file the test harness reads. Then return a
+# minimal valid GraphQL response so the script doesn't bail.
+echo "$@" >> "$GH_ARGV_LOG"
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # Match how the script's GraphQL response is shaped: empty
+        # threads list with totalCount=0 → script reports "no
+        # unresolved threads" and exits 0.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        # HEAD oid fetch
+        echo "abc123def"
+        exit 0
+        ;;
+    esac
+    ;;
+  repo)
+    # `gh repo view --json nameWithOwner` fallback
+    printf '{"nameWithOwner":"test/repo"}\n'
+    exit 0
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+GH_ARGV_LOG="$SCRATCH/gh-argv.log"
+: > "$GH_ARGV_LOG"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# The first GraphQL call (cursor=null path) must use `-F cursor=null`
+# not `-f cursor=null`. Grep the captured argv for the typed flag.
+if grep -qE -- '-F cursor=null' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: first call uses -F cursor=null (typed null)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected -F cursor=null in first GraphQL call argv" >&2
+  echo "      argv log:" >&2
+  sed 's/^/        /' "$GH_ARGV_LOG" >&2
+fi
+
+# Negative assertion: must NOT use `-f cursor=null` (string "null")
+# anywhere — the prior bug.
+if grep -qE -- '-f cursor=null' "$GH_ARGV_LOG"; then
+  fail=$((fail + 1))
+  echo "  FAIL: regression — -f cursor=null (string 'null') was sent" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: no -f cursor=null anywhere in argv (regression closed)"
+fi
+
+# ── Test 2: totalCount cross-validation catches undercount
+echo
+echo "resolve-pr-threads.sh totalCount cross-validation test"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # Simulate the bug condition: totalCount=3 but only 2 nodes
+        # returned. Script must exit 2 with the undercount-detected
+        # error (not silently report "no unresolved threads").
+        # Stub uses the new commentsFirst/commentsLast alias shape.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":3,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}},
+  {"id":"T2","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "2" ] && grep -q "GraphQL count mismatch" <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: totalCount > returned → exit 2 with count-mismatch error"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: undercount should exit 2 (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 3: equal totalCount and returned → no undercount error
+echo
+echo "resolve-pr-threads.sh equal-count happy-path test"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}},
+  {"id":"T2","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "0" ] && echo "$out" | grep -q "No unresolved threads"; then
+  pass=$((pass + 1))
+  echo "  PASS: totalCount == returned (all resolved) → exit 0 + clean message"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: equal counts + all resolved should exit 0 (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 4: defensive isResolved != true catches null
+echo
+echo "resolve-pr-threads.sh defensive isResolved-null test"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # isResolved is null on one thread — defensive `!= true`
+        # filter must treat it as unresolved and surface it.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":null,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# In list mode (default), unresolved threads exit 3 with the listing.
+if [ "$rc" = "3" ] && echo "$out" | grep -q "Unresolved threads on test/repo#99999"; then
+  pass=$((pass + 1))
+  echo "  PASS: null isResolved treated as unresolved (defensive)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: null isResolved should be treated as unresolved (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 4b: totalCount cross-validation also fails on over-count
+# CR Major on PR #194 r2 — a duplicate-page / cursor-reset regression
+# in the pagination loop would produce returned > totalCount; the
+# equality check must fail on that case too, not just under-count.
+echo
+echo "resolve-pr-threads.sh totalCount over-count detection (CR Major on #194)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # totalCount=1 but 2 nodes returned (simulated duplicate page).
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}},
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+if [ "$rc" = "2" ] && grep -q "GraphQL count mismatch" <<<"$out"; then
+  pass=$((pass + 1))
+  echo "  PASS: returned > totalCount → exit 2 with count-mismatch error"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: over-count should exit 2 (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 5: HEAD-anchor uses commentsLast (codex P2 #194 regression)
+# A thread where commentsFirst points at an old commit and commentsLast
+# points at the truly-latest one. The script must surface the
+# commentsLast oid as the thread's commit_oid for the HEAD-anchor
+# check, NOT commentsFirst's. Prior shape (`comments(first: 50)` +
+# `[-1]`) would silently return the wrong oid for >50-comment threads.
+echo
+echo "resolve-pr-threads.sh HEAD-anchor uses commentsLast (codex P2 on #194)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # commentsFirst.commit.oid would be "OLDOID" (anchored to
+        # original review commit), commentsLast.commit.oid is "NEWOID"
+        # (truly-latest comment from a much later push). The script
+        # must read commit_oid from commentsLast.
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"src/foo.ts","body":"original review","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"NEWOIDcurrent"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "NEWOIDcurrent"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo --auto-resolve-bots --dry-run 2>&1)
+rc=$?
+set -e
+
+# With --dry-run --auto-resolve-bots, the script reports "would resolve"
+# only when commit_oid matches HEAD_OID. If it correctly picked
+# commentsLast's "NEWOIDcurrent" (matching HEAD_OID), the output
+# includes "would resolve". If it picked commentsFirst's commit (which
+# we don't even populate here), it would skip-as-stale.
+if echo "$out" | grep -qE "WOULD RESOLVE|would-resolve: [1-9]"; then
+  pass=$((pass + 1))
+  echo "  PASS: HEAD anchor read from commentsLast (current-HEAD bot thread is auto-resolvable)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected would-resolve output (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 5b: github-advanced-security recognized as a bot author (#1101)
+# Before #1101, BOT_LOGINS_RE did not include github-advanced-security, so
+# every CodeQL code-scanning thread fell through the loop's bot-author gate
+# as "non-bot author" and --resolve-actioned / --auto-resolve-bots could
+# never touch it — a disposed CodeQL finding's thread could only be
+# resolved by hand. Same fixture shape as Test 5, GraphQL's un-suffixed
+# login form (author{login} returns "github-advanced-security", not
+# "github-advanced-security[bot]").
+echo
+echo "resolve-pr-threads.sh github-advanced-security recognized as bot author (#1101)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T1","isResolved":false,"isOutdated":false,
+   "commentsFirst":{"nodes":[{"author":{"login":"github-advanced-security"},"path":"src/foo.ts","body":"## CodeQL / Some rule","createdAt":"2026-01-01T00:00:00Z"}]},
+   "commentsLast":{"nodes":[{"commit":{"oid":"NEWOIDcurrent"}}]}}
+]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "NEWOIDcurrent"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+set +e
+out=$(PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo --auto-resolve-bots --dry-run 2>&1)
+rc=$?
+set -e
+
+## CodeRabbit (PR #1106) suggested requiring rc=0, modeled on the concern
+## that a failed run could print "WOULD RESOLVE" before exiting non-zero.
+## That doesn't fit THIS mode: --dry-run deliberately exits 3 whenever any
+## actionable item remains (would-resolve/human/stale/etc. > 0) — see the
+## "Fix: dry-run exits 3 if ANY actionable items remain" comment in
+## resolve-pr-threads.sh, added on PR #172 for the same reason (a caller
+## reading rc=0 as "nothing to do" must not be lied to by a dry-run that
+## found real work). Checking rc=3 is the actual fail-closed contract:
+## dry-run's only two reachable exits after the per-thread loop are 0 (no
+## unresolved threads at all) and 3 (found actionable items), so a
+## genuinely broken run never reaches this "WOULD RESOLVE" text with any
+## other code.
+if [ "$rc" -eq 3 ] \
+   && echo "$out" | grep -qE "WOULD RESOLVE|would-resolve: [1-9]" \
+   && ! echo "$out" | grep -q "non-bot author"; then
+  pass=$((pass + 1))
+  echo "  PASS: github-advanced-security thread is treated as bot-authored, not skipped (#1101)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: expected rc=3 (dry-run actionable-items contract) and would-resolve output with no non-bot skip (rc=$rc)" >&2
+  echo "$out" | sed 's/^/      /' >&2
+fi
+
+# ── Test 6: two-page pagination + cursor accumulation
+# CR Major on PR #194 r3 — without exercising the multi-page path,
+# a paginator regression on the happy path stays green. Stub returns
+# page 1 with hasNextPage=true + endCursor="CURSOR1", page 2 with
+# hasNextPage=false. Final state: 2 nodes accumulated, totalCount=2,
+# script exits 0. Also asserts the 2nd call's argv contains
+# `-f cursor=CURSOR1` (the post-first-call branch is exercised).
+echo
+echo "resolve-pr-threads.sh two-page pagination test (CR Major on #194)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+echo "$@" >> "$GH_ARGV_LOG"
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        # Determine page from whether `cursor=CURSOR1` is in argv.
+        if [[ " $* " == *" cursor=CURSOR1 "* ]]; then
+          # Page 2: remaining node, no next page.
+          cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+  {"id":"T2","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"b","body":"y","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        else
+          # Page 1: first node, hasNextPage=true.
+          cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":2,"pageInfo":{"hasNextPage":true,"endCursor":"CURSOR1"},"nodes":[
+  {"id":"T1","isResolved":true,"isOutdated":false,"commentsFirst":{"nodes":[{"author":{"login":"coderabbitai"},"path":"a","body":"x","createdAt":"2026-01-01T00:00:00Z"}]},"commentsLast":{"nodes":[{"commit":{"oid":"abc"}}]}}
+]}}}}}
+JSON
+        fi
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+GH_ARGV_LOG="$SCRATCH/gh-argv-page.log"
+: > "$GH_ARGV_LOG"
+
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" PATH="$SCRATCH:$PATH" bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# Must (a) exit 0 with "no unresolved threads" (both nodes are
+# isResolved=true and totalCount=2 matches accumulated), (b) include
+# `-f cursor=CURSOR1` in the second-page call argv.
+if [ "$rc" = "0" ] && echo "$out" | grep -q "No unresolved threads" && grep -qE -- '-f cursor=CURSOR1' "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: page 2 fetched with -f cursor=CURSOR1; accumulated count matches totalCount"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pagination regression (rc=$rc)" >&2
+  echo "      output:" >&2; echo "$out" | sed 's/^/        /' >&2
+  echo "      argv log:" >&2; sed 's/^/        /' "$GH_ARGV_LOG" >&2
+fi
+
+# ── Test 7: keyring fallback when neither preflight nor GH_TOKEN set
+# CR Major on PR #194 r3 — the prior `GH_TOKEN="${VAR:-${OTHER:-}}"`
+# pattern set GH_TOKEN to empty when both unset, blocking gh's
+# keyring fallback. The conditional gh_read wrapper must NOT pass
+# GH_TOKEN= (empty) when no PAT is available.
+echo
+echo "resolve-pr-threads.sh keyring fallback (no empty GH_TOKEN trap)"
+
+cat > "$SCRATCH/gh" <<'GH_STUB'
+#!/usr/bin/env bash
+echo "ENV_GH_TOKEN_PRESENT=${GH_TOKEN+yes}" >> "$GH_ARGV_LOG"
+# #951: record the LENGTH, never the value. Nothing asserts on the value,
+# the failure branch below prints this whole log, and the token reaching
+# the stub is not always a fixture one --- resolve-pr-threads.sh
+# auto-sources the op-preflight cache, so a regression in the very
+# behaviour under test would put a real PAT here and then print it.
+# Length still separates the three states this case cares about: absent,
+# present-but-empty (0), present-and-set (>0).
+#
+# Read through a defaulted copy rather than expanding ${#GH_TOKEN}
+# directly. This stub runs as its own bash process and so does NOT
+# inherit the caller's `set -u` (SHELLOPTS is not exported), which is why
+# the direct form works today and why this case --- whose whole premise
+# is an ABSENT GH_TOKEN --- passes. But that is an accident of the
+# parent's environment, not a property of the stub: export SHELLOPTS, or
+# add `set -u` here later, and the direct form aborts before the case can
+# assert anything. The defaulted copy renders identically (0 when absent)
+# under either regime. CodeRabbit raised the nounset shape on PR #993.
+token_value=${GH_TOKEN-}
+echo "ENV_GH_TOKEN_LENGTH=${#token_value}" >> "$GH_ARGV_LOG"
+case "$1" in
+  api)
+    case "$2" in
+      graphql)
+        cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}
+JSON
+        exit 0
+        ;;
+      "repos/"*"/pulls/"*)
+        echo "abc123def"; exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+GH_STUB
+chmod +x "$SCRATCH/gh"
+
+GH_ARGV_LOG="$SCRATCH/gh-argv-keyring.log"
+: > "$GH_ARGV_LOG"
+
+# Crucially: unset both PAT vars in the subshell environment --- AND point
+# the preflight cache lookup at an empty directory (#951). `env -u` alone
+# closes only the env-var half of "no PAT available": resolve-pr-threads.sh
+# sources lib/preflight-helpers.sh, whose load_preflight_env_vars re-reads
+# OP_PREFLIGHT_REVIEWER_PAT from the ON-DISK cache unconditionally. On a
+# machine with a warm cache --- the normal state of an agent session --- the
+# unset variable was immediately refilled with a REAL PAT, this case failed,
+# and its failure branch prints the whole stub log. That is the same
+# unscrubbed-fixture rule this PR fixes elsewhere; before the length change
+# above it would have printed the PAT itself. CI (no cache on the runner)
+# could never see it.
+mkdir -p "$SCRATCH/empty-cache"
+chmod 700 "$SCRATCH/empty-cache"
+set +e
+out=$(GH_ARGV_LOG="$GH_ARGV_LOG" PATH="$SCRATCH:$PATH" \
+  OP_PREFLIGHT_CACHE_DIR="$SCRATCH/empty-cache" \
+  env -u OP_PREFLIGHT_REVIEWER_PAT -u OP_PREFLIGHT_AUTHOR_PAT -u GH_TOKEN \
+  bash "$SCRIPT" 99999 --repo test/repo 2>&1)
+rc=$?
+set -e
+
+# Stub captured env state. Assert GH_TOKEN was NOT set (or NOT empty).
+# An empty GH_TOKEN would show ENV_GH_TOKEN_PRESENT=yes + ENV_GH_TOKEN_LENGTH=0.
+# Need to confirm absence of the "ENV_GH_TOKEN_PRESENT=yes" line on
+# graphql calls.
+if [ "$rc" = "0" ] && ! grep -q "^ENV_GH_TOKEN_PRESENT=yes$" "$GH_ARGV_LOG"; then
+  pass=$((pass + 1))
+  echo "  PASS: GH_TOKEN unset (not empty) when no PAT available — keyring fallback engaged"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: GH_TOKEN was set (possibly empty) — keyring fallback would be blocked (rc=$rc)" >&2
+  echo "      env capture:" >&2; sed 's/^/        /' "$GH_ARGV_LOG" >&2
+fi
+
+# ── Delegated suites run concurrently (#2990) ─────────────────────────
+# Tests 8-10 below each delegate to a fixture suite in tests/ that shares no
+# state with the others, so all five start here, side by side, and each test
+# block below waits for its own suite's exit status instead of running it
+# inline. The blocks keep their order, their PASS/FAIL accounting, their
+# missing-file failure and their diagnostic re-run on failure. A suite whose
+# file is missing is not started, and its block fails as before.
+DELEGATE_DIR="$SCRATCH/delegates"
+mkdir -p "$DELEGATE_DIR"
+delegate_key() { basename "$1" .sh; }
+start_delegate() { # <path>
+  [ -f "$1" ] || return 0
+  bash "$1" >"$DELEGATE_DIR/$(delegate_key "$1").log" 2>&1 &
+  echo "$!" >"$DELEGATE_DIR/$(delegate_key "$1").pid"
+}
+# Exit status of a suite start_delegate launched; a suite that was never
+# started (no pid file) fails.
+delegate_result() { # <path>
+  local pid_file
+  pid_file="$DELEGATE_DIR/$(delegate_key "$1").pid"
+  [ -s "$pid_file" ] || return 1
+  wait "$(cat "$pid_file")"
+}
+for delegate in \
+  "$ROOT/tests/test_resolve_pr_threads_rationale_tag.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_staleness_pagination.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_read_failure.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_bind_head.sh" \
+  "$ROOT/tests/test_resolve_pr_threads_verified_propagation.sh"; do
+  start_delegate "$delegate"
+done
+
+# ── Test 8: delegate to tests/test_resolve_pr_threads_rationale_tag.sh
+# Exercises the mergepath#305 tag-emission flow (derive_tag_class +
+# post_tag_reply + --rationale override + --no-tag-reply). The test
+# is fixture-based and lives in tests/ so it follows the same
+# co-location pattern as test_codex_p1_gate / test_disagreement_detector
+# (the check wrapper delegates to a dedicated test file rather than
+# inlining the cases).
+echo
+echo "resolve-pr-threads.sh rationale-tag emission (mergepath#305)"
+
+TAG_TEST="$ROOT/tests/test_resolve_pr_threads_rationale_tag.sh"
+if [ ! -f "$TAG_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $TAG_TEST" >&2
+elif delegate_result "$TAG_TEST"; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_rationale_tag.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_rationale_tag.sh exited non-zero" >&2
+  # Re-run with output captured so the CI log shows what broke.
+  echo "    re-running with output:" >&2
+  bash "$TAG_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
+# ── Test 9: delegate to tests/test_resolve_pr_threads_staleness_pagination.sh
+# Exercises the #573-item-2 staleness-floor pagination: threads with more
+# comments than the enumeration's last-50 window get a full cursor-
+# paginated re-fetch so the latest bot/reviewer re-raise is never
+# invisible to --resolve-actioned, and any pagination failure fails
+# closed (thread skipped, left unresolved). Same delegation pattern as
+# Test 8 above.
+echo
+echo "resolve-pr-threads.sh staleness-floor pagination (#573 item 2)"
+
+PAGINATION_TEST="$ROOT/tests/test_resolve_pr_threads_staleness_pagination.sh"
+if [ ! -f "$PAGINATION_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $PAGINATION_TEST" >&2
+elif delegate_result "$PAGINATION_TEST"; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_staleness_pagination.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_staleness_pagination.sh exited non-zero" >&2
+  # Re-run with output captured so the CI log shows what broke.
+  echo "    re-running with output:" >&2
+  bash "$PAGINATION_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
+# ── Test 9b: delegate to tests/test_resolve_pr_threads_read_failure.sh
+# Exercises the #1104 HEAD-read classification: a rate-limited read exits 4
+# (could-not-look) and names the exhausted account, a genuine 404 exits 2, and
+# the underlying gh error body -- which gh writes to STDOUT -- reaches the
+# operator instead of being discarded. Without a CI entrypoint that behaviour
+# can regress while the required lint stays green, which is precisely the
+# silent-failure class the suite was written to fence. Same delegation pattern
+# as Tests 8 and 9 above.
+echo
+echo "resolve-pr-threads.sh HEAD-read failure classification (#1104)"
+
+READFAIL_TEST="$ROOT/tests/test_resolve_pr_threads_read_failure.sh"
+if [ ! -f "$READFAIL_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $READFAIL_TEST" >&2
+elif delegate_result "$READFAIL_TEST"; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_read_failure.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_read_failure.sh exited non-zero" >&2
+  echo "    re-running with output:" >&2
+  bash "$READFAIL_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
+# ── Test 9c: delegate to tests/test_resolve_pr_threads_bind_head.sh
+# Exercises #2727's --bind-head (ADR 0004, caller C17): refusal of a PR that is
+# not open against the default branch, the head/base capture before any
+# evidence, evidence bound to that pair (commit list, cited commits, no local
+# ledger rows), the re-read before every write, the bounded restart and the
+# stop after a write. Same delegation pattern as Test 9b.
+echo
+echo "resolve-pr-threads.sh --bind-head head/base binding (#2727)"
+
+BIND_TEST="$ROOT/tests/test_resolve_pr_threads_bind_head.sh"
+if [ ! -f "$BIND_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $BIND_TEST" >&2
+elif delegate_result "$BIND_TEST"; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_bind_head.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_bind_head.sh exited non-zero" >&2
+  echo "    re-running with output:" >&2
+  bash "$BIND_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
+# ── Test 10: delegate to tests/test_resolve_pr_threads_verified_propagation.sh
+# Exercises the #572 --resolve-verified-propagation mode: canonical/templated
+# routing-class threads resolve ONLY on a byte-verified propagation match
+# (consumer content at the compared ref vs mergepath canonical source /
+# re-rendered template with consumer facts), with drift and every
+# verification failure skipped fail-closed, surface-class + human threads
+# untouched, and a working --dry-run preview. Also covers the #616 fixes:
+# routing as a pure path predicate (a previously recorded deferral marker
+# never blocks the classification), the actioned-evidence upgrade to the
+# truthful addressed-elsewhere/rebuttal-recorded tag, the CI-only yq
+# bootstrap above (scripts/lib/ensure-yq.sh), and the round-4 verification
+# gates — open-PR compares read the PR HEAD ref (3510170875), byte-match
+# requires an upstream fix commit newer than the finding (3510170879), and
+# tree-entry mode/type parity mirrors verify-propagation-pr.sh
+# (3510170883). The --auto-resolve-bots #575 deferred→actioned tag
+# auto-upgrade guard is covered by the rationale-tag suite (Test 8 above).
+# Same delegation pattern as Tests 8/9.
+echo
+echo "resolve-pr-threads.sh verified-propagation resolution (#572)"
+
+VERIFIED_PROPAGATION_TEST="$ROOT/tests/test_resolve_pr_threads_verified_propagation.sh"
+if [ ! -f "$VERIFIED_PROPAGATION_TEST" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: missing $VERIFIED_PROPAGATION_TEST" >&2
+elif delegate_result "$VERIFIED_PROPAGATION_TEST"; then
+  pass=$((pass + 1))
+  echo "  PASS: tests/test_resolve_pr_threads_verified_propagation.sh"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: tests/test_resolve_pr_threads_verified_propagation.sh exited non-zero" >&2
+  # Re-run with output captured so the CI log shows what broke.
+  echo "    re-running with output:" >&2
+  bash "$VERIFIED_PROPAGATION_TEST" 2>&1 | sed 's/^/      /' >&2 || true
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then
+  echo "check_resolve_pr_threads: PASS ($pass tests)"
+  exit 0
+else
+  echo "check_resolve_pr_threads: FAIL ($fail of $((pass + fail)) tests)" >&2
+  exit 1
+fi

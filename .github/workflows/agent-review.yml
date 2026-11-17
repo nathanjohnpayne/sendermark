@@ -1,0 +1,3439 @@
+# Note: CodeRabbit (Phase 2.5) is handled by the CodeRabbit GitHub App
+# and does not require a CI workflow step. It runs automatically when
+# installed on the repo. See .github/review-policy.yml for enablement.
+name: Agent Review Pipeline
+
+on:
+  pull_request:
+    # `synchronize` (every push on an open PR) is in the list so
+    # `load-config` re-parses `.github/review-policy.yml` on every
+    # commit, not just on `opened` / `ready_for_review`. Without it,
+    # a shell-parser regression can land on main and only surface
+    # weeks later when the next PR happens to be opened. See #59.
+    # `reopened` is included so the approval-readiness path (#495) actually
+    # fires: the job `if:` matches `synchronize || reopened`, but a reopened
+    # event reaches this workflow only when subscribed here.
+    # `unlabeled` is the #620 readiness retry: on an over-threshold PR with a
+    # carried-over approval, update-branch makes triage re-apply
+    # needs-external-review, the live label re-verify sees it
+    # and hard-fails (correctly), and auto-clear removes the label moments
+    # later once the clearance gate passes — with no trigger on the removal,
+    # the PR sat CLEAN-but-unmerged until a human reran the failed job.
+    # `edited` re-evaluates carried approvals after mutable PR metadata or the
+    # base branch changes, but it does not itself report readiness (#1094).
+    types: [opened, ready_for_review, labeled, synchronize, reopened, edited, unlabeled]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+# #1094: mutable PR events share one latest-state enforcement group, but every
+# APPROVED webhook gets a review-ID group and is never cancelled. The reviews
+# API can lag a webhook; cancelling approval A when approval B arrives could
+# therefore let B's replacement run miss A entirely. A's durable run keeps its
+# own payload fallback and will classify/dismiss it. GitHub also evicts an
+# older PENDING member of a shared group even when cancel-in-progress is false,
+# so events that skip the guard use a run-unique group. COMMENTED reviews and
+# unrelated label events can neither cancel nor replace enforcement; only the
+# needs-external-review force-on label joins mutable approval enforcement.
+concurrency:
+  group: >-
+    agent-review-${{ github.event.pull_request.number }}-${{
+      ((github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved' &&
+        format('approval-{0}', github.event.review.id)) ||
+       ((github.event_name == 'pull_request' &&
+         (github.event.action == 'synchronize' ||
+          github.event.action == 'reopened' ||
+          github.event.action == 'edited' ||
+          (github.event.action == 'labeled' &&
+           github.event.label.name == 'needs-external-review') ||
+          (github.event.action == 'unlabeled' &&
+           contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
+        'approval-enforcement') || github.run_id }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request' &&
+        (github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))) }}
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Read review-policy.yml configuration
+  # ──────────────────────────────────────────────
+  load-config:
+    # Runs on opened, ready_for_review, synchronize, reopened, and edited so the
+    # parser exercises every commit pushed to an open PR, not just
+    # initial open. `reopened` is included for the #495 readiness path: a PR
+    # changed while closed and then reopened, or retargeted through an edit,
+    # must have its policy
+    # re-parsed here BEFORE approval readiness evaluates, so the
+    # threshold/paths feeding triage reflect the changed diff rather than
+    # a stale snapshot. Ordinary `labeled` events remain excluded so reviewer
+    # assignment cannot re-fire on every label edit. The single force-on label
+    # is admitted for invalidation only; `assign` has its own narrower guard
+    # and remains scoped to opened/ready. See #59 for the SKIPPED-as-SUCCESS
+    # miss this closes and Codex's P2 on PR #131 for why generic labeled
+    # events are excluded.
+    # #557: ALSO run on approved pull_request_review events. The
+    # legacy-named auto-merge-on-approval registered-reviewer gate
+    # reads needs.load-config.outputs.reviewers on the direct-approval
+    # path; if load-config is skipped on review events that list is empty,
+    # the gate defaults REVIEWERS_JSON to [], rejects every approver as
+    # "not a registered reviewer", and never reaches readiness validation.
+    # The merge still backstops via merge-clearance-gate. This job
+    # only reads the static review-policy.yml, so it is event-shape-agnostic.
+    if: >
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'opened' ||
+        github.event.action == 'ready_for_review' ||
+        github.event.action == 'synchronize' ||
+        github.event.action == 'reopened' ||
+        github.event.action == 'edited' ||
+        (github.event.action == 'labeled' &&
+         github.event.label.name == 'needs-external-review') ||
+        github.event.action == 'unlabeled')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved')
+    runs-on: ubuntu-latest
+    outputs:
+      threshold: ${{ steps.config.outputs.threshold }}
+      paths: ${{ steps.config.outputs.paths }}
+      reviewers: ${{ steps.config.outputs.reviewers }}
+      author_identity: ${{ steps.config.outputs.author_identity }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Trusted default-branch checkout (#788). This step now shells out to
+          # scripts/workflow/ helpers with a token in the environment, so the
+          # HELPER CODE must come from the default branch and never from the PR
+          # head — the same trust rule the triage job below states. The default
+          # checkout ref made this the PR's own merge ref on `pull_request`
+          # events and the default branch on `pull_request_review` events, so
+          # the same PR was parsed from two different files depending on which
+          # event woke the job.
+          #
+          # The POLICY the helpers read is a separate decision, resolved from
+          # the PR base by scripts/workflow/resolve_base_policy.sh below.
+          ref: ${{ github.event.repository.default_branch }}
+          # Explicit-token gh / github-script only, no authenticated git, so
+          # don't leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
+
+      - name: Parse the governing review-policy.yml
+        id: config
+        env:
+          # Only consumed on the non-default-base path, where the resolver
+          # fetches the base branch's policy. A default-base PR — every PR in
+          # the fleet today — makes no API call at all, so an unset secret is
+          # harmless there and fails closed (empty reviewer allow-list)
+          # everywhere else. Mirrors the triage job's resolver invocation.
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # Bootstrap-skew guard (the #577/#590 shape). The checkout above is
+          # pinned to the DEFAULT branch so the helper code is trusted, which
+          # means the helper is absent from this tree on exactly two
+          # occasions: the PR that INTRODUCES it (this one), and each
+          # consumer's first sync wave — .mergepath-sync.yml makes the
+          # workflow and scripts/workflow/ travel together, but they land IN
+          # that PR, not on the consumer's default branch before it runs.
+          # Without this guard `bash <missing file>` exits 127 and the step —
+          # and the job — hard-fail.
+          #
+          # A failed load-config is the fail-OPEN outcome this whole step
+          # exists to avoid: `triage` declares `needs: [load-config]` with no
+          # `always()`, so it would be SKIPPED and never apply or refresh
+          # `needs-external-review` (#59's SKIPPED-as-SUCCESS class), and
+          # the legacy-named approval-readiness job would be skipped with it.
+          #
+          # So emit the SAME fail-closed outputs load_review_config.sh emits
+          # when it cannot resolve the governing policy, and exit 0:
+          # `reviewers=[]` (assign assigns nobody; the readiness-admission gate
+          # already defaults `REVIEWERS_JSON` to `[]` and rejects every
+          # approver as unregistered), `threshold=0` (triage's preliminary
+          # calculation requires external review), `paths=[]`,
+          # `author_identity=` unproven. Requiredness itself is unaffected
+          # either way: triage re-resolves the base policy for itself, and
+          # pr-review-policy.yml labels independently from a base worktree.
+          # The step activates in full the moment this lands on the default
+          # branch. A PR cannot fake the skew to reach this branch — the test
+          # is against the default-branch tree, which no unmerged PR alters.
+          LOADER="scripts/workflow/load_review_config.sh"
+          if [ ! -f "$LOADER" ]; then
+            echo "::notice::$LOADER is not on the default branch yet (the bootstrap PR introducing it, or a consumer's first sync wave); emitting fail-closed load-config outputs — empty reviewer allow-list, threshold 0 — and soft-passing so triage is not skipped."
+            {
+              echo "threshold=0"
+              echo "paths=[]"
+              echo "reviewers=[]"
+              echo "author_identity="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CONFIG=".github/review-policy.yml"
+          if [ ! -f "$CONFIG" ]; then
+            echo "ERROR: $CONFIG not found"
+            exit 1
+          fi
+
+          # Parsing lives in scripts/workflow/load_review_config.sh so it can
+          # be exercised hermetically (tests/test_load_review_config.sh, run by
+          # scripts/ci/check_external_review_helpers) — the same extraction
+          # this repo applied to parse_policy_list.sh after #54/#57.
+          #
+          # It resolves the policy that GOVERNS this PR (the base branch's)
+          # through the shared resolver that merge-clearance-gate.sh,
+          # codex-review-check.sh and the triage job also use, then emits
+          # threshold / paths / reviewers / author_identity from it. Passing
+          # --base-ref/--base-sha/--default-branch rather than --pr is
+          # load-bearing: it keeps the default-base short circuit free of any
+          # API call (#769), which matters because this job runs on every push
+          # to every open PR in the fleet.
+          bash "$LOADER" \
+            --repo "$REPO" \
+            --base-ref "$BASE_REF" \
+            --base-sha "$BASE_SHA" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --default-config "$CONFIG"
+
+  # ──────────────────────────────────────────────
+  # Job 2: Auto-label PRs that need external review
+  # ──────────────────────────────────────────────
+  triage:
+    needs: [load-config]
+    # `synchronize` / `reopened` are included alongside
+    # opened/ready_for_review so any push-triggered readiness retry gets
+    # threshold and protected-path labels (`needs-external-review`)
+    # REFRESHED against the changed diff before it evaluates. Without this,
+    # an originally-under-threshold PR whose later push or closed-state
+    # change crossed the threshold (or touched a protected path) could
+    # proceed on a stale/missing label snapshot. Mirrors load-config, which
+    # also handles synchronize/reopened so this job's threshold/paths inputs
+    # are freshly parsed. Approved review events also run this same decision
+    # path so block-self-approval consumes one authoritative Phase 4 result
+    # rather than a second threshold/path implementation. Blocking-label
+    # `edited` re-evaluates the mutable body/base inputs before a carried
+    # approval can survive them. The force-on `labeled` event and blocking-label
+    # `unlabeled` events run in classification-only mode: the independence
+    # guard needs current Phase 4 scope, while triage must neither re-add the
+    # label already added nor undo the settle event that just removed it
+    # (#620/#1094).
+    if: >
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      ((github.event_name == 'pull_request' &&
+        (github.event.action == 'opened' ||
+         github.event.action == 'ready_for_review' ||
+         github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))) ||
+       (github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved'))
+    runs-on: ubuntu-latest
+    outputs:
+      needs_external: ${{ steps.check.outputs.needs_external }}
+      phase_4_required: ${{ steps.check.outputs.phase_4_required }}
+      phase_4_intrinsic_required: ${{ steps.check.outputs.phase_4_intrinsic_required }}
+      classified_head: ${{ steps.check.outputs.classified_head }}
+      classified_base_ref: ${{ steps.check.outputs.classified_base_ref }}
+      classified_base_sha: ${{ steps.check.outputs.classified_base_sha }}
+      reviewers: ${{ steps.check.outputs.reviewers }}
+      author_identity: ${{ steps.check.outputs.author_identity }}
+    steps:
+      - name: Checkout trusted workflow helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job shells out only to trusted default-branch helpers; never
+          # run helper code from the PR head under the label-writing PAT.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Evaluate PR against review-policy.yml
+        id: check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          THRESHOLD: ${{ needs.load-config.outputs.threshold }}
+          PROTECTED_PATHS: ${{ needs.load-config.outputs.paths }}
+          GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+        with:
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            // BEGIN REVIEW TRIAGE BOOTSTRAP
+            // Generated from scripts/workflow/review-triage.cjs. Do not edit.
+            async function evaluateReviewTriage({github, context, core, require, mutate = true}) {
+            const childProcess = require('child_process');
+            const fs = require('fs');
+            const os = require('os');
+            const path = require('path');
+            // BEGIN TRIAGE READ BOOTSTRAP
+            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.
+            function bootstrapApprovalTriage() {
+              // Read-only GitHub operations: retry transport failures, never policy drift or
+              // a permanent authorization/not-found response. Three attempts, 250ms then 500ms backoff (750ms total).
+              async function retryGithubRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
+                for (let attempt = 0; ; attempt += 1) {
+                  try {
+                    return await read();
+                  } catch (error) {
+                    const status = Number(error && error.status || 0);
+                    const detail = [error && error.code, error && error.message,
+                      error && error.cause && error.cause.code,
+                      error && error.cause && error.cause.message].join(' ');
+                    const permanent = status >= 400 && status < 500 && status !== 429;
+                    const transient = status === 429 || (status >= 500 && status <= 599) ||
+                      /EPIPE|ECONNRESET|ETIMEDOUT|fetch failed/i.test(detail);
+                    if (attempt >= 2 || permanent || !transient) throw error;
+                    await wait(250 * (attempt + 1));
+                  }
+                }
+              }
+
+              // This only preserves an existing exact-event approval; it never classifies,
+              // grants eligibility or permits merge while triage remains unsuccessful.
+              async function preserveApprovalAfterTriageFailure(input) {
+                const {review, registered, eventPr, readPr, snapshot} = input;
+                if (registered !== true || !review || !Number.isInteger(review.id) || review.id <= 0 ||
+                    String(review.state).toUpperCase() !== 'APPROVED' ||
+                    !eventPr || !eventPr.head || !eventPr.head.sha ||
+                    !eventPr.base || !eventPr.base.ref || !eventPr.base.sha ||
+                    !eventPr.user || typeof eventPr.user.login !== 'string' || !eventPr.user.login ||
+                    (eventPr.body !== null && typeof eventPr.body !== 'string') || review.commit_id !== eventPr.head.sha) return false;
+                try {
+                  const expected = snapshot(eventPr);
+                  const before = await retryGithubRead(readPr);
+                  if (snapshot(before) !== expected) return false;
+                  const after = await retryGithubRead(readPr);
+                  return snapshot(after) === expected;
+                } catch {
+                  return false;
+                }
+              }
+
+              function selectApprovalTriage(input) {
+                if (input.modulePresent) return input.loadCanonical();
+                if (input.trustedWorkflow.includes('const approvalTriage = selectApprovalTriage(')) {
+                  throw new Error('trusted workflow requires the missing approval-triage canonical helper');
+                }
+                return input.loadBootstrap();
+              }
+              return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};
+            }
+            // END TRIAGE READ BOOTSTRAP
+            const {selectApprovalTriage} = bootstrapApprovalTriage();
+            const approvalTriagePath = path.resolve(process.env.GITHUB_WORKSPACE,
+              'scripts/workflow/approval-triage.cjs');
+            const approvalTriage = selectApprovalTriage({
+              modulePresent: fs.existsSync(approvalTriagePath),
+              trustedWorkflow: fs.readFileSync(path.resolve(process.env.GITHUB_WORKSPACE,
+                '.github/workflows/agent-review.yml'), 'utf8'),
+              loadCanonical: () => require(approvalTriagePath),
+              loadBootstrap: bootstrapApprovalTriage,
+            });
+            const {retryGithubRead} = approvalTriage;
+
+            // BEGIN TRIAGE EVENT-LOOP-SAFE IO
+            // Trusted helpers run without blocking the event loop (#2178). A
+            // blocking execFileSync froze it for the whole helper run, about
+            // 30s for the carry-forward on a large PR. The server closed the
+            // idle keep-alive socket in that window, undici never saw the
+            // close, and the next label POST went out on the dead socket
+            // ("other side closed"). Same contract as execFileSync: resolves
+            // stdout, takes `input`, echoes stderr to the log, and rejects on
+            // a non-zero exit, a timeout, or an `input` the helper never read.
+            function execFileAsync(file, args, options = {}) {
+              const {input, ...execOptions} = options;
+              return new Promise((resolve, reject) => {
+                let inputError = null;
+                const child = childProcess.execFile(file, args, execOptions,
+                  (error, stdout) => {
+                    // Settle once stdin has closed, so an EPIPE on `input`
+                    // that lands after the exit still rejects.
+                    const settle = () => {
+                      if (error || inputError) reject(error || inputError);
+                      else resolve(stdout);
+                    };
+                    if (child.stdin.closed) settle();
+                    else child.stdin.once('close', settle);
+                  });
+                child.stderr.on('data', chunk => process.stderr.write(chunk));
+                child.stdin.on('error', error => {
+                  if (input !== undefined) inputError = error;
+                });
+                child.stdin.end(input);
+              });
+            }
+
+            // Adding a label that is already present changes nothing, so a
+            // label add lost in transport or answered with a 5xx is safe to
+            // send again. One retry only: a 4xx or a second failure still
+            // throws, and the step fails closed as before.
+            async function retryIdempotentLabelWrite(write, {
+              wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
+              warn = message => console.log(message),
+            } = {}) {
+              try {
+                return await write();
+              } catch (error) {
+                if (!labelWriteMayRetry(error)) throw error;
+                warn(`Label write failed (${error.message}); retrying once.`);
+                await wait(500);
+                return await write();
+              }
+            }
+
+            function labelWriteMayRetry(error) {
+              const status = Number(error && error.status || 0);
+              if (status >= 400 && status < 500) return false;
+              if (status >= 500 && status <= 599) return true;
+              const detail = [];
+              for (let cause = error, depth = 0; cause && depth < 4;
+                cause = cause.cause, depth += 1) {
+                detail.push(cause.code, cause.message);
+              }
+              return /UND_ERR_SOCKET|other side closed|ECONNRESET|EPIPE|ETIMEDOUT|fetch failed/i
+                .test(detail.join(' '));
+            }
+            // END TRIAGE EVENT-LOOP-SAFE IO
+
+            function parseReviewerList(raw, label) {
+              let reviewers;
+              try {
+                reviewers = JSON.parse(raw || '[]');
+              } catch (error) {
+                throw new Error(`${label} reviewer allow-list is malformed`, {cause: error});
+              }
+              if (
+                !Array.isArray(reviewers) ||
+                reviewers.some(reviewer =>
+                  typeof reviewer !== 'string' || reviewer.trim().length === 0
+                )
+              ) {
+                throw new Error(`${label} reviewer allow-list is malformed`);
+              }
+              return reviewers;
+            }
+
+            // BEGIN TRIAGE POLICY MATERIALIZATION DECISION
+            function shouldMaterializeDefaultPolicy({
+              baseRef,
+              baseSha,
+              defaultBranch,
+              checkoutSha,
+            }) {
+              return baseRef === defaultBranch &&
+                (!checkoutSha || checkoutSha !== baseSha);
+            }
+            // END TRIAGE POLICY MATERIALIZATION DECISION
+
+            // BEGIN TRIAGE PHASE 4 DECISION
+            // BEGIN STABLE PR LABEL NAMES BOOTSTRAP
+            // Generated from scripts/self-approval-detector.cjs. Do not edit.
+            function stablePrLabelNames(candidate) {
+              const labels = candidate && candidate.labels;
+              if (
+                !Array.isArray(labels) ||
+                labels.some(label =>
+                  !label || typeof label.name !== 'string' || !label.name.trim()
+                )
+              ) {
+                throw new Error('live PR labels are unavailable or malformed');
+              }
+              return labels.map(label => label.name).sort();
+            }
+            // END STABLE PR LABEL NAMES BOOTSTRAP
+
+            function phase4RequiredForTriage({
+              requiresReview,
+              laneVerifiedHead,
+              pr,
+            }) {
+              const forceOn = stablePrLabelNames(pr)
+                .includes('needs-external-review');
+              return forceOn || phase4IntrinsicRequiredForTriage({
+                requiresReview,
+                laneVerifiedHead,
+              });
+            }
+
+            function phase4IntrinsicRequiredForTriage({
+              requiresReview,
+              laneVerifiedHead,
+            }) {
+              return Boolean(requiresReview) && !laneVerifiedHead;
+            }
+
+            function triageMayMutateLabels({eventName, action, labelName}) {
+              if (eventName !== 'pull_request') return true;
+              return action !== 'unlabeled' && !(
+                action === 'labeled' &&
+                labelName === 'needs-external-review'
+              );
+            }
+            // END TRIAGE PHASE 4 DECISION
+
+            async function loadGoverningIdentities(pr, policyConfigPath) {
+              const outputPath = path.join(
+                os.tmpdir(),
+                `mergepath-live-policy-${process.pid}-${Date.now()}.out`,
+              );
+              try {
+                fs.writeFileSync(outputPath, '');
+                await execFileAsync(
+                  'bash',
+                  [
+                    'scripts/workflow/load_review_config.sh',
+                    '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                    '--base-ref', pr.base.ref,
+                    '--base-sha', pr.base.sha,
+                    '--default-branch', context.payload.repository.default_branch,
+                    '--default-config', policyConfigPath,
+                    '--output', outputPath,
+                  ],
+                  {encoding: 'utf8', env: process.env},
+                );
+                const outputs = new Map();
+                for (const line of fs.readFileSync(outputPath, 'utf8').split(/\r?\n/)) {
+                  if (!line) continue;
+                  const separator = line.indexOf('=');
+                  if (separator <= 0) {
+                    throw new Error('governing policy output is malformed');
+                  }
+                  const key = line.slice(0, separator);
+                  if (outputs.has(key)) {
+                    throw new Error(`governing policy output repeats ${key}`);
+                  }
+                  outputs.set(key, line.slice(separator + 1));
+                }
+                const reviewers = parseReviewerList(
+                  outputs.get('reviewers'),
+                  'governing policy',
+                );
+                const authorIdentity = outputs.get('author_identity') || '';
+                if (reviewers.length === 0 || !authorIdentity.trim()) {
+                  throw new Error(
+                    'governing policy identities are unavailable; refusing to classify approval',
+                  );
+                }
+                return {reviewers, authorIdentity};
+              } finally {
+                removeOutputFile(outputPath);
+              }
+            }
+
+            // A cleanup failure other than ENOENT still surfaces from the finally block
+            // above, exactly as the inline throw it replaces did; the helper only keeps
+            // the throw out of the finally clause itself (no-unsafe-finally).
+            function removeOutputFile(outputPath) {
+              try {
+                fs.unlinkSync(outputPath);
+              } catch (error) {
+                if (error && error.code !== 'ENOENT') throw error;
+              }
+            }
+            const eventPr = context.payload.pull_request;
+            const snapshotKey = candidate => JSON.stringify({
+              head: candidate && candidate.head && candidate.head.sha,
+              baseRef: candidate && candidate.base && candidate.base.ref,
+              baseSha: candidate && candidate.base && candidate.base.sha,
+              labels: stablePrLabelNames(candidate),
+            });
+            const {data: pr} = await retryGithubRead(() => github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: eventPr.number,
+            }));
+            const triageSnapshot = snapshotKey(pr);
+            if (snapshotKey(eventPr) !== triageSnapshot) {
+              core.notice(
+                'The event PR snapshot is stale; triage is evaluating the ' +
+                'current live head/base and the approval guard will suppress ' +
+                'direct-event violation attribution for the stale webhook.',
+              );
+            }
+            const eventLabelName = context.payload.label &&
+              context.payload.label.name;
+            const isForceOnLabelEvent =
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'labeled' &&
+              eventLabelName === 'needs-external-review';
+            const mayMutateLabels = triageMayMutateLabels({
+              eventName: context.eventName,
+              action: context.payload.action,
+              labelName: eventLabelName,
+            });
+
+            const files = await retryGithubRead(() => github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+              }
+            ));
+            const {data: prAfterFiles} = await retryGithubRead(() => github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: eventPr.number,
+            }));
+            if (snapshotKey(prAfterFiles) !== triageSnapshot) {
+              throw new Error(
+                'PR head/base changed while triage read the live file list; ' +
+                'refusing to classify a mixed snapshot. A newer event will retry.',
+              );
+            }
+
+            // Config must come from the PR BASE, not this default-branch
+            // checkout (#763/#769). This job checks out the default branch so
+            // the HELPER code is trusted — correct, and unchanged — but the
+            // helper was then handed the default branch's review-policy.yml. A
+            // PR targeting a stricter non-default base was therefore judged by
+            // the LOOSER policy, and since `needsExternal` is overwritten by
+            // the helper result below, that could flip it to false and skip the
+            // external-review label entirely.
+            //
+            // Resolution goes through the SHARED helper that
+            // merge-clearance-gate.sh and codex-review-check.sh also use, so
+            // every policy decision in the fleet reads one implementation
+            // rather than four near-copies. For a default-base PR it returns
+            // the checked-out path and makes no API call; it fails (exit 2)
+            // only for a positively-identified non-default base whose policy
+            // cannot be read, which is the one case where silently using the
+            // default-branch copy would be the bypass.
+            let policyConfigPath = '.github/review-policy.yml';
+            let policyReadFailed = false;
+            try {
+              let checkoutSha = '';
+              try {
+                checkoutSha = (await execFileAsync(
+                  'git',
+                  ['rev-parse', 'HEAD'],
+                  {encoding: 'utf8'},
+                )).trim();
+              } catch (error) {
+                core.warning(
+                  `Could not prove the trusted checkout SHA (${error.message}); ` +
+                  `materializing the exact live default-base policy instead.`,
+                );
+              }
+              const policyResolverArgs = [
+                'scripts/workflow/resolve_base_policy.sh',
+                '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                '--base-ref', pr.base.ref,
+                '--base-sha', pr.base.sha,
+                '--default-branch', context.payload.repository.default_branch,
+                '--default-config', '.github/review-policy.yml',
+              ];
+              if (shouldMaterializeDefaultPolicy({
+                baseRef: pr.base.ref,
+                baseSha: pr.base.sha,
+                defaultBranch: context.payload.repository.default_branch,
+                checkoutSha,
+              })) {
+                policyResolverArgs.push('--materialize-default');
+              }
+              policyConfigPath = (await execFileAsync(
+                'bash',
+                policyResolverArgs,
+                {encoding: 'utf8', env: process.env}
+              )).trim();
+              console.log(`Governing review policy: ${policyConfigPath}`);
+            } catch (e) {
+              policyReadFailed = true;
+              core.warning(
+                `Could not resolve the governing review policy ` +
+                `(${e.message}); requiring external review fail-closed rather ` +
+                `than judging this PR by the default-branch policy.`
+              );
+            }
+
+            let governingIdentities = {reviewers: [], authorIdentity: ''};
+            if (!policyReadFailed) {
+              try {
+                governingIdentities = await loadGoverningIdentities(
+                  pr,
+                  policyConfigPath,
+                );
+              } catch (error) {
+                core.warning(
+                  `Could not load live governing identities (${error.message}); ` +
+                  `exporting an empty reviewer allow-list so approval ` +
+                  `enforcement fails closed.`,
+                );
+              }
+            }
+
+            // Threshold and protected-path requiredness (rename sources included, #763)
+            // come only from scripts/workflow/external_review_fingerprint.sh, judged by
+            // the governing base policy. Every branch below assigns both values; the
+            // former inline threshold/glob twin was always overwritten and is gone.
+            let needsExternal;
+            let externalReviewFingerprint;
+            let filesPath = '';
+            const repo = `${context.repo.owner}/${context.repo.repo}`;
+            if (policyReadFailed) {
+              // Base policy unknown — see the fail-closed note above. Skip the
+              // helper entirely: running it against the default-branch config
+              // is exactly the bypass being closed, and its result would
+              // OVERWRITE needsExternal.
+              needsExternal = true;
+              externalReviewFingerprint = '';
+              console.log(
+                'External-review fail-closed: base review policy unreadable; ' +
+                'requiring review and skipping the fingerprint calculation.'
+              );
+            } else {
+              try {
+                filesPath = path.join(os.tmpdir(), `mergepath-pr-${pr.number}-files.json`);
+                fs.writeFileSync(filesPath, JSON.stringify(files));
+                const fingerprintRaw = await execFileAsync(
+                  'bash',
+                  [
+                    'scripts/workflow/external_review_fingerprint.sh',
+                    '--repo', repo,
+                    '--pr', String(pr.number),
+                    '--ref', pr.head.sha,
+                    '--config', policyConfigPath,
+                    '--files-json', filesPath,
+                  ],
+                  {encoding: 'utf8', env: process.env}
+                );
+                const fingerprint = JSON.parse(fingerprintRaw);
+                needsExternal = Boolean(fingerprint.requires_review);
+                externalReviewFingerprint = fingerprint.fingerprint || '';
+              } catch (e) {
+                core.warning(
+                  `External-review fingerprint calculation failed; ` +
+                  `labeling fail-closed (${e.message}).`
+                );
+                needsExternal = true;
+                externalReviewFingerprint = '';
+              }
+            }
+
+            // PROPAGATION-LANE-DEFER (#656): same-repo PR workflows can impersonate github-actions[bot].
+            // Only a fresh byte verification from trusted default-branch code
+            // can exempt the current pair; comments grant no authority.
+            let laneVerifiedHead = false;
+            if (needsExternal && !policyReadFailed) {
+              try {
+                await execFileAsync('bash', [
+                  'scripts/workflow/verify-live-propagation.sh',
+                  `${context.repo.owner}/${context.repo.repo}`,
+                  String(pr.number), pr.head.sha, pr.base.sha, policyConfigPath,
+                ], {input: JSON.stringify(pr), encoding: 'utf8', timeout: 120000});
+                laneVerifiedHead = true;
+              } catch (e) {
+                laneVerifiedHead = false;
+                core.warning(`Propagation byte verification did not clear (${e.message}); labeling fail-closed.`);
+              }
+            }
+
+            // Export intrinsic threshold/path requiredness separately from
+            // the then-live force-on result. A carry-forward below can clear
+            // already-reviewed bytes, but does not turn the PR into Phase 3.
+            // Only the exact-pair, byte-verified propagation lane has the
+            // policy's under-threshold-equivalent standing. The approval
+            // guard recombines the intrinsic output with its own stabilized
+            // live labels so overlapping add/remove events cannot latch this
+            // snapshot's mutable force-on state (#1094).
+            const phase4IntrinsicRequired =
+              phase4IntrinsicRequiredForTriage({
+                requiresReview: needsExternal,
+                laneVerifiedHead,
+              });
+            const phase4Required = phase4RequiredForTriage({
+              requiresReview: needsExternal,
+              laneVerifiedHead,
+              pr,
+            });
+
+            // The C2 write is separable (#2727 3d): addsExternalLabel records the
+            // decision, and only a mutate call sends it. The trusted consumer classifies
+            // with mutate false and writes from its own job.
+            let addsExternalLabel = false;
+            if (needsExternal && laneVerifiedHead) {
+              console.log(
+                `Propagation lane already byte-verified head/base ${pr.head.sha}/${pr.base.sha} ` +
+                `(github-actions[bot] v2 pair marker present) — skipping ` +
+                `needs-external-review add; the lane owns this PR's labeling.`
+              );
+            } else if (needsExternal) {
+              let carried = false;
+              try {
+                if (needsExternal && externalReviewFingerprint && filesPath) {
+                  const carryRaw = await execFileAsync(
+                    'bash',
+                    [
+                      'scripts/workflow/external_review_carryforward.sh',
+                      '--repo', repo,
+                      '--pr', String(pr.number),
+                      '--head', pr.head.sha,
+                      '--current-fingerprint', externalReviewFingerprint,
+                      '--config', policyConfigPath,
+                      '--files-json', filesPath,
+                    ],
+                    {encoding: 'utf8', env: process.env}
+                  );
+                  const carry = JSON.parse(carryRaw);
+                  carried = Boolean(carry.carried);
+                  if (carried) {
+                    needsExternal = false;
+                    console.log(
+                      `Codex already cleared the same external-review fingerprint ` +
+                      `on ${carry.source_commit} at ${carry.source_time}; skipping ` +
+                      `needs-external-review on base-only sync (#705).`
+                    );
+                  }
+                }
+              } catch (e) {
+                core.warning(
+                  `External-review fingerprint carry-forward check failed; ` +
+                  `labeling fail-closed using threshold/protected-path result (${e.message}).`
+                );
+              }
+
+              if (!carried && mayMutateLabels && needsExternal) {
+                addsExternalLabel = true;
+                if (mutate) {
+                  await retryIdempotentLabelWrite(
+                    () => github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: pr.number,
+                      labels: ['needs-external-review'],
+                    }),
+                    {warn: message => core.warning(message)},
+                  );
+                }
+              } else if (!mayMutateLabels && needsExternal) {
+                console.log(
+                  `Computed Phase 4 applicability for the ` +
+                  `${isForceOnLabelEvent ? 'force-on labeled' : 'unlabeled settle'} ` +
+                  `event without mutating needs-external-review (#620/#1094).`
+                );
+              }
+            }
+
+            core.setOutput('needs_external', needsExternal.toString());
+            core.setOutput('phase_4_required', phase4Required.toString());
+            core.setOutput(
+              'phase_4_intrinsic_required',
+              phase4IntrinsicRequired.toString(),
+            );
+            core.setOutput('classified_head', pr.head.sha);
+            core.setOutput('classified_base_ref', pr.base.ref);
+            core.setOutput('classified_base_sha', pr.base.sha);
+            core.setOutput(
+              'reviewers',
+              JSON.stringify(governingIdentities.reviewers),
+            );
+            core.setOutput(
+              'author_identity',
+              governingIdentities.authorIdentity,
+            );
+            core.setOutput('adds_external_label', addsExternalLabel.toString());
+            if (policyConfigPath !== '.github/review-policy.yml') {
+              try {
+                fs.unlinkSync(policyConfigPath);
+              } catch (error) {
+                if (error && error.code !== 'ENOENT') throw error;
+              }
+            }
+            }
+            // END REVIEW TRIAGE BOOTSTRAP
+            // #2727 3d: run the default branch's triage module, so a PR's
+            // edits to the copy above do not change its own classification.
+            // The copy runs only where the module is not on the default branch
+            // yet: the PR that adds it and each consumer's first sync. A
+            // default branch whose workflow already selects the module but
+            // lacks the file fails closed instead of falling back.
+            const reviewTriagePath = path.resolve(process.env.GITHUB_WORKSPACE,
+              'scripts/workflow/review-triage.cjs');
+            let evaluateTriage = evaluateReviewTriage;
+            if (fs.existsSync(reviewTriagePath)) {
+              ({evaluateReviewTriage: evaluateTriage} = require(reviewTriagePath));
+            } else if (fs.readFileSync(path.resolve(process.env.GITHUB_WORKSPACE,
+              '.github/workflows/agent-review.yml'), 'utf8')
+              .includes('const reviewTriagePath = path.resolve(')) {
+              throw new Error('the trusted workflow requires the missing scripts/workflow/review-triage.cjs');
+            }
+            await evaluateTriage({github, context, core, require, mutate: true});
+
+  # ──────────────────────────────────────────────
+  # Job 3: Assign reviewer (internal self-peer review)
+  # ──────────────────────────────────────────────
+  assign:
+    needs: [load-config, triage]
+    if: >
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      (github.event.action == 'opened' || github.event.action == 'ready_for_review')
+    runs-on: ubuntu-latest
+    steps:
+      # The reviewer-assignment parse below runs the SHARED PR-body parser
+      # (scripts/lib/pr-body-contract.mjs) rather than a local regex, so this
+      # job needs the repo on disk. Explicit-token github-script only, no
+      # authenticated git, so don't leave the checkout token in .git/config
+      # (#548 / Codex #550).
+      - name: Check out the shared PR-body parser
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # TRUSTED default-branch checkout, not the PR merge ref (#788, and
+          # the same rule load-config uses above). This job hands a
+          # write-capable token to github-script and then EXECUTES
+          # scripts/lib/pr-body-contract.mjs from this checkout. On
+          # `pull_request` the default ref is the PR merge ref, so an
+          # unpinned checkout would run PR-authored JavaScript with that
+          # token in scope. Disabling checkout credential persistence removes the
+          # checkout credential; it does NOT make the checked-out code
+          # trusted, and the parser must be the canonical one regardless.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Assign reviewer identity based on Authoring-Agent
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          AUTHOR_IDENTITY: ${{ needs.load-config.outputs.author_identity }}
+          REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
+        with:
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+            const authorIdentity = process.env.AUTHOR_IDENTITY || 'nathanjohnpayne';
+            const reviewers = JSON.parse(process.env.REVIEWERS_JSON || '[]');
+
+            // Under the new policy, all PRs are authored by the author identity.
+            if (author !== authorIdentity) {
+              console.log(`Author ${author} is not ${authorIdentity}; skipping auto-assignment.`);
+              return;
+            }
+
+            if (reviewers.length === 0) {
+              console.log('No reviewers configured in review-policy.yml');
+              return;
+            }
+
+            // Read the Authoring-Agent line from the PR body to determine which
+            // agent wrote the code. Per REVIEW_POLICY.md, the same agent reviews
+            // under its own reviewer identity (e.g., claude → nathanpayne-claude).
+            //
+            // This MUST use the shared parser, not a local regex (#1121). The
+            // previous `body.match(/^Authoring-Agent:.../mi)` took the first RAW
+            // line, so a marker inside an HTML comment counted as a declaration
+            // here while gh-pr-guard.sh ignored it. The same PR could then be
+            // assigned to one reviewer while the guard attributed it to another,
+            // and merge-clearance could wrongly consider the same-agent Codex
+            // fallback eligible. One parser, one answer, everywhere.
+            const { execFileSync } = require('child_process');
+            const body = pr.body || '';
+            // Bounded to match PR_BODY_CONTRACT_TIMEOUT_SECONDS in
+            // scripts/lib/pr-body-contract.sh (#1281). This call site does not
+            // go through that lib, so it carries the bound itself; the parity
+            // suite asserts the two agree.
+            //
+            // A timeout lands in the catch below and yields '', which for
+            // ASSIGNMENT is the conservative outcome: an empty agent name
+            // cannot equal any reviewer, so assignment falls through to the
+            // default rather than guessing. That is safe HERE and only here --
+            // assignment is not a gate. The same empty value would be
+            // fail-OPEN in gate (b), which is why the shell lib suppresses
+            // output on expiry instead of returning a blank contract.
+            const PR_BODY_PARSE_TIMEOUT_MS = 120000;
+            const runParser = (flag) => {
+              try {
+                return execFileSync('node', ['scripts/lib/pr-body-contract.mjs', flag],
+                  {
+                    input: body, encoding: 'utf8',
+                    timeout: PR_BODY_PARSE_TIMEOUT_MS, killSignal: 'SIGKILL',
+                  }).trim();
+              } catch (e) {
+                console.log(`shared PR-body parser failed for ${flag}: ${e.message}`);
+                return '';
+              }
+            };
+
+            // Exactly one VISIBLE marker, matching the guard and the merge gate.
+            // Zero, or more than one, is not a declaration and must not resolve
+            // to a reviewer — falling through to the default keeps assignment
+            // conservative instead of guessing from an ambiguous body.
+            const agentCount = runParser('--author-count');
+            const agentName = agentCount === '1' ? runParser('--author').toLowerCase() : '';
+            let reviewer;
+
+            if (agentName) {
+              const matchingReviewer = reviewers.find(
+                r => r.endsWith(`-${agentName}`)
+              );
+              if (matchingReviewer) {
+                reviewer = matchingReviewer;
+                console.log(`Authoring-Agent: ${agentName} → assigning ${reviewer}`);
+              } else {
+                console.log(`Authoring-Agent: ${agentName} has no matching reviewer identity, using first available.`);
+                reviewer = reviewers[0];
+              }
+            } else {
+              console.log('No Authoring-Agent line found in PR body; assigning first available reviewer.');
+              reviewer = reviewers[0];
+            }
+
+            const { data: existingReviewers } = await github.rest.pulls.listRequestedReviewers({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+            });
+            const alreadyRequested = existingReviewers.users.map(u => u.login);
+
+            if (!alreadyRequested.includes(reviewer)) {
+              await github.rest.pulls.requestReviewers({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                reviewers: [reviewer],
+              });
+              console.log(`Assigned ${reviewer} for internal self-peer review.`);
+            }
+
+  # Note: no CI-side invoke-reviewer job exists. Phase 2 internal
+  # self-peer review is performed by the authoring agent in its own
+  # session — the identity-checked reviewer wrapper selects API attribution
+  # (e.g., nathanpayne-claude) using the session's reviewer credential;
+  # Human Git author identity stays fixed; retain the local human committer
+  # or the approved signed Claude cloud committer. See REVIEW_POLICY.md § Phase 2
+  # and the AGENTS.md reading order. A headless Claude/Codex CLI
+  # invocation in CI is intentionally NOT used: it (a) bypasses the
+  # in-session tool context the agent already has, (b) adds a stale
+  # API-key failure surface unrelated to the PR, and (c) duplicates
+  # work the agent is already doing as part of the PR loop.
+
+  # ──────────────────────────────────────────────
+  # Job 4: Detect agent disagreement → escalate
+  # ──────────────────────────────────────────────
+  detect-disagreement:
+    if: github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted disagreement detector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # #2775: the github-script step below holds the CI-actor PAT and
+          # require()s scripts/disagreement-detector.cjs. With no `ref:` a
+          # pull_request_review event checks out refs/pull/N/merge, so a
+          # same-repo branch could rewrite the detector and run it with the
+          # token. Load it only from the trusted default branch, as
+          # block-self-approval does. scripts/ci/check_pipeline_token_checkouts
+          # fails any token-holding job that regresses to this shape.
+          ref: ${{ github.event.repository.default_branch }}
+          # Explicit-token gh / github-script only, no authenticated git, so
+          # don't leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
+
+      # #975 (this job's row) and #2775: the reviewer allow-list comes from
+      # the policy governing the PR's base, through the same trusted loader
+      # load-config uses, not from the PR's own copy. Parsing it in shell also
+      # retires the run-time js-yaml install, an unpinned registry package
+      # the PAT-holding step used to require(). load-config cannot be
+      # reused directly: its `if:` admits only APPROVED review events, and
+      # this job needs CHANGES_REQUESTED events too.
+      - name: Resolve the governing reviewer allow-list
+        id: policy
+        env:
+          # Read-only, and used only when the policy is not already the
+          # checked-out one: a non-default base (the resolver fetches that
+          # base's file) or a default-branch tip that has moved past the
+          # event's base SHA (below). Otherwise no API call is made (#769).
+          # github.token can read this repository's contents, so no PAT is in
+          # scope while the policy is resolved.
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          LOADER="scripts/workflow/load_review_config.sh"
+          if [ ! -f "$LOADER" ]; then
+            # Fail closed: an empty allow-list makes the next step a no-op.
+            echo "::warning::$LOADER is not on the default branch; leaving needs-human-review unchanged."
+            echo "reviewers=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # On a default-base PR the loader reads the local policy with no API
+          # call (#769), but the checkout follows the movable default-branch
+          # tip. If that tip is not the event's base SHA, read the policy at
+          # BASE_SHA instead, so the classification uses one policy
+          # generation. A policy update landing mid-run must not clear an
+          # escalation. An unreadable policy leaves the list unproven, and
+          # the next step then fails closed.
+          CONFIG=".github/review-policy.yml"
+          if [ "$BASE_REF" = "$DEFAULT_BRANCH" ] && [ "$(git rev-parse HEAD)" != "$BASE_SHA" ]; then
+            CONFIG="$(mktemp)"
+            if ! gh api "repos/$REPO/contents/.github/review-policy.yml?ref=$BASE_SHA" \
+                -H "Accept: application/vnd.github.raw" > "$CONFIG"; then
+              echo "::warning::Could not read .github/review-policy.yml at base $BASE_SHA; the reviewer allow-list is unproven."
+              echo "reviewers=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          # The loader emits fail-closed outputs (reviewers=[]) and exits 0
+          # when it cannot resolve the governing policy.
+          bash "$LOADER" \
+            --repo "$REPO" \
+            --base-ref "$BASE_REF" \
+            --base-sha "$BASE_SHA" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --default-config "$CONFIG"
+
+      - name: Check for conflicting reviews
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEWERS_JSON: ${{ steps.policy.outputs.reviewers }}
+        with:
+          # #2775 C4: this step still needs a PAT. Removing needs-human-review
+          # must fire the `unlabeled` event that re-arms readiness (#620), and
+          # label events written with GITHUB_TOKEN start no workflow runs.
+          # Everything this process loads now comes from the trusted checkout.
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const path = require('path');
+
+            // Decision logic lives in scripts/disagreement-detector.cjs
+            // so the workflow and the fixture-driven test
+            // (scripts/ci/check_disagreement_detector) exercise the
+            // exact same code. See #259 for the regression this
+            // factoring closes.
+            const detector = require(
+              path.resolve(process.env.GITHUB_WORKSPACE, 'scripts/disagreement-detector.cjs')
+            );
+
+            // The whole decision, including the #975 unproven-allow-list rule,
+            // is resolveDisagreement() in the default branch's module (#2727
+            // 3d), which the trusted consumer also runs. Where the module
+            // predates it (the PR that adds it and each consumer's first
+            // sync), the run treats the allow-list as unproven: it classifies
+            // every reviewer, may only apply the label, and fails visibly.
+            const resolveDisagreement =
+              typeof detector.resolveDisagreement === 'function'
+                ? detector.resolveDisagreement
+                : ({reviews, headSha, hasLabel}) => {
+                  const everyone = [...new Set(reviews.map(r => r && r.user && r.user.login).filter(Boolean))];
+                  const decision = detector.decide({reviews, reviewerAccounts: everyone, headSha, hasLabel});
+                  return {decision: decision === 'remove' ? 'noop' : decision, allowListProven: false};
+                };
+
+            // Paginate reviews — long histories (>30) otherwise truncate and
+            // mask the latest-on-HEAD signal. Mirrors the pagination
+            // fix in pr-audit.yml (PR #255 P2).
+            const reviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                per_page: 100,
+              }
+            );
+
+            // Check if the label is currently applied
+            const labels = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            const hasLabel = labels.data.some(l => l.name === 'needs-human-review');
+
+            const {decision, allowListProven} = resolveDisagreement({
+              reviews,
+              reviewersJson: process.env.REVIEWERS_JSON,
+              headSha: context.payload.pull_request.head.sha,
+              hasLabel,
+            });
+
+            if (decision === 'apply') {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['needs-human-review'],
+              });
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: '**Agent disagreement detected.** One reviewer approved and another requested changes on the current HEAD. Escalating to @nathanjohnpayne for human tiebreaker per REVIEW_POLICY.md.',
+              });
+            } else if (decision === 'remove') {
+              // No live disagreement on the current HEAD — remove the
+              // label. Covers the #259 case: a stale CHANGES_REQUESTED
+              // on an older SHA is superseded by an APPROVED on HEAD.
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  name: 'needs-human-review',
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body: '**Agent disagreement resolved.** No live conflict on the current HEAD (latest review per reviewer, non-DISMISSED, commit_id == HEAD). Removing `needs-human-review` label.',
+                });
+              } catch (e) {
+                // Label may already be removed — ignore 404
+                if (e.status !== 404) throw e;
+              }
+            }
+            if (!allowListProven) {
+              core.setFailed('No governing available_reviewers list: classified every reviewer and never removed needs-human-review (#975).');
+            }
+            // decision === 'noop' — nothing to do.
+
+  # ──────────────────────────────────────────────
+  # Job 5: Enforce approval independence
+  # ──────────────────────────────────────────────
+  block-self-approval:
+    needs: [load-config, triage]
+    if: >
+      always() &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      ((github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved') ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         github.event.action == 'edited' ||
+         (github.event.action == 'labeled' &&
+          github.event.label.name == 'needs-external-review') ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name)))))
+    runs-on: ubuntu-latest
+    outputs:
+      eligible_approval: ${{ steps.check.outputs.eligible_approval }}
+      auto_arm_allowed: ${{ steps.retract_shared_author.outputs.auto_arm_allowed }}
+    steps:
+      - name: Checkout trusted self-approval detector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The review event can target untrusted PR code. Load the detector
+          # only from the trusted default branch.
+          ref: ${{ github.event.repository.default_branch }}
+          # Explicit-token github-script only, no authenticated git, so don't
+          # leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
+
+      - name: Classify and dismiss ineligible approvals
+        id: check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}
+          REVIEWERS_JSON: ${{ needs.triage.outputs.reviewers }}
+          EVENT_REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
+          PHASE_4_INTRINSIC_REQUIRED: ${{ needs.triage.outputs.phase_4_intrinsic_required }}
+          TRIAGE_HEAD: ${{ needs.triage.outputs.classified_head }}
+          TRIAGE_BASE_REF: ${{ needs.triage.outputs.classified_base_ref }}
+          TRIAGE_BASE_SHA: ${{ needs.triage.outputs.classified_base_sha }}
+          TRIAGE_RESULT: ${{ needs.triage.result }}
+        with:
+          github-token: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            // BEGIN APPROVAL TRIAGE BOOTSTRAP
+            // Generated from scripts/workflow/approval-triage.cjs. Do not edit.
+            function bootstrapApprovalTriage() {
+              // Read-only GitHub operations: retry transport failures, never policy drift or
+              // a permanent authorization/not-found response. Three attempts, 250ms then 500ms backoff (750ms total).
+              async function retryGithubRead(read, wait = ms => new Promise(resolve => setTimeout(resolve, ms))) {
+                for (let attempt = 0; ; attempt += 1) {
+                  try {
+                    return await read();
+                  } catch (error) {
+                    const status = Number(error && error.status || 0);
+                    const detail = [error && error.code, error && error.message,
+                      error && error.cause && error.cause.code,
+                      error && error.cause && error.cause.message].join(' ');
+                    const permanent = status >= 400 && status < 500 && status !== 429;
+                    const transient = status === 429 || (status >= 500 && status <= 599) ||
+                      /EPIPE|ECONNRESET|ETIMEDOUT|fetch failed/i.test(detail);
+                    if (attempt >= 2 || permanent || !transient) throw error;
+                    await wait(250 * (attempt + 1));
+                  }
+                }
+              }
+
+              // This only preserves an existing exact-event approval; it never classifies,
+              // grants eligibility or permits merge while triage remains unsuccessful.
+              async function preserveApprovalAfterTriageFailure(input) {
+                const {review, registered, eventPr, readPr, snapshot} = input;
+                if (registered !== true || !review || !Number.isInteger(review.id) || review.id <= 0 ||
+                    String(review.state).toUpperCase() !== 'APPROVED' ||
+                    !eventPr || !eventPr.head || !eventPr.head.sha ||
+                    !eventPr.base || !eventPr.base.ref || !eventPr.base.sha ||
+                    !eventPr.user || typeof eventPr.user.login !== 'string' || !eventPr.user.login ||
+                    (eventPr.body !== null && typeof eventPr.body !== 'string') || review.commit_id !== eventPr.head.sha) return false;
+                try {
+                  const expected = snapshot(eventPr);
+                  const before = await retryGithubRead(readPr);
+                  if (snapshot(before) !== expected) return false;
+                  const after = await retryGithubRead(readPr);
+                  return snapshot(after) === expected;
+                } catch {
+                  return false;
+                }
+              }
+
+              function selectApprovalTriage(input) {
+                if (input.modulePresent) return input.loadCanonical();
+                if (input.trustedWorkflow.includes('const approvalTriage = selectApprovalTriage(')) {
+                  throw new Error('trusted workflow requires the missing approval-triage canonical helper');
+                }
+                return input.loadBootstrap();
+              }
+              return {retryGithubRead, preserveApprovalAfterTriageFailure, selectApprovalTriage};
+            }
+            // END APPROVAL TRIAGE BOOTSTRAP
+            const {selectApprovalTriage} = bootstrapApprovalTriage();
+
+
+            // BEGIN SELF-APPROVAL BOOTSTRAP
+            // Generated from scripts/self-approval-detector.cjs. Do not edit.
+            function bootstrapDetector() {
+              function normalized(value) {
+                return typeof value === 'string' ? value.trim().toLowerCase() : '';
+              }
+
+              // BEGIN STABLE PR LABEL NAMES
+              function stablePrLabelNames(candidate) {
+                const labels = candidate && candidate.labels;
+                if (
+                  !Array.isArray(labels) ||
+                  labels.some(label =>
+                    !label || typeof label.name !== 'string' || !label.name.trim()
+                  )
+                ) {
+                  throw new Error('live PR labels are unavailable or malformed');
+                }
+                return labels.map(label => label.name).sort();
+              }
+              // END STABLE PR LABEL NAMES
+
+              function decide(input) {
+                const prAuthor = normalized(input && input.prAuthor);
+                const authorIdentity = normalized(input && input.authorIdentity);
+                const reviewer = normalized(input && input.reviewer);
+                const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
+                  ? input.reviewerAccounts.map(normalized).filter(Boolean)
+                  : [];
+                const reviewerIsAgent = reviewerAccounts.includes(reviewer);
+
+                // Keep the native-account defense independent of the PR-body declaration.
+                // This catches a reviewer approving a PR authored by that same GitHub
+                // account even when external review would otherwise not be required.
+                if (reviewer && reviewerIsAgent && prAuthor === reviewer) {
+                  return {
+                    action: 'block',
+                    reason: 'same-native-account-approval',
+                    persistentViolation: true,
+                  };
+                }
+
+                // Human reviews are the documented tiebreaker and reviewer accounts not in
+                // this repository's configured agent allow-list are outside this guard.
+                if (!reviewerIsAgent) {
+                  return { action: 'allow', reason: 'human-or-unregistered-reviewer' };
+                }
+
+                if (!prAuthor || !authorIdentity) {
+                  return { action: 'block', reason: 'indeterminate-native-author' };
+                }
+
+                // External contributors and dependency bots do not use the shared author
+                // identity, so they need no Authoring-Agent declaration. Their registered
+                // agent reviewer is independent by native GitHub identity.
+                if (prAuthor !== authorIdentity) {
+                  return { action: 'allow', reason: 'non-shared-author-pr' };
+                }
+
+                if (!input || typeof input.requiresExternalReview !== 'boolean') {
+                  return { action: 'block', reason: 'indeterminate-review-requirement' };
+                }
+
+                if (input.requiresExternalReview === true) {
+                  const declarationAttempts = (
+                    typeof input.prBody === 'string' ? input.prBody : ''
+                  ).split(/\r?\n|\r/).filter(
+                    line => /^[ \t]*Authoring-Agent:/i.test(line),
+                  );
+                  if (declarationAttempts.length === 0) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'missing-authoring-agent-declaration',
+                    };
+                  }
+                  if (declarationAttempts.length > 1) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'multiple-authoring-agent-declarations',
+                    };
+                  }
+                  const declaration = /^Authoring-Agent:[ \t]*([A-Za-z0-9_-]+)[ \t]*$/i
+                    .exec(declarationAttempts[0]);
+                  if (!declaration) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'malformed-authoring-agent-declaration',
+                    };
+                  }
+                  const authoringAgent = normalized(declaration[1]);
+                  const authoringReviewers = reviewerAccounts.filter(
+                    account => account.endsWith(`-${authoringAgent}`),
+                  );
+                  if (authoringReviewers.length === 0) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'unknown-authoring-agent',
+                    };
+                  }
+                  if (authoringReviewers.length > 1) {
+                    return {
+                      action: 'block',
+                      reason: 'indeterminate-phase-4-author',
+                      detail: 'ambiguous-authoring-agent-mapping',
+                    };
+                  }
+                  const [authoringReviewer] = authoringReviewers;
+
+                  if (authoringReviewer && authoringReviewer === reviewer) {
+                    return {
+                      action: 'block',
+                      reason: 'same-agent-phase-4-approval',
+                      // The declaration is mutable and GitHub exposes no conditional label
+                      // write bound to the body snapshot. Dismiss the approval, but reserve
+                      // the human-only persistent label for immutable native-author proof.
+                      authoringAgent,
+                      authoringReviewer,
+                    };
+                  }
+                } else {
+                  return { action: 'allow', reason: 'under-threshold-agent-approval' };
+                }
+
+                return { action: 'allow', reason: 'different-agent-phase-4-approval' };
+              }
+
+              function latestOpinionatedReviews(input) {
+                const reviewerAccounts = Array.isArray(input && input.reviewerAccounts)
+                  ? input.reviewerAccounts.map(normalized).filter(Boolean)
+                  : [];
+                const prAuthor = normalized(input && input.prAuthor);
+                const includePrAuthor = Boolean(input && input.includePrAuthor);
+                const reviews = Array.isArray(input && input.reviews) ? input.reviews : [];
+                const latestByReviewer = new Map();
+
+                for (const review of reviews) {
+                  const reviewer = normalized(review && review.user && review.user.login);
+                  const state = normalized(review && review.state).toUpperCase();
+                  if (
+                    !reviewer ||
+                    (!includePrAuthor && reviewer === prAuthor) ||
+                    !reviewerAccounts.includes(reviewer) ||
+                    !['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(state)
+                  ) {
+                    continue;
+                  }
+
+                  const current = latestByReviewer.get(reviewer);
+                  const submittedAt = String((review && review.submitted_at) || '');
+                  const currentSubmittedAt = String((current && current.submitted_at) || '');
+                  const id = Number((review && review.id) || 0);
+                  const currentId = Number((current && current.id) || 0);
+                  if (
+                    !current ||
+                    submittedAt > currentSubmittedAt ||
+                    (submittedAt === currentSubmittedAt && id > currentId)
+                  ) {
+                    latestByReviewer.set(reviewer, review);
+                  }
+                }
+
+                return reviewerAccounts
+                  .map(reviewer => latestByReviewer.get(reviewer))
+                  .filter(Boolean);
+              }
+
+              function latestApprovedReviews(input) {
+                const headSha = normalized(input && input.headSha);
+                const requireHead = Boolean(input && input.requireHead);
+                return latestOpinionatedReviews(input).filter(review =>
+                  normalized(review.state).toUpperCase() === 'APPROVED' &&
+                  (!requireHead || (headSha && normalized(review.commit_id) === headSha)),
+                );
+              }
+
+              // A direct review webhook can arrive before the list-reviews endpoint exposes
+              // that review. Add it only when the live list has no object with the same ID;
+              // if the API already reports that ID as DISMISSED or CHANGES_REQUESTED, the
+              // live state wins over the older APPROVED webhook payload.
+              function reviewsWithDirectFallback(reviews, directReview) {
+                const combined = Array.isArray(reviews) ? [...reviews] : [];
+                const directId = Number((directReview && directReview.id) || 0);
+                if (
+                  directId > 0 &&
+                  !combined.some(review => Number((review && review.id) || 0) === directId)
+                ) {
+                  combined.push(directReview);
+                }
+                return combined;
+              }
+
+              // Bind the webhook-only fallback to live PR state without letting event
+              // freshness decide whether the fallback is retained. A delayed durable
+              // APPROVED event must still carry its exact review object when listReviews
+              // lags; staleness suppresses only direct-event attribution (red run and
+              // persistent label), not classification or dismissal.
+              function prepareDirectApproval(input) {
+                const directReview = input && input.directReview;
+                const liveHeadSha = normalized(input && input.liveHeadSha);
+                const directCommit = normalized(directReview && directReview.commit_id);
+                const directAttributionCurrent = !directReview || (
+                  input && input.eventEnforcementCurrent === true &&
+                  liveHeadSha &&
+                  directCommit === liveHeadSha
+                );
+
+                return {
+                  reviews: reviewsWithDirectFallback(input && input.liveReviews, directReview),
+                  directAttributionCurrent,
+                };
+              }
+
+              // Plan the complete standing-approval enforcement for one workflow event.
+              // Event identity controls only attribution (red run / persistent label); it
+              // never narrows the standing set that must be classified and dismissed.
+              function planApprovalEnforcement(input) {
+                const directReviewId = Number((input && input.directReviewId) || 0);
+                const directAttributionCurrent = !input || input.directAttributionCurrent !== false;
+                // Enforcement must retain a registered reviewer whose native account is
+                // also the PR author so decide() can apply the explicit native-account
+                // defense. Ordinary approval-readiness callers keep excluding PR-author
+                // reviews through latestApprovedReviews()'s default.
+                const approvals = latestApprovedReviews({...input, includePrAuthor: true});
+                let eligibleApproval = false;
+                let persistentDirectViolation = false;
+                const directBlockedDiagnostics = [];
+                const blockedDiagnostics = [];
+
+                const classifiedApprovals = approvals.map(review => {
+                  const reviewer = review && review.user && review.user.login;
+                  const decision = decide({...input, reviewer});
+                  const diagnostic = decision.detail
+                    ? `${decision.reason}: ${decision.detail}`
+                    : decision.reason;
+                  const reviewId = Number((review && review.id) || 0);
+                  const isDirectReview =
+                    directAttributionCurrent && directReviewId > 0 && reviewId === directReviewId;
+
+                  if (decision.action === 'allow') {
+                    eligibleApproval = true;
+                  } else {
+                    blockedDiagnostics.push(diagnostic);
+                    if (isDirectReview) {
+                      directBlockedDiagnostics.push(diagnostic);
+                      persistentDirectViolation = Boolean(decision.persistentViolation);
+                    }
+                  }
+
+                  return {review, reviewer, decision, diagnostic, isDirectReview};
+                });
+
+                return {
+                  approvals: classifiedApprovals,
+                  eligibleApproval,
+                  persistentDirectViolation,
+                  directBlockedDiagnostics,
+                  blockedDiagnostics,
+                };
+              }
+              return {stablePrLabelNames, decide, latestApprovedReviews, reviewsWithDirectFallback, prepareDirectApproval, planApprovalEnforcement};
+            }
+            // END SELF-APPROVAL BOOTSTRAP
+
+            // BEGIN SELF-APPROVAL RESOLVER
+            function detectorSupportsDurableFallback(detector) {
+              return detector &&
+                typeof detector.stablePrLabelNames === 'function' &&
+                typeof detector.decide === 'function' &&
+                typeof detector.latestApprovedReviews === 'function' &&
+                typeof detector.reviewsWithDirectFallback === 'function' &&
+                typeof detector.prepareDirectApproval === 'function' &&
+                typeof detector.planApprovalEnforcement === 'function';
+            }
+
+            function selectDetector(input) {
+              const detectorRequiredMarker =
+                'SELF_APPROVAL_DETECTOR_DURABLE_FALLBACK_V2';
+              if (input.modulePresent) {
+                const canonical = input.loadCanonical();
+                if (detectorSupportsDurableFallback(canonical)) {
+                  return canonical;
+                }
+              }
+              if (String(input.trustedWorkflow || '').includes(detectorRequiredMarker)) {
+                throw new Error(
+                  'trusted workflow already requires the durable approval ' +
+                  'detector capability, but the canonical module is missing ' +
+                  'or incompatible; failing closed',
+                );
+              }
+              if (typeof input.notice === 'function') {
+                input.notice(
+                  'The trusted default branch predates the durable approval ' +
+                  'detector; using the generated strict bootstrap for this ' +
+                  'atomic workflow/module rollout only.',
+                );
+              }
+              return input.loadBootstrap();
+            }
+            // END SELF-APPROVAL RESOLVER
+
+            const detectorPath = path.resolve(
+              process.env.GITHUB_WORKSPACE,
+              'scripts/self-approval-detector.cjs',
+            );
+            const trustedWorkflowPath = path.resolve(
+              process.env.GITHUB_WORKSPACE,
+              '.github/workflows/agent-review.yml',
+            );
+            const modulePresent = fs.existsSync(detectorPath);
+            const trustedWorkflow = fs.readFileSync(trustedWorkflowPath, 'utf8');
+            const detector = selectDetector({
+              modulePresent,
+              trustedWorkflow,
+              loadCanonical: () => require(detectorPath),
+              loadBootstrap: bootstrapDetector,
+              notice: message => core.notice(message),
+            });
+            const {
+              stablePrLabelNames,
+              decide,
+              latestApprovedReviews,
+              reviewsWithDirectFallback,
+              prepareDirectApproval,
+              planApprovalEnforcement,
+            } = detector;
+            if (
+              typeof stablePrLabelNames !== 'function' ||
+              typeof decide !== 'function' ||
+              typeof latestApprovedReviews !== 'function' ||
+              typeof reviewsWithDirectFallback !== 'function' ||
+              typeof prepareDirectApproval !== 'function' ||
+              typeof planApprovalEnforcement !== 'function'
+            ) {
+              throw new Error('self-approval detector exports are unavailable');
+            }
+
+            // BEGIN DISMISS REVIEW FAIL-CLOSED
+            async function dismissReviewFailClosed(input) {
+              try {
+                await input.dismiss();
+                return 'dismissed';
+              } catch (writeError) {
+                let currentReview;
+                try {
+                  currentReview = await input.read();
+                } catch (readError) {
+                  throw writeError;
+                }
+                if (
+                  !currentReview ||
+                  Number(currentReview.id || 0) !== Number(input.reviewId) ||
+                  String(currentReview.state || '').toUpperCase() !== 'DISMISSED'
+                ) {
+                  throw writeError;
+                }
+                input.notice();
+                return 'already-dismissed';
+              }
+            }
+            // END DISMISS REVIEW FAIL-CLOSED
+
+            // BEGIN DURABLE APPROVAL PROTECTION
+            function registeredReviewerUnion(rawLists) {
+              const reviewers = new Set();
+              for (const raw of rawLists) {
+                let parsed;
+                try {
+                  parsed = JSON.parse(raw || '[]');
+                } catch (error) {
+                  continue;
+                }
+                if (!Array.isArray(parsed)) continue;
+                for (const reviewer of parsed) {
+                  if (typeof reviewer === 'string' && reviewer.trim()) {
+                    reviewers.add(reviewer.trim().toLowerCase());
+                  }
+                }
+              }
+              return reviewers;
+            }
+
+            async function protectDurableApproval(input) {
+              const directReview = input && input.directReview;
+              const reviewer = String(
+                directReview && directReview.user && directReview.user.login || '',
+              ).trim().toLowerCase();
+              if (
+                !directReview ||
+                String(directReview.state || '').toUpperCase() !== 'APPROVED' ||
+                Number(directReview.id || 0) <= 0 ||
+                !reviewer ||
+                !registeredReviewerUnion(input.reviewerLists || []).has(reviewer)
+              ) {
+                return false;
+              }
+              await input.dismiss(directReview);
+              return true;
+            }
+            // END DURABLE APPROVAL PROTECTION
+
+            // BEGIN STABLE REVIEW SNAPSHOT
+            async function readStableReviewSnapshot(input) {
+              let pr = input.pr;
+              const maxAttempts = Number(input.maxAttempts || 3);
+              for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                const reviews = await input.listReviews(pr);
+                const after = await input.readPr();
+                if (
+                  input.enforcementSnapshot(after) ===
+                  input.enforcementSnapshot(pr)
+                ) {
+                  return {pr: after, reviews, attempts: attempt};
+                }
+                if (input.policySnapshot(after) !== input.triageSnapshot) {
+                  throw new Error(
+                    'PR head/base changed after live triage',
+                  );
+                }
+                input.notice(attempt);
+                pr = after;
+              }
+              throw new Error(
+                `PR metadata did not stabilize after ${maxAttempts} review reads`,
+              );
+            }
+            // END STABLE REVIEW SNAPSHOT
+
+            // BEGIN APPROVAL PHASE 4 DECISION
+            function approvalEnforcementSnapshot(candidate, policySnapshotFn) {
+              return JSON.stringify({
+                policy: policySnapshotFn(candidate),
+                author: candidate && candidate.user && candidate.user.login,
+                body: (candidate && candidate.body) || '',
+                labels: stablePrLabelNames(candidate),
+              });
+            }
+
+            function phase4RequiredForApprovalGuard(
+              phase4IntrinsicRaw,
+              candidate,
+            ) {
+              if (
+                phase4IntrinsicRaw !== 'true' &&
+                phase4IntrinsicRaw !== 'false'
+              ) {
+                throw new Error('Phase 4 applicability is unavailable');
+              }
+              return phase4IntrinsicRaw === 'true' ||
+                stablePrLabelNames(candidate)
+                  .includes('needs-external-review');
+            }
+            // END APPROVAL PHASE 4 DECISION
+
+            async function protectCurrentDirectReview(reason) {
+              const directReview =
+                context.eventName === 'pull_request_review' &&
+                context.payload.review &&
+                context.payload.review.state === 'approved'
+                  ? context.payload.review
+                  : null;
+              return protectDurableApproval({
+                directReview,
+                reviewerLists: [
+                  process.env.REVIEWERS_JSON,
+                  process.env.EVENT_REVIEWERS_JSON,
+                ],
+                dismiss: approval => dismissReviewFailClosed({
+                  reviewId: approval.id,
+                  dismiss: () => github.rest.pulls.dismissReview({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: context.payload.pull_request.number,
+                    review_id: approval.id,
+                    message: `Approval policy snapshot could not stabilize ` +
+                      `(${reason}). This registered-agent approval was ` +
+                      `dismissed conservatively; submit a fresh approval on ` +
+                      `the current PR state.`,
+                  }),
+                  read: async () => {
+                    const response = await github.rest.pulls.getReview({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: context.payload.pull_request.number,
+                      review_id: approval.id,
+                    });
+                    return response.data;
+                  },
+                  notice: () => core.notice(
+                    `Approval ${approval.id} was already dismissed by an ` +
+                    `overlapping enforcement run.`,
+                  ),
+                }),
+              });
+            }
+
+            async function failClosedBeforeClassification(reason, message) {
+              const dismissed = await protectCurrentDirectReview(reason);
+              if (dismissed) {
+                core.notice(
+                  'The durable registered-agent approval was dismissed before ' +
+                  'this unstable run stopped.',
+                );
+              }
+              core.setFailed(message);
+            }
+
+            core.setOutput('eligible_approval', 'false');
+            core.setOutput('snapshot_current', 'false');
+            let retryGithubRead, preserveApprovalAfterTriageFailure;
+            try {
+              const approvalTriagePath = path.resolve(process.env.GITHUB_WORKSPACE,
+                'scripts/workflow/approval-triage.cjs');
+              const approvalTriage = selectApprovalTriage({
+                modulePresent: fs.existsSync(approvalTriagePath),
+                trustedWorkflow: fs.readFileSync(path.resolve(process.env.GITHUB_WORKSPACE,
+                  '.github/workflows/agent-review.yml'), 'utf8'),
+                loadCanonical: () => require(approvalTriagePath),
+                loadBootstrap: bootstrapApprovalTriage,
+              });
+              ({retryGithubRead, preserveApprovalAfterTriageFailure} = approvalTriage);
+              if (typeof retryGithubRead !== 'function' ||
+                  typeof preserveApprovalAfterTriageFailure !== 'function') {
+                throw new Error('approval-triage helper exports are unavailable');
+              }
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `approval-triage helper load failed: ${error.message}`,
+                'Approval-triage helper is unavailable; refusing to classify or consume approvals.',
+              );
+              return;
+            }
+            const eventPr = context.payload.pull_request;
+            const policySnapshot = candidate => JSON.stringify({
+              head: candidate && candidate.head && candidate.head.sha,
+              baseRef: candidate && candidate.base && candidate.base.ref,
+              baseSha: candidate && candidate.base && candidate.base.sha,
+            });
+            const enforcementSnapshot = candidate =>
+              approvalEnforcementSnapshot(candidate, policySnapshot);
+            if (process.env.TRIAGE_RESULT !== 'success') {
+              const directReview = context.eventName === 'pull_request_review'
+                ? context.payload.review : null;
+              const registered = registeredReviewerUnion([
+                process.env.REVIEWERS_JSON, process.env.EVENT_REVIEWERS_JSON,
+              ]).has(String(directReview && directReview.user &&
+                directReview.user.login || '').trim().toLowerCase());
+              const preserve = await preserveApprovalAfterTriageFailure({
+                review: directReview, registered, eventPr,
+                snapshot: enforcementSnapshot,
+                readPr: async () => (await github.rest.pulls.get({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: eventPr.number,
+                })).data,
+              });
+              if (preserve) {
+                core.notice('Triage failed but the exact approval snapshot is stable; preserving the approval.');
+                core.setFailed('Phase 4 classification did not complete; refusing to classify or consume approvals.');
+              } else {
+                await failClosedBeforeClassification(
+                  'live triage did not complete and approval snapshot is not proven stable',
+                  'Phase 4 classification did not complete; refusing to classify or consume approvals.',
+                );
+              }
+              return;
+            }
+
+            const triageSnapshot = JSON.stringify({
+              head: process.env.TRIAGE_HEAD || '',
+              baseRef: process.env.TRIAGE_BASE_REF || '',
+              baseSha: process.env.TRIAGE_BASE_SHA || '',
+            });
+            let livePrResponse;
+            try {
+              livePrResponse = await retryGithubRead(() => github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: eventPr.number,
+              }));
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `live PR read failed: ${error.message}`,
+                `Could not read the live PR (${error.message}); refusing to ` +
+                `consume approvals.`,
+              );
+              return;
+            }
+            let pr = livePrResponse.data;
+            if (policySnapshot(pr) !== triageSnapshot) {
+              await failClosedBeforeClassification(
+                'PR head/base changed after live triage',
+                'The PR changed after live triage; refusing to classify with ' +
+                'stale governing-policy outputs. A current run must retry.',
+              );
+              return;
+            }
+            const eventPolicyCurrent =
+              policySnapshot(pr) === policySnapshot(eventPr);
+            if (!eventPolicyCurrent) {
+              core.notice(
+                'The event head/base is stale; this durable approval run will ' +
+                'still classify its exact webhook review under the live ' +
+                'triage policy, without persistent direct attribution.',
+              );
+            }
+            let reviewerAccounts;
+            try {
+              reviewerAccounts = JSON.parse(
+                process.env.REVIEWERS_JSON || '[]',
+              );
+            } catch (error) {
+              reviewerAccounts = [];
+            }
+            if (
+              !Array.isArray(reviewerAccounts) ||
+              reviewerAccounts.length === 0 ||
+              reviewerAccounts.some(reviewer =>
+                typeof reviewer !== 'string' || reviewer.trim().length === 0
+              )
+            ) {
+              await failClosedBeforeClassification(
+                'governing reviewer allow-list is unavailable',
+                'governing policy reviewer allow-list is unavailable; refusing to classify approval',
+              );
+              return;
+            }
+
+            const phase4IntrinsicRaw =
+              process.env.PHASE_4_INTRINSIC_REQUIRED;
+            if (
+              phase4IntrinsicRaw !== 'true' &&
+              phase4IntrinsicRaw !== 'false'
+            ) {
+              await failClosedBeforeClassification(
+                'Phase 4 applicability is unavailable',
+                'Phase 4 applicability is unavailable; refusing to consume approvals.',
+              );
+              return;
+            }
+            const isDirectApproval =
+              context.eventName === 'pull_request_review' &&
+              context.payload.review &&
+              context.payload.review.state === 'approved';
+            const isUnlabeledRearm =
+              context.eventName === 'pull_request' &&
+              context.payload.action === 'unlabeled';
+            let stableReviewSnapshot;
+            try {
+              stableReviewSnapshot = await readStableReviewSnapshot({
+                pr,
+                triageSnapshot,
+                enforcementSnapshot,
+                policySnapshot,
+                listReviews: currentPr => retryGithubRead(() => github.paginate(
+                  github.rest.pulls.listReviews,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: currentPr.number,
+                    per_page: 100,
+                  },
+                )),
+                readPr: async () => {
+                  const response = await retryGithubRead(() => github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                  }));
+                  return response.data;
+                },
+                notice: attempt => core.notice(
+                  `The PR body, author, or labels changed during review read attempt ` +
+                  `${attempt}; retrying the durable approval fallback against ` +
+                  `one stable live snapshot.`,
+                ),
+              });
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `stable review snapshot unavailable: ${error.message}`,
+                `Could not obtain one stable live review snapshot ` +
+                `(${error.message}); refusing to consume approvals.`,
+              );
+              return;
+            }
+            pr = stableReviewSnapshot.pr;
+            const liveReviews = stableReviewSnapshot.reviews;
+            const prAuthor = pr.user.login;
+            let requiresExternalReview;
+            try {
+              requiresExternalReview = phase4RequiredForApprovalGuard(
+                phase4IntrinsicRaw,
+                pr,
+              );
+            } catch (error) {
+              await failClosedBeforeClassification(
+                `live Phase 4 applicability is unavailable: ${error.message}`,
+                `Could not classify live Phase 4 applicability ` +
+                `(${error.message}); refusing to consume approvals.`,
+              );
+              return;
+            }
+            core.setOutput('snapshot_current', eventPolicyCurrent.toString());
+            const directReview = isDirectApproval
+              ? context.payload.review
+              : null;
+            let eventEnforcementCurrent = false;
+            try {
+              eventEnforcementCurrent =
+                enforcementSnapshot(eventPr) === enforcementSnapshot(pr);
+            } catch (error) {
+              core.notice(
+                `The event enforcement snapshot is unavailable ` +
+                `(${error.message}); direct-event violation attribution is ` +
+                `disabled for this webhook.`,
+              );
+            }
+            const preparedApproval = prepareDirectApproval({
+              liveReviews,
+              directReview,
+              eventEnforcementCurrent,
+              liveHeadSha: pr.head.sha,
+            });
+            const enforcement = planApprovalEnforcement({
+              reviews: preparedApproval.reviews,
+              directReviewId: directReview && directReview.id,
+              directAttributionCurrent:
+                preparedApproval.directAttributionCurrent,
+              reviewerAccounts,
+              prAuthor,
+              authorIdentity: process.env.AUTHOR_IDENTITY,
+              prBody: pr.body || '',
+              requiresExternalReview,
+            });
+
+            if (enforcement.approvals.length === 0) {
+              core.info('No eligible registered approval exists for this readiness retry.');
+              return;
+            }
+
+            for (const classification of enforcement.approvals) {
+              const {
+                review: approval,
+                reviewer,
+                decision,
+                diagnostic: decisionDiagnostic,
+                isDirectReview,
+              } = classification;
+              core.info(
+                `Approval ${approval.id} by ${reviewer}: ` +
+                `${decision.action} (${decisionDiagnostic})`,
+              );
+
+              if (decision.action !== 'block') {
+                continue;
+              }
+
+              const persistentDirectViolation =
+                isDirectReview && Boolean(decision.persistentViolation);
+              const dismissalPrefix = persistentDirectViolation
+                ? 'Approval violates the agent-independence policy'
+                : isDirectReview
+                  ? 'Approval independence could not be verified'
+                  : 'Approval is no longer eligible under the current agent-independence policy';
+              await dismissReviewFailClosed({
+                reviewId: approval.id,
+                dismiss: () => github.rest.pulls.dismissReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  review_id: approval.id,
+                  message: `${dismissalPrefix} (${decisionDiagnostic}). ` +
+                    'This review has been dismissed automatically.',
+                }),
+                read: async () => {
+                  const response = await github.rest.pulls.getReview({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pr.number,
+                    review_id: approval.id,
+                  });
+                  return response.data;
+                },
+                notice: () => core.notice(
+                  `Approval ${approval.id} was already dismissed by an ` +
+                  'overlapping enforcement run; treating the write as complete.',
+                ),
+              });
+            }
+
+            if (enforcement.persistentDirectViolation) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['policy-violation'],
+              });
+            }
+
+            core.setOutput(
+              'eligible_approval',
+              enforcement.eligibleApproval.toString(),
+            );
+            if (enforcement.directBlockedDiagnostics.length > 0) {
+              core.setFailed(
+                `Approval dismissed by the agent-independence guard ` +
+                `(${enforcement.directBlockedDiagnostics.join('; ')}).`,
+              );
+            } else if (enforcement.blockedDiagnostics.length > 0) {
+              core.notice(
+                `Dismissed ${enforcement.blockedDiagnostics.length} approval(s) that ` +
+                `became ineligible before the ${isUnlabeledRearm ? 'unlabeled' : 'update'} readiness evaluation.`,
+              );
+            }
+
+      - name: Retract durable auto-merge
+        id: retract_shared_author
+        if: ${{ always() }}
+        env:
+          # SHARED_AUTHOR_DISARM_REQUIRED_V1. The marker name is retained for
+          # rollout compatibility. The step is now read-only: GitHub offers no
+          # conditional disable, so an unproven arm blocks without mutation.
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR_IDENTITY: ${{ needs.triage.outputs.author_identity }}
+          SNAPSHOT_CURRENT: ${{ steps.check.outputs.snapshot_current }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Default closed. The legacy output means only "run privileged
+          # readiness validation"; it never authorizes a merge mutation.
+          echo "auto_arm_allowed=false" >> "$GITHUB_OUTPUT"
+          if ! pr_state=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json author,autoMergeRequest,url,headRefOid,baseRefName,baseRefOid); then
+            echo "::error::Could not read live PR author or auto-merge state."
+            exit 1
+          fi
+          if ! jq -e '
+            type == "object" and
+            (.author.login | type == "string" and length > 0) and
+            (.url | type == "string" and length > 0) and
+            (.headRefOid | type == "string" and length > 0) and
+            (.baseRefName | type == "string" and length > 0) and
+            (.baseRefOid | type == "string" and length > 0) and
+            has("autoMergeRequest") and
+            ((.autoMergeRequest == null) or (.autoMergeRequest | type == "object"))
+          ' >/dev/null 2>&1 <<<"$pr_state"; then
+            echo "::error::Live PR author or auto-merge metadata is malformed."
+            exit 1
+          fi
+          native_author=$(jq -r '.author.login' <<<"$pr_state")
+          live_head=$(jq -r '.headRefOid' <<<"$pr_state")
+          live_base_ref=$(jq -r '.baseRefName' <<<"$pr_state")
+          live_base_sha=$(jq -r '.baseRefOid' <<<"$pr_state")
+          if [ "${SNAPSHOT_CURRENT:-}" != "true" ] \
+            || [ "$live_head" != "${EVENT_HEAD:-}" ] \
+            || [ "$live_base_ref" != "${EVENT_BASE_REF:-}" ] \
+            || [ "$live_base_sha" != "${EVENT_BASE_SHA:-}" ]; then
+            echo "::warning::The event head/base is stale or unclassified; treating the live auto-merge arm as unclassified."
+            AUTHOR_IDENTITY=""
+          fi
+          if [ -z "${AUTHOR_IDENTITY:-}" ]; then
+            if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+              echo "Governing author_identity is unavailable, but no auto-merge request exists; readiness continuation remains disabled."
+              exit 0
+            fi
+            echo "::warning::Governing author_identity is unavailable; blocking on the existing unclassified auto-merge request fail closed."
+          elif [ "$native_author" != "$AUTHOR_IDENTITY" ]; then
+            echo "auto_arm_allowed=true" >> "$GITHUB_OUTPUT"
+            if jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+              echo "Native non-shared PR is eligible for readiness validation and has no durable arm."
+              exit 0
+            fi
+            echo "::warning::Native non-shared PR has a head-only durable arm; blocking pending the #1058 merge-group boundary."
+          elif jq -e '.autoMergeRequest == null' >/dev/null <<<"$pr_state"; then
+            echo "Shared-author PR has no auto-merge request to retract; readiness continuation remains disabled."
+            exit 0
+          fi
+          # #1058: native disable has no exact-action precondition. This
+          # pull_request workflow is candidate-controlled for same-repository
+          # PRs, so it must never receive the target-admin or source-read PATs
+          # needed to prove the queue topology. Trusted-default-branch
+          # pull_request_target/workflow_run/scheduled paths perform that proof.
+          # Here every armed state remains untouched and blocks fail closed.
+          echo "::error::Refusing to mutate or classify a durable arm from a candidate-controlled workflow."
+          exit 1
+
+  # ──────────────────────────────────────────────
+  # Job 6: Approval readiness (legacy job id retained for consumers)
+  # ──────────────────────────────────────────────
+  # The job must wait for detect-disagreement, block-self-approval, and triage
+  # because each sibling can apply a blocking label or invalidate an approval.
+  # Triage also recomputes Phase 4 applicability for synchronize, reopen,
+  # approved-review, and blocking-label-removal events. The guard exports a
+  # live eligible-approval result and the legacy-named auto_arm_allowed output;
+  # the latter now means only that a native non-shared PR may enter read-only
+  # readiness validation. It is never permission to arm, enqueue, or merge.
+  #
+  # Three event shapes re-evaluate readiness (#495, #620): a newly submitted
+  # approval; synchronize or reopen with a surviving registered latest-state
+  # approval; and removal of a blocking label after clearance settles. Edited
+  # events only invalidate mutable approval provenance and deliberately do not
+  # enter this job. Every path rechecks the governing author identity, labels,
+  # and required checks after consuming the upstream live-approval result.
+  # This candidate-controlled job can only report readiness; the trusted
+  # continuation rechecks clearance, accounting, conversations, approval
+  # independence, and mutable PR state before reporting stable unarmed
+  # readiness. The separate #1058 merge-group authorization owns admission.
+  auto-merge-on-approval:
+    needs: [load-config, detect-disagreement, block-self-approval, triage]
+    # Job-level override (replaces rather than merges with the workflow
+    # default above): candidate-controlled review jobs are strictly read-only.
+    # Privileged author and queue-policy credentials live behind the trusted-
+    # main environment and are consumed only by trusted continuation workflows.
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: read
+    if: >
+      always() &&
+      ((github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved') ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action == 'synchronize' ||
+         github.event.action == 'reopened' ||
+         (github.event.action == 'unlabeled' &&
+          contains(fromJSON('["needs-external-review","needs-human-review","policy-violation","human-hold"]'), github.event.label.name))))) &&
+      needs.triage.result == 'success' &&
+      needs.block-self-approval.result == 'success' &&
+      needs.block-self-approval.outputs.eligible_approval == 'true' &&
+      needs.block-self-approval.outputs.auto_arm_allowed == 'true' &&
+      !contains(github.event.pull_request.labels.*.name, 'needs-external-review') &&
+      !contains(github.event.pull_request.labels.*.name, 'needs-human-review') &&
+      !contains(github.event.pull_request.labels.*.name, 'human-hold')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Readiness logic still comes from the trusted default branch, never
+          # the PR checkout, even though this job receives only read access.
+          ref: ${{ github.event.repository.default_branch }}
+          # Explicit-token API path only, no authenticated git, so don't
+          # leave the checkout token in .git/config (#548 / Codex #550).
+          persist-credentials: false
+
+      # Readiness retry gate (#495). On a `synchronize` / `reopened` event
+      # the approval is NOT in the event payload, so confirm via the API
+      # that a valid non-author latest-state APPROVED review already
+      # exists before continuing. On the `pull_request_review` approved path
+      # the approval IS the trigger, so this step is skipped and `proceed`
+      # defaults to true for the downstream guard.
+      #
+      # Approval semantics mirror scripts/codex-review-check.sh gate (b)
+      # and scripts/disagreement-detector.cjs: collapse to each reviewer's
+      # LATEST opinionated review (APPROVED / CHANGES_REQUESTED /
+      # DISMISSED; COMMENTED is informational), exclude the PR author
+      # (GitHub blocks reviewer == author for native approval anyway), and
+      # require that latest state to be APPROVED. A later
+      # CHANGES_REQUESTED or DISMISSED from the same reviewer supersedes an
+      # earlier APPROVED, so a withdrawn approval does not establish readiness.
+      - name: Gate require existing non-author approval
+        id: require_approval
+        if: >
+          github.event_name == 'pull_request' ||
+          github.event_name == 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO: ${{ github.repository }}
+          # #529 / #544: restrict the approval that enters readiness to a
+          # REGISTERED agent reviewer identity (available_reviewers), matching
+          # scripts/codex-review-check.sh gate (b) and the required
+          # merge-clearance-gate. An APPROVED from an account that is NOT a
+          # mapped reviewer identity must not enter readiness on EITHER path:
+          # the synchronize retry (existing-review API check below) OR the
+          # direct pull_request_review approved event. #544 review: the gate
+          # previously ran only on pull_request, so a direct approval from an
+          # unregistered non-author skipped it (the merge-clearance-gate still
+          # backstopped the actual merge, but the readiness gate should be
+          # consistent on both paths).
+          EVENT_REVIEWER: ${{ github.event.review.user.login }}
+          REVIEWERS_JSON: ${{ needs.load-config.outputs.reviewers }}
+        run: |
+          REVIEWERS_JSON="${REVIEWERS_JSON:-[]}"
+          # Direct approval event: the approval IS the trigger, so verify the
+          # event reviewer is a registered, non-author reviewer here (#544).
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request_review" ]; then
+            if [ -z "$EVENT_REVIEWER" ] || [ "$EVENT_REVIEWER" = "$PR_AUTHOR" ]; then
+              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is empty or the PR author; readiness denied."
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if ! printf '%s' "$REVIEWERS_JSON" | jq -e --arg r "$EVENT_REVIEWER" 'index($r) != null' >/dev/null 2>&1; then
+              echo "::notice::Approval reviewer '$EVENT_REVIEWER' is not a registered reviewer (available_reviewers); readiness denied (#544)."
+              echo "proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Direct approval from registered reviewer $EVENT_REVIEWER; proceeding."
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # --- synchronize / reopened readiness path (existing API check) ---
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::notice::The read-only workflow token is unavailable; cannot confirm an existing approval for the synchronize readiness retry."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Fetch raw pages then flatten with `jq -s 'add // []'` BEFORE
+          # aggregating. `gh api --paginate --jq` applies the filter per
+          # page, so a `group_by` over a >30-review history (default page
+          # size) would collapse each page in isolation and miss a later
+          # CHANGES_REQUESTED on a subsequent page. Flatten first, then run
+          # the latest-state-per-reviewer collapse over the full array.
+          # Mirrors fetch_api_array() in scripts/codex-review-check.sh.
+          if ! RAW=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>&1); then
+            echo "::error::Could not read reviews to confirm an existing approval ($RAW). Failing closed — readiness denied."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Latest opinionated review per non-author REGISTERED reviewer;
+          # pass only when at least one such reviewer's latest state is
+          # APPROVED. `-s` (slurp) merges the per-page arrays into one
+          # list-of-arrays; `add // []` then flattens to the full review
+          # array. #529: the `IN($reviewers[])` filter restricts to
+          # available_reviewers identities — an approval from a non-reviewer
+          # account does NOT count. Default to [] so an empty/failed
+          # load-config fails CLOSED (no reviewer matches → no readiness).
+          REVIEWERS_JSON="${REVIEWERS_JSON:-[]}"
+          if ! APPROVER=$(printf '%s' "$RAW" | jq -r -s \
+            --arg author "$PR_AUTHOR" \
+            --argjson reviewers "$REVIEWERS_JSON" '
+              [ (add // []) | .[]
+                | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")
+                | select(.user.login != $author)
+                | select(.user.login | IN($reviewers[]))
+              ]
+              | group_by(.user.login)
+              | map(max_by(.submitted_at))
+              | map(select(.state == "APPROVED"))
+              | first
+              | if . == null then "" else .user.login end' 2>/dev/null); then
+            echo "::error::Could not parse review list to confirm an existing approval. Failing closed — readiness denied."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$APPROVER" ]; then
+            echo "::notice::No valid non-author APPROVED review from a registered reviewer (available_reviewers) on PR #$PR_NUMBER; a push does not establish readiness without one (#495/#529)."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Existing non-author approval found ($APPROVER); proceeding with the synchronize readiness retry."
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Enter read-only readiness lane
+        id: author_merge_token
+        # Candidate-controlled pull_request and pull_request_review workflows
+        # must never materialize the author credential. This job can report
+        # read-only readiness with github.token; trusted pull_request_target,
+        # workflow_run, and schedule jobs own every privileged continuation.
+        if: steps.require_approval.outputs.proceed != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_AUTHOR: ${{ needs.load-config.outputs.author_identity }}
+        run: |
+          expected_author="${EXPECTED_AUTHOR:-}"
+          if [ -z "$expected_author" ]; then
+            echo "::notice::The governing base policy yielded no author identity; read-only readiness is disabled."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Read-only readiness admitted for governing author: $expected_author"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Re-verify blocking labels before readiness probe
+        if: steps.author_merge_token.outputs.enabled == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Guard against the TOCTOU race between the trigger-time label
+          # snapshot and this readiness report. The job's top-level `if:`
+          # expression evaluates labels from the `pull_request_review` event
+          # payload at the moment GitHub Actions dispatched the event. Two
+          # things can make that snapshot stale by the time this probe runs:
+          #
+          #   1. Eventual consistency. If a label is applied milliseconds
+          #      before the review event fires, the event payload can still
+          #      be generated without the label attached. Observed on PR #60
+          #      (2026-04-14), where the `needs-external-review` label was
+          #      applied 2 seconds before the review event but the job's
+          #      `if:` check evaluated to true anyway, merging the PR before
+          #      any external review could happen. See #61.
+          #
+          #   2. Other jobs can legitimately apply a blocking label after
+          #      approval while this job is evaluating current-head checks.
+          #      The trigger payload does not reflect that later mutation.
+          #
+          # Re-fetch the authoritative label state from the GitHub API before
+          # entering the readiness probe. The trusted continuation repeats this
+          # check alongside feedback-accounting and conversation-resolution
+          # gates before it reports stable unarmed readiness. Abort if any
+          # blocking label is now present. Also check `policy-violation`, which
+          # is applied by the block-self-approval job earlier in this same
+          # workflow run (and, again, the `if:` at job start wouldn't have seen
+          # it).
+          # The trusted default-branch checkout intentionally lags an atomic
+          # workflow+helper rollout by one merge. Source the shared helper when
+          # it is present; retain the exact bootstrap predicate for the first
+          # mergepath or consumer rollout so approval does not fail before the
+          # helper has landed on that repository's default branch.
+          if [ -f scripts/lib/blocking-labels.sh ]; then
+            # shellcheck source=scripts/lib/blocking-labels.sh
+            source scripts/lib/blocking-labels.sh
+          else
+            mergepath_blocking_labels_csv() {
+              awk '$0 == "needs-external-review" || $0 == "needs-human-review" || $0 == "policy-violation" || $0 == "human-hold"' \
+                | paste -sd, -
+            }
+          fi
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
+          printf 'Labels at readiness time:\n%s\n' "$LABELS"
+          blocking_labels=$(printf '%s\n' "$LABELS" | mergepath_blocking_labels_csv)
+          if [ -n "$blocking_labels" ]; then
+            echo "::error::Blocking label(s) present at readiness time: $blocking_labels."
+            exit 1
+          fi
+          echo "No blocking labels present — proceeding with readiness validation."
+
+
+      - name: Probe current-head check readiness once
+        id: check_readiness
+        if: steps.author_merge_token.outputs.enabled == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REQUIRED_HEAD_CHECK_NAME: lint
+        run: |
+          # Resolve the check-run names that must be green on the PR head.
+          # Shared with dependabot-auto-merge.yml and the approval
+          # continuation so all three enforce ONE list with one
+          # implementation; see scripts/required-head-checks.sh for why the
+          # value is per-consumer and read from the default branch.
+          # First-rollout guard (#1070). On the PR introducing this helper,
+          # and on each consumer's first propagation PR, the checkout can
+          # predate the script. Fall back to the PRE-#1070 behaviour --
+          # `lint` alone -- rather than failing closed: a repo without the
+          # script cannot have received the config file either, so there is
+          # no configured gate to drop. This is NOT the indeterminate-read
+          # case, which stays fail-closed inside the script.
+          if [ ! -f scripts/required-head-checks.sh ]; then
+            echo "::notice::scripts/required-head-checks.sh absent (pre-#1070 checkout); using the default required head check."
+            required_check_names="lint"
+          elif ! required_check_names=$(bash scripts/required-head-checks.sh --repo "$REPO" --list); then
+            echo "::error::could not resolve the required head-check list; refusing to report merge readiness."
+            exit 1
+          fi
+          if [ -z "$required_check_names" ]; then
+            echo "::error::required head-check list resolved empty; refusing to report merge readiness."
+            exit 1
+          fi
+          echo "::notice::required head checks:"
+          printf '%s\n' "$required_check_names" | sed 's/^/::notice::  /'
+          # Retained for the diagnostics below, which name a single check.
+          required_check_name=$(printf '%s\n' "$required_check_names" | head -n 1)
+          # Approval is durable readiness state. This job probes current-head
+          # checks exactly once; it never reserves a runner while CI executes.
+          # A successful repo-lint / annex / policy workflow later wakes the
+          # trusted continuation in auto-clear-blocking-labels.yml, which
+          # reruns the complete merge gate and final mutable-state readback.
+          pr_view_json=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,isCrossRepository,baseRefName,headRefName)
+          sha=$(echo "$pr_view_json" | jq -r .headRefOid)
+          # #655 Codex P2 round 9 ("wait for valid push-only annex
+          # workflows"): a push-only annex trigger only fires IN THIS REPO
+          # for a same-repo PR (a fork PRs push lands in the fork, never
+          # registering a push event here) -- isCrossRepository is gh pr
+          # view's own field for this, no extra API call needed.
+          annex_same_repo_pr=$(echo "$pr_view_json" | jq -r 'if .isCrossRepository then "false" else "true" end')
+          # #655 Codex P2 round 11 ("evaluate base-branch filters before
+          # passing"): a pull_request branches/branches-ignore filter is
+          # matched against the PRs BASE ref; a push branches/branches-ignore
+          # filter is matched against the ref actually being pushed, which
+          # for a same-repo PRs synchronize event is the PRs own HEAD ref
+          # (the feature branch), not base. Both already on this same
+          # pr_view_json call, no extra API call needed.
+          annex_base_branch=$(echo "$pr_view_json" | jq -r '.baseRefName // ""')
+          annex_head_branch=$(echo "$pr_view_json" | jq -r '.headRefName // ""')
+          # #655 Codex P2 round 16 ("wait for path-matched annex
+          # workflows", narrowed in round 17 -- "use the event diff when
+          # emulating path filters", found on the codex-review-check.sh
+          # copy and mirrored here): paginated the same way as the reviews
+          # fetch above (flatten with jq -s BEFORE deriving filenames).
+          # #655 Codex P2 round 17 ("fail closed when the changed-file
+          # lookup fails", Codex; "don't silently treat changed-files API
+          # failures as filtered out", CodeRabbit): the round-16 version
+          # piped stderr into stdout (2>&1) with no failure check, so a
+          # failed gh api call fed an error message into jq, which failed
+          # too, silently collapsing annex_changed_files_json to empty --
+          # indistinguishable from "genuinely fetched, zero files" on the
+          # ruby side, wrongly treated as "paths definitely does not
+          # match". Explicit success/failure branching keeps a failed
+          # fetch as an EXPLICITLY empty string (never touched by jq),
+          # which the ruby probe treats as "unknown", not "no files".
+          if annex_changed_files_raw=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" 2>&1); then
+            annex_changed_files_json=$(printf '%s' "$annex_changed_files_raw" | jq -s 'add // []' | jq -c '[.[].filename]')
+          else
+            annex_changed_files_json=""
+            echo "::warning::Could not fetch PR changed files ($annex_changed_files_raw) -- paths/paths-ignore annex filters will be treated as unresolvable (conservative default, #655 round 17)."
+          fi
+
+          # #655: a consumer's optional, never-propagated repo_lint_local.yml
+          # annex (#601) produces a check run that branch protection does not
+          # require, and this step — before this fix — did not observe either,
+          # so it could report readiness with a red or missing annex check.
+          # Probe the PR HEAD commit for the annex file via the Contents API
+          # (not this job's own checkout — its ref is not guaranteed to be the
+          # PR head on every trigger shape this workflow handles) and require
+          # its check run(s) too when present. Absent (the common case,
+          # including mergepath itself) is a no-op: only `lint` is required,
+          # unchanged from before.
+          #
+          # required_checks_json stays scoped to ONLY the canonical
+          # `required_check_name` entry -- it is a hard requirement this
+          # one-shot readiness probe evaluates. The repo_lint_local.yml annex
+          # must NOT be enforced the
+          # same way (#655 Codex P2 round 6, "avoid forcing path-filtered
+          # annex jobs to start"): a consumer annex scoped by workflow-level
+          # `paths`/`paths-ignore` legitimately produces NO check run at all
+          # for a PR outside those paths, and earlier rounds forcing its
+          # derived name(s) into this hard-required list made the old wait
+          # loop refuse readiness on every such PR. Annex enforcement instead
+          # runs as a separate workflow-wide scan below (annex_workflow),
+          # mirroring codex-review-check.sh gate (a): match by the stable
+          # .workflowPath rather than by a specific job name, block immediately
+          # on any REPORTED bad conclusion, report not-ready while anything
+          # for that workflow is still in flight, and treat "nothing reported
+          # for this workflow at all"
+          # as non-blocking -- the same trade-off gate (a) already made and
+          # validated across #655 rounds 2-5.
+          # Built from the resolved LIST. The consumers of this array below
+          # (check_count, .[$i].name, the rollup filter) already iterate it
+          # generically, so widening one name to several needs no change
+          # there. The scoping rule in the comment above is unchanged: only
+          # explicitly-configured hard requirements land here, never the
+          # path-filtered annex.
+          # -R over the NEWLINE list: check-run names contain spaces
+          # ("Merge clearance gate"), so word-splitting would shatter them
+          # into names that do not exist and this probe would never be ready.
+          required_checks_json=$(printf '%s\n' "$required_check_names" \
+            | jq -R . | jq -s -c '[.[] | select(length > 0) | {name: ., workflow: ""}]')
+          annex_workflow=""
+          annex_unfiltered="false"
+          annex_probe_err=$(mktemp)
+          if annex_content=$(gh api "repos/$REPO/contents/.github/workflows/repo_lint_local.yml?ref=$sha" --jq .content 2>"$annex_probe_err"); then
+            # The annex contract (scripts/ci/check_ci_scripts_wired) only requires
+            # a real push/pull_request-triggered workflow that wires local
+            # checks — it does NOT require the job (and therefore check-run)
+            # name to be `repo-lint-local` (Codex P2 on #655), nor does it ban
+            # path filters. Derive the annex's own top-level workflow name the
+            # same way check_ci_scripts_wired parses its `on:` trigger
+            # (safe_load + rescue), rather than assuming the filename
+            # convention or that the workflow is unconditionally triggered.
+            #
+            # Matrix-strategy jobs are skipped during NAME derivation (#655
+            # Codex P2 round 3): GitHub expands a matrix job into one check
+            # run per combination with a name this static YAML read cannot
+            # reproduce. They are NOT invisible to enforcement, though (#655
+            # Codex P1 round 6, "observe matrix annex jobs before
+            # auto-merge") -- annex_workflow is captured regardless of
+            # whether any job names were derived, so the workflow-wide scan
+            # below still catches a reported matrix-leg failure by workflow
+            # identity, without needing to know its expanded name in advance.
+            # ruby's stderr is NOT redirected here (unlike the base64
+            # decode) so the skip notice surfaces in the workflow log.
+            annex_probe_raw=$(printf '%s' "$annex_content" | base64 -d 2>/dev/null | ANNEX_SAME_REPO_PR="$annex_same_repo_pr" ANNEX_BASE_BRANCH="$annex_base_branch" ANNEX_HEAD_BRANCH="$annex_head_branch" ANNEX_CHANGED_FILES_JSON="$annex_changed_files_json" ruby -ryaml -rjson -e '
+              raw = STDIN.read
+              # #655 Codex P1 round 7 ("parse valid annex workflows that use
+              # YAML aliases"): GitHub Actions supports anchors/aliases in
+              # workflow files, but Psych safe_load defaults to
+              # aliases:false specifically to block the "billion laughs"
+              # DoS (a small file whose nested aliases expand
+              # exponentially at parse time). This parses a PRs OWN branch
+              # content, so any repo accepting external contributions is
+              # exposed to a crafted repo_lint_local.yml exhausting CI
+              # runner memory/CPU. Allow aliases, but bound the attack
+              # surface first: a byte-size cap (legitimate CI configs are a
+              # few KB) plus a raw anchor/alias token count cap (the
+              # exploit needs many alias references to achieve exponential
+              # blowup; a legitimate DRY job template reuses one or two) --
+              # counted on the RAW text before parsing, since the danger is
+              # in the expansion itself, not the input size.
+              if raw.bytesize > 100_000
+                STDERR.puts "repo_lint_local.yml exceeds 100000 bytes -- refusing to parse (defensive cap, not a realistic legitimate size, #655)"
+                exit
+              end
+              # #655 Codex P2 round 8 ("avoid treating path globs as YAML
+              # aliases"): a naive `[&*]word` scan over-counts, since an
+              # ordinary glob like `**/*.ts` in a paths:/paths-ignore: list
+              # starts with `*` too -- inflating the count on a perfectly
+              # legitimate annex with a longer filter list past the cap. A
+              # real YAML anchor/alias can ONLY appear immediately after a
+              # structural position: start of text; a block-sequence dash
+              # (which requires being the first non-whitespace character
+              # on its line, with a MANDATORY space before the value --
+              # narrowed in round 9, see below); or `:`, `,`, `[`, `{`
+              # anywhere, optionally followed by whitespace. A glob string
+              # value is never in that position unquoted (a bare scalar
+              # starting with `*` is itself a YAML syntax error, confirmed
+              # empirically), and a QUOTED glob has a leading quote
+              # character that breaks the match.
+              #
+              # #655 Codex P2 round 9 ("do not count glob hyphens as YAML
+              # aliases"): the round 8 version accepted a bare `-` ANYWHERE
+              # in the text (with optional trailing whitespace) as a
+              # structural position, which also matched an internal hyphen
+              # inside a glob directly before a `*` (e.g.
+              # "src/component-*.ts") with no space between them --
+              # inflating the count on a filter list using hyphenated
+              # names. A real block-sequence dash is anchored to the start
+              # of its line (only preceded by indentation) and REQUIRES at
+              # least one space before its value, unlike a mid-string
+              # hyphen.
+              if raw.scan(/(?:\A|^[ \t]*-\s+|[:,\[{]\s*)[&*][A-Za-z0-9_.-]+/).length > 40
+                STDERR.puts "repo_lint_local.yml has an unusually high anchor/alias token count -- refusing to parse (defensive cap against a YAML alias-expansion DoS, #655)"
+                exit
+              end
+              begin
+                doc = YAML.safe_load(raw, aliases: true)
+              rescue Psych::Exception
+                exit
+              end
+              exit unless doc.is_a?(Hash) && doc["jobs"].is_a?(Hash)
+              # #655 Codex P2 round 6: when the annex omits a top-level
+              # `name:`, GitHub displays (and reports into
+              # statusCheckRollup .workflowName as) the workflow FILE PATH,
+              # not an empty string -- an empty workflow_name would disable
+              # the workflow-wide scan below, even for a valid annex with
+              # reported job failures.
+              workflow_name = doc["name"] ? doc["name"].to_s : ".github/workflows/repo_lint_local.yml"
+              jobs = []
+              doc["jobs"].each do |id, job|
+                if job.is_a?(Hash) && job["strategy"].is_a?(Hash) && job["strategy"]["matrix"]
+                  STDERR.puts "skipping matrix-strategy job #{id} -- its expanded check-run name(s) cannot be derived from the static job definition (#655)"
+                  next
+                end
+                name = (job.is_a?(Hash) && job["name"]) ? job["name"] : id
+                jobs << { "name" => name.to_s, "workflow" => workflow_name }
+              end
+              # #655 Codex P1 round 7 ("wait for unfiltered annex workflow
+              # to appear before merging"): distinguish an annex trigger
+              # with NO restricting filter (which is GUARANTEED to
+              # eventually produce a check run for this PR -- it just may
+              # not have been scheduled yet) from one that IS filtered
+              # (which may legitimately never run for this diff). YAML 1.1
+              # coerces the bareword `on:` key to the boolean true
+              # (yes/no/on/off/y/n are all boolean literals -- the "Norway
+              # problem"), so doc["on"] is nil for the overwhelmingly
+              # common unquoted `on:`; only a quoted "on": key would ever
+              # land as the string "on".
+              #
+              # #655 Codex P2 round 9 ("honor non-path pull_request
+              # filters before waiting"): round 8 checked only
+              # paths/paths-ignore on the pull_request config. GitHub
+              # Actions pull_request triggers also support branches,
+              # branches-ignore, and types -- a types list that excludes
+              # synchronize (e.g. types: [opened] only) means this
+              # workflow will NEVER run for a resynchronized PRs current
+              # HEAD, so treating that as unfiltered would wait forever:
+              # the exact permanent-deadlock class rounds 2-5 already
+              # fought to eliminate for the paths case.
+              #
+              # #655 Codex P1 round 10 ("treat synchronize-enabled types
+              # as runnable", found on the codex-review-check.sh copy of
+              # this same logic and mirrored here): round 9 disqualified
+              # "unfiltered" on the MERE presence of a types key, but
+              # types is not a narrowing filter the way paths/branches
+              # are -- it selects WHICH pull_request activities trigger
+              # this workflow at all, and the GitHub default (when types
+              # is omitted) is [opened, synchronize, reopened]. An
+              # explicit types list that STILL includes synchronize (the
+              # activity that fires for a resynchronized PRs current
+              # HEAD) is therefore just as unfiltered as omitting types
+              # entirely -- the common explicit form
+              # `types: [opened, synchronize, reopened]` was being
+              # wrongly disqualified. Only a types list that EXCLUDES
+              # synchronize actually means this workflow never runs for
+              # that HEAD, so types gets its own check below rather than
+              # joining the generic filter-key list.
+              #
+              # #655 Codex P2 round 9 ("wait for valid push-only annex
+              # workflows"): check_ci_scripts_wired accepts push OR
+              # pull_request as valid wiring, but a push-only annex was
+              # never classified as unfiltered at all (no pull_request
+              # trigger present), so this wait never waited for it. A push
+              # trigger only fires IN THIS REPO for a same-repo PR (a fork
+              # PRs push lands in the fork, never here), so
+              # annex_same_repo_pr (computed above from gh pr views own
+              # isCrossRepository field) gates whether an unfiltered push
+              # trigger counts.
+              #
+              # #655 Codex P2 round 11 ("evaluate base-branch filters
+              # before passing", found on the codex-review-check.sh copy
+              # of this same logic and mirrored here): rounds 9-10
+              # blanket-disqualified "unfiltered" on the MERE PRESENCE of
+              # branches/branches-ignore, but GitHub schedules the
+              # workflow whenever the actual ref matches -- e.g.
+              # `pull_request: {branches: [main]}` still runs for every PR
+              # targeting main. Evaluated against the real ref instead:
+              # pull_request compares the PRs BASE ref (annex_base_branch,
+              # computed above); push compares the ref actually being
+              # pushed, which for a same-repo PRs synchronize is the PRs
+              # own HEAD ref (annex_head_branch), not base. Matching uses
+              # Matching translates each pattern into an equivalent Ruby
+              # Regexp rather than using File.fnmatch, refined per #655
+              # round 13 ("use an Actions-compatible branch glob matcher",
+              # found on the codex-review-check.sh copy and mirrored here)
+              # to correct a gap in the round-12 fnmatch version: GitHub
+              # documented branch patterns support a `+` repetition
+              # quantifier on a preceding character/class (e.g.
+              # `v[12].[0-9]+.[0-9]+`, matching semver branches) -- a real
+              # regex feature fnmatch has no equivalent for (it always
+              # treats `+` as a literal character and returns false).
+              # Regexp natively supports quantifiers AND character classes,
+              # so translating once and matching via Regexp#match? handles
+              # the full documented syntax (*, **, ?, [...], +) with one
+              # mechanism instead of patching fnmatch further. `**` crosses
+              # `/` (translated to `.*`); a lone `*` does not (translated to
+              # `[^/]*`); `[...]` and a following `+` are copied through
+              # verbatim, since Ruby regex character-class and quantifier
+              # syntax already matches the GitHub semantics. A backslash
+              # escapes the next special character into a literal match, as
+              # GitHub documents for branch/tag names that contain glob
+              # metacharacters. Everything else is regex-escaped. Patterns
+              # are evaluated IN ORDER with an optional `!` prefix negating a
+              # prior match (a later pattern overrides an earlier one for the
+              # same ref), which a plain `any?` check ignored entirely. An
+              # unknown/unresolvable branch still conservatively disqualifies
+              # rather than guessing.
+              #
+              # #655 Codex P2 round 11 ("treat tag-only push annexes as
+              # filtered", narrowed in round 13 -- "do not treat tag
+              # filters as excluding branch pushes", found on the
+              # codex-review-check.sh copy and mirrored here): a push
+              # trigger scoped ONLY by tags/tags-ignore (no branches/
+              # branches-ignore at all) only fires for TAG ref pushes,
+              # never an ordinary branch push. But GitHub documents
+              # branches and tags as combinable on the SAME push trigger
+              # (runs for a matching branch push OR a matching tag push),
+              # so a trigger with BOTH keys must still be evaluated by its
+              # branches filter -- the round-11 version disqualified on
+              # tags presence alone, before branches ever got a chance to
+              # match, which wrongly filtered an annex GitHub would
+              # actually run for a matching branch push (the exact same
+              # push a same-repo PRs synchronize always is). Tags now only
+              # disqualifies when there is no branches/branches-ignore key
+              # at all to independently evaluate.
+              on = doc.key?("on") ? doc["on"] : doc[true]
+              def branch_pattern_to_regex(pattern)
+                # #655 Codex P2 round 16 ("honor ? as an optional-character
+                # filter", found on the codex-review-check.sh copy and
+                # mirrored here): GitHub documents `?` as matching zero or
+                # one of the PRECEDING character (e.g. `release?` matches
+                # base branch `release` itself), not "exactly one arbitrary
+                # character" the way POSIX glob/fnmatch define it. Building
+                # a TOKEN LIST (one entry per translated glob unit) instead
+                # of one flat string lets `?` wrap the LAST token in
+                # `(?:...)?` -- correctly quantifying whatever unit came
+                # before it (a literal char, an escaped char, or a whole
+                # `[...]` class), not just a single output character. A
+                # leading `?` (no preceding token) is a no-op. `tokens.
+                # join` reconstructs the exact same concatenation the old
+                # flat-string version produced for every other case,
+                # including `+` (still a bare postfix quantifier on
+                # whatever token precedes it).
+                tokens = []
+                chars = pattern.chars
+                i = 0
+                while i < chars.length
+                  c = chars[i]
+                  if c == "\\" && chars[i + 1]
+                    tokens << Regexp.escape(chars[i + 1])
+                    i += 2
+                  elsif c == "*" && chars[i + 1] == "*"
+                    tokens << ".*"
+                    i += 2
+                  elsif c == "*"
+                    tokens << "[^/]*"
+                    i += 1
+                  elsif c == "?"
+                    tokens[-1] = "(?:#{tokens[-1]})?" if tokens.any?
+                    i += 1
+                  elsif c == "["
+                    j = i + 1
+                    j += 1 while j < chars.length && chars[j] != "]"
+                    tokens << chars[i..j].join
+                    i = j + 1
+                  elsif c == "+"
+                    tokens << "+"
+                    i += 1
+                  else
+                    tokens << Regexp.escape(c)
+                    i += 1
+                  end
+                end
+                Regexp.new("\\A#{tokens.join}\\z")
+              end
+              def branch_matches?(pattern, branch)
+                return false unless pattern.is_a?(String) && branch.is_a?(String)
+                branch_pattern_to_regex(pattern).match?(branch)
+              rescue RegexpError, ArgumentError
+                false
+              end
+              def push_tag_only_excludes?(cfg)
+                (cfg.key?("tags") || cfg.key?("tags-ignore")) && !(cfg.key?("branches") || cfg.key?("branches-ignore"))
+              end
+              def branch_matches_list?(patterns, branch)
+                return false unless patterns.is_a?(Array)
+                included = false
+                patterns.each do |raw|
+                  next unless raw.is_a?(String)
+                  if raw.start_with?("!")
+                    included = false if branch_matches?(raw[1..], branch)
+                  else
+                    included = true if branch_matches?(raw, branch)
+                  end
+                end
+                included
+              end
+              def branch_filter_excludes?(cfg, branch)
+                return true if (cfg.key?("branches") || cfg.key?("branches-ignore")) && !(branch.is_a?(String) && !branch.empty?)
+                if cfg.key?("branches")
+                  return true unless branch_matches_list?(cfg["branches"], branch)
+                end
+                if cfg.key?("branches-ignore")
+                  return true if branch_matches_list?(cfg["branches-ignore"], branch)
+                end
+                false
+              end
+              # #655 Codex P2 round 16 ("wait for path-matched annex
+              # workflows", narrowed in round 17 -- "use the event diff
+              # when emulating path filters", found on the
+              # codex-review-check.sh copy and mirrored here): a paths/
+              # paths-ignore key was previously treated as unconditionally
+              # filtered on mere presence, even when the PRs actual
+              # changed files match the filter. Path glob syntax
+              # documents the SAME tokens as branch/tag patterns, so
+              # branch_matches_list? is reused. `paths` requires at least
+              # one changed file to match; `paths-ignore` excludes only
+              # when EVERY changed file matches the ignore patterns.
+              # GitHub evaluates a PUSH triggers path filter against the
+              # two-dot diff of JUST that push, not the whole-PR
+              # three-dot diff this fetch provides -- an earlier commit
+              # already in the PR could have touched a matching path
+              # while the CURRENT push does not, wrongly keeping this
+              # "unfiltered" and blocking readiness forever while waiting for a
+              # check that will never report. The three-dot PR-wide diff
+              # genuinely matches what GitHub documents for the
+              # pull_request event, so only that event gets the real
+              # evaluation; push keeps the round-16-era always-filtered
+              # default. GitHub also only considers the first 300 changed
+              # files for path-filter evaluation, so the list is capped
+              # the same way before matching.
+              def paths_filter_excludes?(event, cfg, changed_files, changed_files_known)
+                return false unless cfg.key?("paths") || cfg.key?("paths-ignore")
+                return true if event == "push"
+                return false unless changed_files_known
+                capped_files = changed_files.first(300)
+                if cfg.key?("paths")
+                  return true unless capped_files.any? { |f| branch_matches_list?(cfg["paths"], f) }
+                end
+                if cfg.key?("paths-ignore")
+                  return true if capped_files.all? { |f| branch_matches_list?(cfg["paths-ignore"], f) }
+                end
+                false
+              end
+              # #655 Codex P2 round 17 (do not silently treat changed-files
+              # API failures as filtered out, CodeRabbit; "fail closed
+              # when the changed-file lookup fails", Codex): the bash
+              # layer above now leaves annex_changed_files_json as an
+              # EXPLICITLY empty string on a fetch failure (never touched
+              # by jq), which changed_files_known distinguishes from a
+              # genuinely-fetched, genuinely-empty array -- unknown data
+              # must not silently read as "paths definitely do not match".
+              changed_files_known = !(ENV["ANNEX_CHANGED_FILES_JSON"] || "").empty?
+              changed_files = begin
+                changed_files_known ? JSON.parse(ENV["ANNEX_CHANGED_FILES_JSON"]) : []
+              rescue JSON::ParserError
+                []
+              end
+              trigger_unfiltered = lambda do |event, relevant_branch|
+                case on
+                when String then on == event
+                when Array then on.include?(event)
+                when Hash
+                  next false unless on.key?(event)
+                  cfg = on[event]
+                  next true unless cfg.is_a?(Hash)
+                  next false if paths_filter_excludes?(event, cfg, changed_files, changed_files_known)
+                  next false if event == "push" && push_tag_only_excludes?(cfg)
+                  next false if branch_filter_excludes?(cfg, relevant_branch)
+                  # #655 Codex P2 round 16 (do not skip opened-only annex
+                  # runs), REVERTED in round 17 ("do not infer
+                  # opened-only runs from committer date", found on the
+                  # codex-review-check.sh copy and mirrored here): round
+                  # 16 tried to distinguish "still on the PRs opening
+                  # commit" from "synchronized since" by comparing the
+                  # HEAD committer date against the PRs created_at.
+                  # Confirmed live: a genuinely-new synchronize push whose
+                  # commit preserves an OLDER committer date (a
+                  # rebase/cherry-pick of a stale commit) still satisfies
+                  # that comparison, so the heuristic can say "unfiltered"
+                  # for a trigger that will NEVER report again on this
+                  # HEAD -- injecting a permanent PENDING/wait state. No
+                  # reliable, non-spoofable signal is available from the
+                  # data already on hand, and a permanent deadlock is
+                  # strictly worse than the narrower gap being reopened.
+                  # Reverted to the simple, safe round-10 rule: only a
+                  # types list that explicitly includes synchronize
+                  # counts as unfiltered.
+                  next (cfg["types"].is_a?(Array) && cfg["types"].include?("synchronize")) if cfg.key?("types")
+                  true
+                else
+                  false
+                end
+              end
+              pr_unfiltered = trigger_unfiltered.call("pull_request", ENV["ANNEX_BASE_BRANCH"])
+              push_unfiltered = trigger_unfiltered.call("push", ENV["ANNEX_HEAD_BRANCH"])
+              same_repo_pr = ENV["ANNEX_SAME_REPO_PR"] == "true"
+              unfiltered = pr_unfiltered || (push_unfiltered && same_repo_pr)
+              puts JSON.generate({ "workflow" => workflow_name, "jobs" => jobs, "unfiltered" => unfiltered })
+            ' || true)
+            if [ -z "$annex_probe_raw" ]; then
+              # ruby never reached its `puts` line: the YAML itself did not
+              # parse or had no `jobs:` hash -- genuinely unparseable, not
+              # just empty. The workflow name is unknown too (parsing never
+              # got that far), so there is nothing to scope a workflow-wide
+              # scan to either. Unlike pre-round-6 behavior, do NOT fall back
+              # to forcing the conventional name into required_checks_json:
+              # that name might not be the real one, risking the exact
+              # deadlock this redesign removes. codex-review-check.sh's gate
+              # (a) still independently enforces this annex on its own
+              # schedule (it is safe from this deadlock: an unreported
+              # required name there is a no-op, never an injected failure).
+              echo "::warning::repo_lint_local.yml annex present at $sha but could not be parsed as a workflow (invalid YAML or no jobs) — cannot determine its check name(s) or workflow identity, so this run cannot enforce it (gate (a) / codex-review-check.sh still will) (#655)."
+            else
+              annex_workflow=$(echo "$annex_probe_raw" | jq -r '.workflow')
+              annex_unfiltered=$(echo "$annex_probe_raw" | jq -r '.unfiltered')
+              annex_jobs=$(echo "$annex_probe_raw" | jq -c '.jobs')
+              if [ "$(echo "$annex_jobs" | jq 'length')" -eq 0 ]; then
+                echo "::warning::repo_lint_local.yml annex present at $sha but every job is matrix-strategy (skipped) — its expanded check-run name(s) cannot be derived; its workflow ($annex_workflow, unfiltered=$annex_unfiltered) is still scanned below for any reported failure (#655)."
+              else
+                echo "::notice::repo_lint_local.yml annex present at $sha — its workflow ($annex_workflow, unfiltered=$annex_unfiltered) will be scanned for any reported failure (#655): $(echo "$annex_jobs" | jq -r '[.[].name] | join(" ")')."
+              fi
+            fi
+          elif grep -q 'HTTP 404' "$annex_probe_err"; then
+            : # genuinely absent (confirmed 404) — no annex, no-op, unchanged from before.
+          elif grep -q 'HTTP 403' "$annex_probe_err"; then
+            # #655 Codex P2 round 4: a 403 (token lacks Contents: read) is
+            # USUALLY persistent, not transient -- forcing enforcement here
+            # would permanently affect native auto-merge on EVERY future PR
+            # too (the same 403 recurs every time), not just ones with an
+            # actual annex. Do not enforce; warn loudly so the token's scope
+            # gets fixed instead.
+            echo "::warning::repo_lint_local.yml probe at $sha got HTTP 403 (workflow token likely lacks Contents: read) — NOT failing closed, since a persistent 403 would otherwise force an unresolvable synthetic check on every future PR too. Grant the workflow Contents: read to restore annex enforcement (#655)."
+          else
+            # An indeterminate but plausibly-transient read failure (rate
+            # limit, 5xx, network) must not be treated the same as a
+            # confirmed absence -- but unlike pre-round-6 behavior, this run
+            # cannot fail closed by forcing a guessed name into
+            # required_checks_json without risking the same deadlock #655
+            # round 6 removed. codex-review-check.sh's gate (a) is a safer
+            # place for this fallback (an unreported required name there is
+            # inert, never an injected failure) and re-evaluates on its own
+            # schedule, so this narrower run simply logs and moves on.
+            echo "::warning::Could not determine whether repo_lint_local.yml exists at $sha (API error, not a confirmed 404) — this run cannot enforce it (gate (a) / codex-review-check.sh still will) (#655): $(cat "$annex_probe_err")"
+          fi
+          rm -f "$annex_probe_err"
+
+          # #655 Codex P2 round 11 ("restrict the lint wait to the required
+          # workflow"): gh pr view --json statusCheckRollup has no field for
+          # "is this specific entry actually required by branch protection",
+          # so the workflow=="" (name-only) canonical-check match below could
+          # not distinguish the REAL required "lint" from an unrelated,
+          # non-required check that coincidentally shares its bare name in a
+          # different workflow (e.g. an experimental local job) -- requiring
+          # that unrelated check to ALSO be green, per the round-5 "every
+          # group must be green" rule. Both GraphQL CheckRun and
+          # StatusContext expose isRequired(pullRequestNumber:), the
+          # ground-truth answer, but only when queried directly (the fixed
+          # --json shape from gh pr view omits it,
+          # and querying it through commits.nodes.commit loses the implicit
+          # PR context, erroring "A pull request ID or pull request number is
+          # required" -- confirmed empirically), so this switches from
+          # `gh pr view --json` to a raw graphql call and reshapes the result
+          # into the same {statusCheckRollup: [...]} shape the rest of this
+          # evaluation below expects, adding isRequired as an extra field.
+          repo_owner="${REPO%%/*}"
+          repo_name="${REPO#*/}"
+          all_done=1
+            check_count=$(echo "$required_checks_json" | jq 'length')
+            # #655 Codex P1 round 12 ("paginate the status check rollup"):
+            # a PR with more than 100 statusCheckRollup contexts (this PR
+            # itself already has 160+, confirmed live while working on
+            # this fix) silently hid every entry past the first page from
+            # both the required-check and annex workflow-wide scans below
+            # -- readiness could be reported while an unobserved check past page
+            # 1 was still red. Page through with the Relay cursor
+            # (pageInfo.hasNextPage/endCursor) rather than raising the
+            # page size, since the rollup can grow without bound as more
+            # checks/review rounds accumulate on a long-lived PR. Pass a null
+            # cursor for the first page and the returned Relay cursor for each
+            # later page.
+            rollup_contexts="[]"
+            cursor=""
+            # #1024 (b): rollup_complete records whether this probe
+            # actually walked every page. It is only ever cleared by the
+            # short-circuit below, which fires exclusively toward the
+            # "not ready" verdict -- never toward "green".
+            rollup_complete=1
+            while :; do
+              cursor_args=(-F cursor=null)
+              if [ -n "$cursor" ]; then
+                cursor_args=(-f cursor="$cursor")
+              fi
+              page_json=$(gh api graphql -f query='
+                query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                      commits(last: 1) {
+                        nodes {
+                          commit {
+                            statusCheckRollup {
+                              contexts(first: 100, after: $cursor) {
+                                pageInfo { hasNextPage endCursor }
+                                nodes {
+                                  __typename
+                                  ... on CheckRun {
+                                    name
+                                    status
+                                    conclusion
+                                    startedAt
+                                    completedAt
+                                    isRequired(pullRequestNumber: $number)
+                                    checkSuite { workflowRun { workflow { name resourcePath } } }
+                                  }
+                                  ... on StatusContext {
+                                    context
+                                    state
+                                    createdAt
+                                    isRequired(pullRequestNumber: $number)
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }' -f owner="$repo_owner" -f name="$repo_name" -F number="$PR_NUMBER" "${cursor_args[@]}")
+              page_nodes=$(echo "$page_json" | jq -c '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes // [])')
+              # #752 (follow-up to #497/#750, same fix as the
+              # codex-review-check.sh and admin-merge-codeowners-blocked.sh
+              # copies): concatenate via stdin, not argv. rollup_contexts
+              # accumulates every check-run across all pages, and a Phase 4
+              # PR's check-run set (many workflow jobs / matrix runs) is
+              # large enough that the running total, passed as a --argjson
+              # VALUE, exceeds the ubuntu-runner single-argument length
+              # ceiling (MAX_ARG_STRLEN, ~128KB) on a later page — jq then
+              # dies rc=126 "Argument list too long" (observed
+              # deterministically on PR #495; macOS's much larger ARG_MAX
+              # masked it locally). This job runs on ubuntu-latest, which is
+              # exactly where that ceiling bites. `jq -s` slurps both JSON
+              # arrays from stdin instead, which has no such ceiling.
+              rollup_contexts=$(printf '%s\n%s\n' "$rollup_contexts" "$page_nodes" | jq -c -s 'add')
+              has_next=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false)')
+              cursor=$(echo "$page_json" | jq -r '(.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.endCursor // "")')
+              [ "$has_next" = "true" ] || break
+              # #1024 (b): the pages walked so far can already SETTLE this
+              # probe's verdict as "not ready", and when they do,
+              # the remaining pages cannot change it -- so stop paying for
+              # them. The predicate below is deliberately one-directional:
+              # it only ever short-circuits toward not-ready, never toward
+              # concluding green, because cheaper pagination that can miss a
+              # pending required check is far worse than an expensive one.
+              #
+              # Soundness (this is the whole safety argument, so it is
+              # spelled out rather than asserted): the predicate fires only
+              # on an entry that (1) matches a configured required check
+              # name, (2) for the canonical workflow=="" requirement, also
+              # reports isRequired==true for THIS pull request, and (3) is
+              # non-terminal by the same CheckRun/StatusContext rule the
+              # winner-selection query below uses. Given such an entry, the
+              # full-pagination evaluation below is GUARANTEED to reach
+              # all_done=0 for that check name no matter what the unfetched
+              # pages hold: isRequired==true makes $required_matches
+              # non-empty, so the workflow=="" branch keeps this entry in
+              # $matches; its workflow group therefore has a non-empty
+              # $pending list; and a non-empty $pending makes that group's
+              # winner the pending entry, which is exactly the
+              # pending_count>0 branch. A name-scoped ($workflow != "")
+              # requirement skips the isRequired filter entirely and lands
+              # on the same branch. An absent or null isRequired never
+              # fires the short-circuit, so an ambiguous rollup keeps
+              # paging as before.
+              pending_required=$(printf '%s' "$rollup_contexts" | jq --argjson required "$required_checks_json" '
+                . as $ctx
+                | [ $required[]
+                    | . as $req
+                    | ($ctx | map(select(
+                          ((.name // .context // "") == $req.name)
+                          and ($req.workflow == "" or ((.checkSuite.workflowRun.workflow.name // "") == $req.workflow))
+                          and (if $req.workflow == "" then (.isRequired == true) else true end)
+                          and (if (.status != null)
+                               then (.status != "COMPLETED")
+                               else ((.state // "") as $sc_state | ["PENDING","EXPECTED"] | index($sc_state))
+                               end)
+                      )) | length)
+                  ]
+                | add // 0')
+              if [ "$pending_required" -gt 0 ]; then
+                rollup_complete=0
+                break
+              fi
+            done
+            # #1024 (b): a short-circuited probe holds only a PREFIX of
+            # the rollup, so nothing below may draw a conclusion from it.
+            # The verdict is already settled ("not ready", per the
+            # soundness argument above), so skip this probe's remaining
+            # evaluation and emit the durable readiness result. Zeroing the
+            # check-loop bound (rather than
+            # re-indenting ~200 lines of evaluation into an else-branch)
+            # keeps the diff on a propagated required-gate workflow small
+            # enough to review line by line. Skipping matters: on a partial
+            # rollup a stale FAILED entry whose superseding success sits on
+            # an unfetched page would lose winner-selection and wrongly
+            # refuse readiness. Nothing is lost by deferring -- a red
+            # sibling check cannot change a verdict that is already "wait",
+            # and it is still caught by the later completed-workflow event
+            # whose probe completes pagination.
+            if [ "$rollup_complete" -ne 1 ]; then
+              echo "::notice::A required check is still pending on the first $(echo "$rollup_contexts" | jq 'length') statusCheckRollup context(s) for HEAD $sha; skipping the remaining pages in this readiness probe (#1024)."
+              all_done=0
+              check_count=0
+            fi
+            # workflowPath (#655 round 13, "disambiguate annex workflows
+            # beyond display name", found on the codex-review-check.sh copy
+            # and mirrored here): derived from the workflow FILE's
+            # GraphQL-reported resourcePath rather than its freely-editable
+            # display name, since the annex contract does not guarantee a
+            # unique .name across a consumer's workflows.
+            rollup_json=$(echo "$rollup_contexts" | jq '{
+              statusCheckRollup: (map({
+                  name: .name,
+                  context: .context,
+                  workflowName: (.checkSuite.workflowRun.workflow.name // null),
+                  workflowPath: (((.checkSuite.workflowRun.workflow.resourcePath // "") | split("/") | last) // ""),
+                  status: .status,
+                  conclusion: .conclusion,
+                  state: .state,
+                  startedAt: .startedAt,
+                  completedAt: .completedAt,
+                  # A StatusContext has NEITHER startedAt nor completedAt --
+                  # the GraphQL fragment selects only createdAt for that union
+                  # member. Carried so the surface partition below has a real
+                  # ordering key (#1214 review round 1, found independently by
+                  # Codex and CodeRabbit): before the partition existed a
+                  # status could never win a tie anyway, so the missing key was
+                  # inert; giving statuses their own winner made it load-
+                  # bearing, and without this every status compares equal and
+                  # the winner falls out of GraphQL connection order.
+                  createdAt: .createdAt,
+                  isRequired: .isRequired,
+                  # Which GraphQL union member this entry came from (#1214,
+                  # mirroring #1193 in codex-review-check.sh). A required
+                  # context is satisfiable from a check run OR a legacy commit
+                  # status, and GitHub evaluates each surface as its own row.
+                  # The winner grouping below keyed on workflowName alone,
+                  # which separated the two only by accident: a StatusContext
+                  # has no workflow name, so it landed in the "" group -- along
+                  # with every check run that also has none, meaning every
+                  # check run NOT published by GitHub Actions. Carried so the
+                  # grouping can key on the surface deliberately.
+                  kind: (.__typename // "")
+                }))
+            }')
+            for ((i = 0; i < check_count; i++)); do
+              check_name=$(echo "$required_checks_json" | jq -r ".[$i].name")
+              check_workflow=$(echo "$required_checks_json" | jq -r ".[$i].workflow")
+              # #655 (Codex P2 round 5): group matching entries by workflow
+              # identity, not just by name, before deciding "is this check
+              # done". Two failure modes this closes:
+              #   - Stale-vs-pending (a same-name/same-workflow rerun): a
+              #     completed success from an earlier trigger (e.g. push)
+              #     alongside a still-QUEUED rerun from a later trigger
+              #     (e.g. pull_request synchronize) has NEITHER startedAt
+              #     nor completedAt on the queued entry, so a naive
+              #     sort_by(...) | last ranked the queued entry BEFORE the
+              #     completed one (empty string sorts first) and this loop
+              #     could wrongly report the stale success. Any
+              #     non-completed entry in a workflow's group is now
+              #     treated as "still pending" regardless of timestamps.
+              #   - Same-name collision (a consumer's local job also called
+              #     "lint", allowed by the annex contract): for the
+              #     workflow=="" (name-only) canonical `lint` requirement,
+              #     the name-only select matches EITHER workflow's "lint"
+              #     runs. Without grouping, picking one "winner" by
+              #     timestamp could let a newer successful annex "lint"
+              #     mask an older FAILED canonical "lint", reporting readiness
+              #     without canonical lint actually being green. Grouping by
+              #     workflow and requiring EVERY group's winner to be green
+              #     means a same-named annex job can never stand in for the
+              #     canonical check.
+              # #655 Codex P2 round 6 ("treat successful status contexts as
+              # complete"): a StatusContext entry has no .status field at
+              # all (only CheckRun does), so `.status != "COMPLETED"` was
+              # true for EVERY status context regardless of .state,
+              # including state=="SUCCESS" -- pending forever. A
+              # StatusContext is non-terminal only when .state is literally
+              # "PENDING"; every other .state (SUCCESS/FAILURE/ERROR/
+              # EXPECTED) is terminal. A CheckRun is non-terminal whenever
+              # .status is present and not "COMPLETED", unchanged.
+              #
+              # #655 Codex P2 round 11 ("restrict the lint wait to the
+              # required workflow"): the round-5 "group by workflow, require
+              # every group green" rule closed the mask-the-canonical-check
+              # risk, but left the OPPOSITE risk open for the workflow==""
+              # (canonical) match specifically -- a coincidentally same-
+              # named but NON-required check from an unrelated workflow
+              # would ALSO become a mandatory group, wrongly blocking on
+              # ITS failure even though branch protection never required
+              # it. isRequired (ground truth from the graphql query above,
+              # scoped to this PR) now additionally filters the workflow==""
+              # case to required entries when any same-name entry reports
+              # required=true. If none do, keep the configured-check wait
+              # behavior instead of treating branch-protection metadata as a
+              # hard prerequisite for this workflow to wait on its configured
+              # check name. A name-scoped annex match ($workflow != "") is
+              # unaffected, since annex checks are not expected to be
+              # required at all.
+              #
+              # Self-caught while porting this winner-selection pattern into
+              # codex-review-check.sh for #655 round 13 ("ignore stale annex
+              # runs after a green rerun"): `["PENDING","EXPECTED"] |
+              # index(.state // "")` rebinds `.` to the piped-in array
+              # literal for the REST of that expression, so `.state` tries
+              # to index an array with a string and jq hard-errors --
+              # exactly the same "sub-pipeline rebinds dot" hazard the
+              # required-name filter in codex-review-check.sh already
+              # documents and guards against for `$label_name`. Latent since
+              # round 6/11 (never triggered here because every entry seen so
+              # far has been a CheckRun with a non-null .status, so the
+              # buggy StatusContext-only `else` branch never actually ran),
+              # but a classic Statuses-API context reaching this branch
+              # would fail the whole jq call regardless of its .state value.
+              # Fixed by binding .state to $ann_state BEFORE the array-literal
+              # pipe, verified against both CheckRun- and StatusContext-shaped
+              # entries (PENDING/EXPECTED/SUCCESS/absent .state) directly.
+              winners=$(echo "$rollup_json" | jq -c --arg name "$check_name" --arg workflow "$check_workflow" '
+                [.statusCheckRollup[]
+                  | select((.name // .context // "") == $name)
+                  | select($workflow == "" or (.workflowName // "") == $workflow)
+                ] as $name_matches
+                | ([$name_matches[] | select(.isRequired == true)]) as $required_matches
+                | (if $workflow == "" and ($required_matches | length) > 0
+                   then $required_matches
+                   else $name_matches
+                   end) as $matches
+                | ($matches | group_by([(.workflowName // ""), (.kind // "")])) as $groups
+                | [
+                    $groups[]
+                    | (map(select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end))) as $pending
+                    | if ($pending | length) > 0
+                      then $pending[0]
+                      else (sort_by(.completedAt // .startedAt // .createdAt // "") | last)
+                      end
+                  ]')
+              winner_count=$(echo "$winners" | jq 'length')
+              if [ "$winner_count" -eq 0 ]; then
+                echo "::notice::Required check run '$check_name' is absent on current HEAD $sha; not ready."
+                all_done=0
+                continue
+              fi
+              pending_count=$(echo "$winners" | jq '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)] | length')
+              if [ "$pending_count" -gt 0 ]; then
+                pending_status=$(echo "$winners" | jq -r '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)][0].status // .state // ""')
+                echo "::notice::Required check run '$check_name' is $pending_status on current HEAD $sha; not ready."
+                all_done=0
+                continue
+              fi
+              # success/skipped/neutral are all non-blocking conclusions
+              # (#655 Codex P2 round 2): a conditional annex job GitHub
+              # completes as skipped is not a failure, and neutral is a
+              # passing conclusion for required checks too. Mirrors the
+              # same acceptance set codex-review-check.sh's BAD_CHECKS
+              # filter already uses. Every group's winner must be green
+              # (#655 round 5) -- see the comment above the query.
+              bad=$(echo "$winners" | jq -c '[.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))]')
+              bad_count=$(echo "$bad" | jq 'length')
+              if [ "$bad_count" -gt 0 ]; then
+                bad_summary=$(echo "$bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
+                echo "::error::Required check run '$check_name' failed on current HEAD $sha (conclusion=$bad_summary); readiness denied."
+                exit 1
+              fi
+              conclusion_summary=$(echo "$winners" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
+              echo "Required check run '$check_name' is $conclusion_summary on current HEAD $sha."
+            done
+
+            # #1024 (b): `rollup_complete` guards the annex scan for the
+            # same reason the required-check evaluation is skipped above -- its
+            # group-by-name winner selection over a PREFIX of the rollup
+            # could pick a stale FAILURE whose green rerun sits on an
+            # unfetched page and exit 1 on it. The scan runs unchanged on
+            # a probe whose pagination completed.
+            if [ -n "$annex_workflow" ] && [ "$rollup_complete" -eq 1 ]; then
+              # #655 Codex round 6 (P1 "wait for annex checks before
+              # clearing the label", P1 "observe matrix annex jobs before
+              # reporting readiness", P2 "avoid forcing path-filtered annex jobs to
+              # start"): scan the annex's own workflow for any REPORTED
+              # entry rather than requiring a specific derived name, same
+              # design as codex-review-check.sh gate (a)'s
+              # ANNEX_WORKFLOW_BAD scan. A still-in-progress entry is
+              # deliberately treated as pending (not bad) here -- unlike
+              # gate (a) (a repeatedly re-evaluated snapshot, where
+              # in-progress correctly counts as "not yet clean"), this probe
+              # reports not-ready and lets the completion event re-enter.
+              # Zero reported
+              # entries for this workflow is non-blocking: forcing a wait
+              # for one that may legitimately never exist (a path-filtered
+              # annex outside this PR's diff) would time out and refuse
+              # readiness on every such PR, forever.
+              #
+              # #655 Codex P2 round 13 ("disambiguate annex workflows beyond
+              # display name", found on the codex-review-check.sh copy and
+              # mirrored here): matching on .workflowName risked either
+              # masking the real annex behind an unrelated same-named
+              # workflow (false readiness) or blocking on an unrelated
+              # same-named workflow's failure (false red, refuses readiness
+              # forever). .workflowPath is derived from
+              # the GraphQL-reported resourcePath of the workflow FILE
+              # itself, not its freely-editable display name, so match on
+              # the known, fixed annex filename instead. A StatusContext
+              # (no checkSuite at all) safely resolves workflowPath to ""
+              # and can never collide with this literal.
+              annex_matches=$(echo "$rollup_json" | jq -c '
+                [.statusCheckRollup[] | select((.workflowPath // "") == "repo_lint_local.yml")]')
+              annex_match_count=$(echo "$annex_matches" | jq 'length')
+              if [ "$annex_match_count" -eq 0 ] && [ "$annex_unfiltered" = "true" ]; then
+                # #655 Codex P1 round 7 ("wait for unfiltered annex workflow
+                # to appear before merging"): an annex with NO workflow-level
+                # paths/paths-ignore filter is GUARANTEED to eventually
+                # produce a check run for this PR -- zero entries right now
+                # means Actions has not scheduled it yet, not that it never
+                # will (unlike a path-filtered annex, where zero entries is
+                # genuinely ambiguous between "not yet" and "never for this
+                # diff"). Report not-ready instead of treating this the same
+                # as the path-filtered case; the annex completion event will
+                # re-enter the trusted continuation.
+                echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has not reported yet (unfiltered trigger, so it is expected to); current HEAD $sha is not ready (#655)."
+                all_done=0
+              else
+                annex_pending=$(echo "$annex_matches" | jq -c '[.[] | select(if (.status != null) then (.status != "COMPLETED") else ((.state // "") as $ann_state | ["PENDING","EXPECTED"] | index($ann_state)) end)]')
+                annex_pending_count=$(echo "$annex_pending" | jq 'length')
+                if [ "$annex_pending_count" -gt 0 ]; then
+                  echo "::notice::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_pending_count check-run(s) still in progress on current HEAD $sha; not ready (#655)."
+                  all_done=0
+                else
+                  # #655 Codex P2 round 13 ("ignore stale annex runs after a
+                  # green rerun", found on the codex-review-check.sh copy
+                  # and mirrored here): every entry reaching this branch is
+                  # already terminal (annex_pending above is zero), but the
+                  # annex's own workflow can legitimately report more than
+                  # one TERMINAL entry per job name for the current SHA -- a
+                  # failed push-triggered run followed by a successful
+                  # pull_request run, or a failed job manually rerun to a
+                  # later success. Without grouping, an old superseded
+                  # FAILURE never leaves the rollup and would refuse
+                  # readiness forever even after the same-named job went
+                  # green. Group by check name and keep only the
+                  # latest-completed entry per name (mirrors the required-
+                  # check winners query above, minus the pending branch
+                  # already handled by annex_pending) before judging
+                  # bad-ness.
+                  annex_bad=$(echo "$annex_matches" | jq -c '
+                    group_by(.name // .context // "?")
+                    | [.[] | (sort_by(.completedAt // .startedAt // "") | last)]
+                    | [.[] | select((.conclusion // .state // "") as $r | ($r != "SUCCESS" and $r != "SKIPPED" and $r != "NEUTRAL"))]')
+                  annex_bad_count=$(echo "$annex_bad" | jq 'length')
+                  if [ "$annex_bad_count" -gt 0 ]; then
+                    annex_bad_summary=$(echo "$annex_bad" | jq -r '[.[] | (.conclusion // .state // "none")] | join(", ")')
+                    echo "::error::repo_lint_local.yml annex workflow '$annex_workflow' has $annex_bad_count non-passing reported check-run(s) after winner-selection on current HEAD $sha (conclusion=$annex_bad_summary); readiness denied (#655)."
+                    exit 1
+                  fi
+                fi
+              fi
+            fi
+            if [ "$all_done" -eq 1 ]; then
+              echo "CURRENT_HEAD_SHA=$sha" >> "$GITHUB_ENV"
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "All required check run(s) are successful on current HEAD $sha."
+              exit 0
+            fi
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Required current-head checks are still pending. Approval readiness is recorded; the completed-workflow continuation will re-evaluate without holding this runner."
+            exit 0
+
+      - name: Report stable read-only readiness
+        if: steps.author_merge_token.outputs.enabled == 'true' && steps.check_readiness.outputs.ready == 'true'
+        run: |
+          echo "::notice::Read-only readiness is green. The trusted Agent Review Pipeline workflow_run continuation will re-evaluate every mutable gate."

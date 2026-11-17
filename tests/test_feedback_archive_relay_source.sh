@@ -1,0 +1,952 @@
+#!/usr/bin/env bash
+# Runtime tests for the trusted source-run to PR binding used by the feedback
+# archive relay. Every network response is supplied by the gh shim; the log
+# makes a write against a title-selected PR observable if one is introduced.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/scripts/workflow/feedback-archive-relay-source.sh"
+[ -x "$SCRIPT" ] || { echo "missing executable $SCRIPT" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "SKIP: jq is required" >&2; exit 0; }
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/feedback-archive-relay-source.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+BIN="$TMP/bin"
+mkdir -p "$BIN"
+PASS=0
+FAIL=0
+pass() { printf 'PASS: %s\n' "$*"; PASS=$((PASS + 1)); }
+fail() { printf 'FAIL: %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
+assert_eq() { [ "$1" = "$2" ] && pass "$3" || fail "$3 (got=$1 want=$2)"; }
+assert_empty_writes() {
+  if ! grep -E $'\t(POST|PATCH|DELETE)\t|--method\t(POST|PATCH|DELETE)' "$GH_LOG" >/dev/null 2>&1; then
+    pass "$1"
+  else
+    fail "$1 (unexpected mutation: $(cat "$GH_LOG"))"
+  fi
+}
+
+cat >"$BIN/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'gh' >>"$GH_LOG"
+for a in "$@"; do printf '\t%s' "$a" >>"$GH_LOG"; done
+printf '\n' >>"$GH_LOG"
+for a in "$@"; do
+  if [ "$a" = --input ]; then
+    body=$(cat)
+    printf 'input\t%s\n' "$body" >>"$GH_LOG"
+    break
+  fi
+done
+[ "${1:-}" = api ] || exit 64
+shift
+paginate=false
+if [ "${1:-}" = --paginate ]; then paginate=true; shift; fi
+method=GET
+if [ "${1:-}" = --method ]; then method=$2; shift 2; fi
+endpoint=${1:-}
+shift || true
+jq_filter=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = --jq ]; then jq_filter=$arg; fi
+  prev=$arg
+done
+case "$endpoint" in
+  repos/acme/widget/actions/workflows/codex-p1-gate.yml/runs)
+    [ "$method" = GET ] || exit 65
+    page=1
+    for arg in "$@"; do
+      case "$arg" in page=*) page=${arg#page=} ;; esac
+    done
+    if [ "$page" = 2 ] && [ -n "${WORKFLOW_RUNS_PAGE2:-}" ]; then
+      cat "$WORKFLOW_RUNS_PAGE2"
+    else
+      cat "$WORKFLOW_RUNS"
+    fi
+    ;;
+  repos/acme/widget/contents/*\?ref=*)
+    path=${endpoint#repos/acme/widget/contents/}
+    path=${path%%\?ref=*}
+    if [ "${FAIL_RESOLVER_DOWNLOAD:-false}" = true ]; then
+      printf 'trusted resolver download failure\n' >&2
+      exit 1
+    fi
+    case "$path" in
+      scripts/workflow/feedback-archive-relay-source.sh|scripts/lib/gh-api-array.sh) ;;
+      *) printf 'unexpected trusted resolver path: %s\n' "$path" >&2; exit 65 ;;
+    esac
+    jq -n --arg content "$(base64 <"$TEST_ROOT/$path" | tr -d '\n')" \
+      '{type:"file",encoding:"base64",content:$content}'
+    ;;
+  repos/acme/widget/pulls/[0-9]*)
+    pr=${endpoint##*/}
+    file_var="PR_$pr"
+    file=${!file_var:-}
+    [ -n "$file" ] || { printf 'HTTP 404\n' >&2; exit 1; }
+    if [ "${FAIL_PR_HEAD_READ:-false}" = true ] && [ "$jq_filter" = .head.sha ]; then
+      printf 'temporary PR head read failure\n' >&2
+      exit 1
+    fi
+    if [ "$jq_filter" = .head.sha ] && [ -n "${HEAD_SEQUENCE_FILE:-}" ]; then
+      count_file="${HEAD_SEQUENCE_FILE}.count"
+      count=0; [ -f "$count_file" ] && count=$(cat "$count_file")
+      count=$((count + 1)); printf '%s' "$count" >"$count_file"
+      sed -n "${count}p" "$HEAD_SEQUENCE_FILE"
+    elif [ -n "$jq_filter" ]; then
+      jq -r "$jq_filter" "$file"
+    else
+      cat "$file"
+    fi
+    ;;
+  repos/acme/widget/pulls\?state=all\&head=*)
+    cat "$CANDIDATES"
+    ;;
+  repos/acme/widget/check-runs)
+    [ "$method" = POST ] || exit 65
+    if [ "$jq_filter" = .id ]; then printf '900\n'; else printf '{"id":900}\n'; fi
+    ;;
+  repos/acme/widget/issues/[0-9]*/comments)
+    if [ "$method" = POST ]; then printf '{"id": 901}\n';
+    elif [ -n "${RELAY_COMMENTS_FILE:-}" ]; then cat "$RELAY_COMMENTS_FILE";
+    else printf '[]\n'; fi
+    ;;
+  repos/acme/widget/check-runs/[0-9]*)
+    [ "$method" = PATCH ] || exit 65
+    ;;
+  repos/acme/widget/commits/*/check-runs*)
+    printf '{"check_runs":[]}\n'
+    ;;
+  repos/acme/widget/actions/artifacts/[0-9]*)
+    [ "$method" = DELETE ] || exit 65
+    ;;
+  *)
+    printf 'unhandled endpoint: %s\n' "$endpoint" >&2
+    exit 65
+    ;;
+esac
+SH
+chmod +x "$BIN/gh"
+cat >"$BIN/sleep" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$BIN/sleep"
+cat >"$BIN/date" <<'SH'
+#!/usr/bin/env bash
+# The workflow runs on Ubuntu (GNU date); make its two scan-window `-d`
+# conversions deterministic when this hermetic test runs on macOS/BSD date.
+printf '%s\n' '2026-09-26T10:00:00Z'
+SH
+chmod +x "$BIN/date"
+
+sha() { printf '%040d' "$1"; }
+BASE_ID=100
+BASE_REPO=acme/widget
+RUN_AT=2026-09-26T10:00:00Z
+
+write_pr() {
+  # number, head sha, head repo id, head repo name, branch, actor, created, fork flag
+  local fork=${8:-}
+  if [ -z "$fork" ]; then
+    [ "$4" = "$BASE_REPO" ] && fork=false || fork=true
+  fi
+  jq -n --argjson n "$1" --arg head "$2" --argjson hrid "$3" --arg hrepo "$4" \
+    --arg branch "$5" --arg actor "$6" --arg created "$7" --argjson base "$BASE_ID" \
+    --arg repo "$BASE_REPO" --argjson fork "$fork" '{number:$n,created_at:$created,user:{login:$actor},base:{repo:{id:$base,full_name:$repo,default_branch:"main"}},head:{sha:$head,ref:$branch,repo:{id:$hrid,full_name:$hrepo,fork:$fork}}}' >"$TMP/pr-$1.json"
+  eval "PR_$1=\"$TMP/pr-$1.json\""
+  export "PR_$1"
+}
+
+write_run() {
+  # event, source sha, source repo id, source repo, branch, associations json, path
+  jq -n --arg event "$1" --arg head "$2" --argjson hri "$3" --arg hr "$4" --arg branch "$5" \
+    --argjson associations "$6" --arg path "$7" --arg created "$RUN_AT" --argjson base "$BASE_ID" \
+    --arg repo "$BASE_REPO" --argjson pr "${RUN_PR:-41}" '{id:501,display_title:("Codex P1 Gate relay-v1 PR #" + ($pr|tostring)),event:$event,path:$path,head_sha:$head,head_branch:$branch,head_repository:{id:$hri,full_name:$hr},repository:{id:$base,full_name:$repo},created_at:$created,pull_requests:$associations}' >"$TMP/run.json"
+}
+
+run_case() {
+  : >"$GH_LOG"
+  set +e
+  OUTPUT=$(PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" "$SCRIPT" "$BASE_REPO" "$1" <"$TMP/run.json" 2>"$TMP/stderr")
+  RC=$?
+  set -e
+  if [ "$RC" -ne 0 ]; then
+    printf 'helper rc=%s: %s [calls: %s]\n' "$RC" "$(cat "$TMP/stderr")" "$(cat "$GH_LOG")" >&2
+  fi
+}
+
+CANDIDATES="$TMP/candidates.json"
+GH_LOG="$TMP/gh.log"
+WORKFLOW_RUNS="$TMP/workflow-runs.json"
+export CANDIDATES GH_LOG WORKFLOW_RUNS
+
+# GitHub's observed review-event shape has no PR association. A unique source
+# origin/branch binds it, but publication uses the current PR API head after a
+# later push, rather than the historical source head.
+SRC=$(sha 11)
+PUBLISH=$(sha 12)
+write_pr 41 "$PUBLISH" 201 fork/alice relay-branch alice 2026-09-25T09:00:00Z
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg source fork/alice --arg branch relay-branch '[{number:41,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$head,full_name:$source},ref:$branch}}]' >"$CANDIDATES"
+write_run pull_request_review "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
+run_case 41
+assert_eq "$RC" 0 "empty-association pull_request_review binds a unique fork branch"
+assert_eq "$(printf '%s' "$OUTPUT" | jq -r .publish_head_sha)" "$PUBLISH" "review relay publishes on current PR API head"
+assert_eq "$(printf '%s' "$OUTPUT" | jq -r .source_head_sha)" "$SRC" "review relay retains historical source head separately"
+assert_empty_writes "binding helper never mutates while resolving a review source"
+
+# The same empty-association shape is documented for review-comment events.
+write_run pull_request_review_comment "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 0 "empty-association pull_request_review_comment binds a unique fork branch"
+assert_eq "$(printf '%s' "$OUTPUT" | jq -r .source_event)" pull_request_review_comment "review-comment event is preserved in the binding"
+
+# issue_comment runs execute from the trusted default branch. Its run head is
+# deliberately not compared to the PR head, and a same-repository Dependabot
+# PR still requires the relay.
+ISSUE_HEAD=$(sha 31)
+DEP_HEAD=$(sha 32)
+write_pr 42 "$DEP_HEAD" "$BASE_ID" "$BASE_REPO" dependabot/npm/foo dependabot[bot] 2026-09-25T09:00:00Z
+jq -n '[]' >"$CANDIDATES"
+RUN_PR=42 write_run issue_comment "$ISSUE_HEAD" "$BASE_ID" "$BASE_REPO" main '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
+run_case 42
+assert_eq "$RC" 0 "default-branch issue_comment binds its PR despite a different run head"
+assert_eq "$(printf '%s' "$OUTPUT" | jq -r .publish_head_sha)" "$DEP_HEAD" "issue-comment publication head comes from the PR API"
+assert_eq "$(printf '%s' "$OUTPUT" | jq -r .requires_relay)" true "same-repository Dependabot PR still requires relay"
+
+# Match the producer's classification field directly. A repository that is
+# itself a fork can host a same-name PR head with `fork: true`; origin binding
+# still uses ids/branch, while relay classification must remain true.
+write_pr 43 "$(sha 43)" "$BASE_ID" "$BASE_REPO" fork-base-branch alice 2026-09-25T09:00:00Z true
+jq -n --argjson base "$BASE_ID" --arg source "$BASE_REPO" --arg branch fork-base-branch '[{number:43,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$base,full_name:$source},ref:$branch}}]' >"$CANDIDATES"
+RUN_PR=43 write_run pull_request "$(sha 43)" "$BASE_ID" "$BASE_REPO" fork-base-branch '[]' '.github/workflows/codex-p1-gate.yml'
+run_case 43
+assert_eq "$RC" 0 "same-name head with GitHub fork flag binds normally"
+assert_eq "$(printf '%s' "$OUTPUT" | jq -r .requires_relay)" true "relay classification follows head.repo.fork rather than name equality"
+
+# An artifact or title that names PR 77 cannot override the source origin: the
+# unique branch candidate is PR 41, so helper stays inert for PR 77.
+write_pr 77 "$(sha 77)" 202 fork/bob victim-branch bob 2026-09-25T09:00:00Z
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg source fork/alice --arg branch relay-branch '[{number:41,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$head,full_name:$source},ref:$branch}}]' >"$CANDIDATES"
+RUN_PR=77 write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+run_case 77
+assert_eq "$RC" 4 "wrong-title cross-PR candidate is rejected before any writer can arm"
+assert_empty_writes "wrong-title cross-PR binding makes no mutation"
+
+# A contradictory nonempty association is rejection, never permission to fall
+# back to the title or the origin query.
+jq -n --argjson base "$BASE_ID" '{number:77,base:{repo:{id:$base}},head:{repo:{id:202},ref:"victim-branch"}} | [.]' >"$TMP/associations.json"
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch "$(cat "$TMP/associations.json")" '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 4 "contradictory source association is rejected without title fallback"
+assert_empty_writes "contradictory association creates no mutation"
+
+# Nonempty associations are source evidence only when they identify one PR.
+# Two otherwise matching PRs can share a fork branch and commit across base
+# branches; a run title must not select between them. Exercise both candidate
+# titles so either target remains inert.
+write_pr 81 "$(sha 81)" 201 fork/alice relay-branch alice 2026-09-25T09:00:00Z
+write_pr 82 "$(sha 82)" 201 fork/alice relay-branch alice 2026-09-25T09:00:00Z
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg branch relay-branch '
+  [41,81] | map({number:.,base:{repo:{id:$base}},head:{repo:{id:$head},ref:$branch}})
+' >"$TMP/ambiguous-associations.json"
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch "$(cat "$TMP/ambiguous-associations.json")" '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 4 "multiple matching source associations reject the first candidate title"
+assert_empty_writes "first ambiguous association target creates no mutation"
+RUN_PR=81 write_run pull_request "$SRC" 201 fork/alice relay-branch "$(cat "$TMP/ambiguous-associations.json")" '.github/workflows/codex-p1-gate.yml'
+run_case 81
+assert_eq "$RC" 4 "multiple matching source associations reject the second candidate title"
+assert_empty_writes "second ambiguous association target creates no mutation"
+
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg branch relay-branch '
+  [{number:41,base:{repo:{id:$base}},head:{repo:{id:$head},ref:$branch}}]
+' >"$TMP/single-association.json"
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch "$(cat "$TMP/single-association.json")" '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 0 "one matching source association accepts its candidate"
+assert_empty_writes "verified single association remains read-only while binding"
+dup_associations=$(jq -c '[.[0], .[0]]' "$TMP/single-association.json")
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch "$dup_associations" '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 0 "duplicate identical source associations collapse to one candidate"
+assert_empty_writes "duplicate identical association remains read-only while binding"
+
+# Two historical PRs for one source branch are intentionally unavailable: do
+# not choose the first target or let a reused branch acquire a later PR.
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg source fork/alice --arg branch relay-branch '[41,43] | map({number:.,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$head,full_name:$source},ref:$branch}})' >"$CANDIDATES"
+write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+run_case 41
+assert_eq "$RC" 4 "ambiguous reused source branch is rejected"
+assert_empty_writes "ambiguous source branch creates no mutation"
+
+# A title pointing at another branch in the same fork cannot rely on repository
+# identity alone; exact source branch equality is load-bearing.
+write_pr 78 "$(sha 78)" 201 fork/alice different-branch alice 2026-09-25T09:00:00Z
+RUN_PR=78 write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+run_case 78
+assert_eq "$RC" 4 "same-fork wrong-branch candidate is rejected"
+assert_empty_writes "same-fork wrong-branch candidate creates no mutation"
+
+# A reused branch must not let an old source run acquire a PR created later.
+write_pr 79 "$(sha 79)" 201 fork/alice relay-branch alice 2026-09-27T09:00:00Z
+RUN_PR=79 write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+run_case 79
+assert_eq "$RC" 4 "source run cannot bind a PR created after the run"
+assert_empty_writes "later-created branch reuse creates no mutation"
+
+# A malformed candidate response is an infrastructure result, distinct from a
+# title/source mismatch, so callers can retry but may not publish meanwhile.
+printf '{}\n' >"$TMP/pr-80.json"
+PR_80="$TMP/pr-80.json"; export PR_80
+RUN_PR=80 write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+run_case 80
+assert_eq "$RC" 3 "malformed candidate PR response fails as infrastructure"
+assert_empty_writes "malformed candidate response creates no mutation"
+
+# Exercise the scheduled sweep's real source-window scanner. The scanner is
+# the sole producer of its relay inventory; an API payload that cannot prove a
+# workflow_runs array must set relay_scan_error before the caller can consider
+# an empty inventory clear. This extracts the production function instead of
+# reproducing its jq/filter loop in the test.
+SCAN_FUNCTION="$TMP/scan-source-window.sh"
+awk '
+  /scan_source_window\(\) \{/ { active=1 }
+  active && /^              }$/ { sub(/^              /, ""); print; exit }
+  active { sub(/^              /, ""); print }
+' "$ROOT/.github/workflows/codex-p1-gate.yml" >"$SCAN_FUNCTION"
+[ -s "$SCAN_FUNCTION" ] || { echo "could not extract scheduled relay source scanner" >&2; exit 1; }
+SCAN_HARNESS="$TMP/scan-source-window-harness.sh"
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+  cat "$SCAN_FUNCTION"
+  cat <<'SH'
+relay_scan_error=false
+source_runs='[]'
+source_meta='[]'
+relay_source_cache="$RUNNER_TEMP/relay-source-cache-$PR"
+rm -rf "$relay_source_cache"
+mkdir -p "$relay_source_cache"
+scan_source_window pull_request 1758880800 1758884400
+printf 'relay_scan_error=%s\n' "$relay_scan_error"
+printf 'source_runs=%s\n' "$source_runs"
+SH
+} >"$SCAN_HARNESS"
+chmod +x "$SCAN_HARNESS"
+run_scan() {
+  local page2=${1:-}
+  local max_runs=${2:-50}
+  : >"$GH_LOG"
+  rm -rf "$TMP/scan-runner"
+  set +e
+  SCAN_OUTPUT=$(cd "$ROOT" && PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" \
+    WORKFLOW_RUNS="$WORKFLOW_RUNS" WORKFLOW_RUNS_PAGE2="$page2" RUNNER_TEMP="$TMP/scan-runner" REPO="$BASE_REPO" \
+    PR=41 MAX_RELAY_SOURCE_RUNS="$max_runs" "$SCAN_HARNESS" 2>"$TMP/scan.err")
+  SCAN_RC=$?
+  set -e
+}
+
+printf '%s\n' '{"total_count":0}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after a missing workflow_runs array"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "missing workflow_runs marks the relay scan as an infrastructure error"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^source_runs=//p')" '[]' "missing workflow_runs never qualifies an empty relay inventory"
+assert_empty_writes "missing workflow_runs scan makes no target mutation"
+
+printf '%s\n' '{"total_count":0,"workflow_runs":{}}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after a wrong-shaped workflow_runs value"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "wrong-shaped workflow_runs marks the relay scan as an infrastructure error"
+assert_empty_writes "wrong-shaped workflow_runs scan makes no target mutation"
+
+# A successful API command that prints no JSON (including whitespace only) is
+# neither an empty page nor a valid inventory. Keep both cases bounded: the
+# checked singleton capture must set relay_scan_error on page one before any
+# pagination loop can advance.
+: >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after an empty successful response"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "empty successful response marks the relay scan as an infrastructure error"
+assert_empty_writes "empty successful response scan makes no target mutation"
+
+printf ' \n\t \n' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after a whitespace-only successful response"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "whitespace-only successful response marks the relay scan as an infrastructure error"
+assert_empty_writes "whitespace-only successful response scan makes no target mutation"
+
+printf '%s\n' '{"total_count":0,"workflow_runs":[]}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner accepts a legitimate empty workflow run page"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" false "legitimate empty workflow run page does not become an infrastructure error"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^source_runs=//p')" '[]' "legitimate empty workflow run page leaves the inventory empty"
+assert_empty_writes "legitimate empty workflow run scan makes no target mutation"
+
+# A complete first page can still be followed by a malformed empty second
+# response. total_count=101 forces the actual pagination branch once, then the
+# singleton capture must fail closed rather than leaving the lease pending.
+printf '%s\n' '{"total_count":101,"workflow_runs":[]}' >"$WORKFLOW_RUNS"
+PAGE2="$TMP/workflow-runs-page2.json"
+: >"$PAGE2"
+run_scan "$PAGE2" 500
+assert_eq "$SCAN_RC" 0 "actual sweep scanner returns after an empty second page"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" true "empty second page marks the relay scan as an infrastructure error"
+if grep -F -- $'page=2' "$GH_LOG" >/dev/null; then
+  pass "empty second-page case exercised the real pagination branch"
+else
+  fail "empty second-page case did not request page two: $(cat "$GH_LOG")"
+fi
+assert_empty_writes "empty second-page scan makes no target mutation"
+
+# A matching, positively bound source is still retained. This guards the
+# checked capture from accidentally treating all nonempty pages as failures.
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg source fork/alice --arg branch relay-branch '[{number:41,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$head,full_name:$source},ref:$branch}}]' >"$CANDIDATES"
+RUN_PR=41 write_run pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+jq -n --slurpfile runs "$TMP/run.json" '{total_count:1,workflow_runs:$runs}' >"$WORKFLOW_RUNS"
+run_scan
+assert_eq "$SCAN_RC" 0 "actual sweep scanner accepts a valid matching source run"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^relay_scan_error=//p')" false "valid matching source run does not become an infrastructure error"
+assert_eq "$(printf '%s\n' "$SCAN_OUTPUT" | sed -n 's/^source_runs=//p')" '[501]' "valid matching source run remains in the pending relay inventory"
+assert_empty_writes "sweep source inventory scan stays read-only for a matching source"
+
+# The recovery writer is a privileged sink. Execute the run block extracted
+# from the actual workflow, rather than duplicating it: a forged title/source
+# mismatch must reach its inert exit before a check POST, while a valid delayed
+# run must POST against publish_head_sha (the current PR API head), never the
+# historical source/artifact head.
+RECOVERY="$TMP/recovery.sh"
+awk '
+  /name: Publish a PR-head failure when source resolution errors/ { active=1 }
+  active && /^      - name: Locate the read-only handoff artifact/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$RECOVERY"
+[ -s "$RECOVERY" ] || { echo "could not extract relay recovery writer" >&2; exit 1; }
+chmod +x "$RECOVERY"
+
+# The recovery uses a resolver path supplied by the preceding trusted setup
+# step. Execute that setup after a simulated checkout failure, with contents
+# responses served by the gh shim, so the recovery path proves it uses the
+# downloaded helper and its colocated dependency rather than the workspace.
+PREPARE_RESOLVER="$TMP/prepare-resolver.sh"
+awk '
+  /name: Prepare the trusted source resolver/ { active=1 }
+  active && /^      - name: Resolve the source PR and read-only boundary/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$PREPARE_RESOLVER"
+[ -s "$PREPARE_RESOLVER" ] || { echo "could not extract trusted resolver preparation" >&2; exit 1; }
+chmod +x "$PREPARE_RESOLVER"
+TRUSTED_REF=$(sha 99)
+run_fallback_prepare() {
+  : >"$GH_LOG"
+  rm -rf "$TMP/fallback-runner"
+  : >"$TMP/resolver-output"
+  set +e
+  PATH="$BIN:$PATH" GH_LOG="$GH_LOG" TEST_ROOT="$ROOT" RUNNER_TEMP="$TMP/fallback-runner" \
+    GITHUB_WORKSPACE="$TMP/missing-checkout" REPO="$BASE_REPO" TRUSTED_REF="$TRUSTED_REF" \
+    CHECKOUT_OUTCOME=failure GITHUB_OUTPUT="$TMP/resolver-output" "$PREPARE_RESOLVER" \
+    >"$TMP/prepare.out" 2>"$TMP/prepare.err"
+  PREPARE_RC=$?
+  set -e
+  PREPARED_RESOLVER=$(sed -n 's/^path=//p' "$TMP/resolver-output")
+}
+run_recovery() {
+  : >"$GH_LOG"
+  jq -n --argjson pr "$1" --arg event "$2" --arg head "$3" --argjson repo_id "$4" \
+    --arg repo "$5" --arg branch "$6" --argjson associations "$7" --arg path "$8" \
+    --arg created "$RUN_AT" '{workflow_run:{id:501,display_title:("Codex P1 Gate relay-v1 PR #" + ($pr|tostring)),event:$event,path:$path,head_sha:$head,head_branch:$branch,head_repository:{id:$repo_id,full_name:$repo},repository:{id:100,full_name:"acme/widget"},created_at:$created,pull_requests:$associations}}' >"$TMP/event.json"
+  set +e
+  PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" \
+    GITHUB_EVENT_PATH="$TMP/event.json" RUNNER_TEMP="$TMP" REPO="$BASE_REPO" \
+    SOURCE_RESOLVER="${9:-$SCRIPT}" SOURCE_RUN_ID=501 CHECK_NAME='Codex P1 unresolved threads' "$RECOVERY" >"$TMP/recovery.out" 2>"$TMP/recovery.err"
+  RECOVERY_RC=$?
+  set -e
+}
+
+# The recovery must rebind; a source from Alice cannot publish a failure onto
+# title-selected Bob PR 77, even though that PR is a fork and has a real head.
+run_recovery 77 pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml'
+assert_eq "$RECOVERY_RC" 1 "actual recovery writer exits without publication for an unbound title target"
+assert_empty_writes "actual recovery writer makes no target-PR mutation after failed binding"
+
+# A delayed valid source binds PR 41 and the writer publishes the API head 12,
+# not source head 11. This is the recovery path's real POST command.
+jq -n --argjson base "$BASE_ID" --argjson head 201 --arg source fork/alice --arg branch relay-branch '[{number:41,created_at:"2026-09-25T09:00:00Z",base:{repo:{id:$base}},head:{repo:{id:$head,full_name:$source},ref:$branch}}]' >"$CANDIDATES"
+run_recovery 41 pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
+assert_eq "$RECOVERY_RC" 1 "actual recovery writer reports its source-step failure after publishing bound failure"
+if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- $'head_sha=0000000000000000000000000000000000000012' "$GH_LOG" >/dev/null \
+  && ! grep -F -- $'head_sha=0000000000000000000000000000000000000011' "$GH_LOG" >/dev/null; then
+  pass "actual recovery writer publishes only the bound PR API head"
+else
+  fail "actual recovery writer did not target the bound PR API head: $(cat "$GH_LOG")"
+fi
+
+# A failed checkout skips the ordinary source step. The actual preparation
+# block must recover only the trusted resolver pair at the workflow SHA; then
+# the actual recovery block may publish a failure for a positively bound run.
+# This executes those two blocks from an otherwise checkout-free directory.
+run_fallback_prepare
+assert_eq "$PREPARE_RC" 0 "actual fallback preparation succeeds after checkout failure"
+assert_eq "$PREPARED_RESOLVER" "$TMP/fallback-runner/relay-source-resolver/scripts/workflow/feedback-archive-relay-source.sh" "fallback preparation exports its isolated trusted resolver path"
+if [ -x "$PREPARED_RESOLVER" ] \
+  && [ -r "$TMP/fallback-runner/relay-source-resolver/scripts/lib/gh-api-array.sh" ]; then
+  pass "fallback preparation downloads the resolver and its required dependency"
+else
+  fail "fallback preparation did not materialize the isolated resolver pair"
+fi
+run_recovery 41 pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main' "$PREPARED_RESOLVER"
+assert_eq "$RECOVERY_RC" 1 "checkout-failure recovery publishes a bound terminal failure"
+if [ "$(grep -Ec $'\t(POST|PATCH|DELETE)\t|--method\t(POST|PATCH|DELETE)' "$GH_LOG")" -eq 1 ] \
+  && grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null \
+  && ! grep -F -- "head_sha=$SRC" "$GH_LOG" >/dev/null; then
+  pass "checkout-failure recovery writes only the positively bound API head"
+else
+  fail "checkout-failure recovery did not limit publication to the bound API head: $(cat "$GH_LOG")"
+fi
+
+# The fallback resolver retains its rejection boundary: recovering it after a
+# checkout failure cannot turn a forged title into permission to publish.
+run_fallback_prepare
+assert_eq "$PREPARE_RC" 0 "fallback preparation remains available for an unbound source"
+run_recovery 77 pull_request "$SRC" 201 fork/alice relay-branch '[]' '.github/workflows/codex-p1-gate.yml' "$PREPARED_RESOLVER"
+assert_eq "$RECOVERY_RC" 1 "checkout-failure recovery remains inert for an unbound source"
+assert_empty_writes "checkout-failure fallback makes no target mutation for a forged source"
+
+# A failed trusted download exports no resolver path. In the workflow this
+# leaves the normal source step skipped and the recovery condition unarmed;
+# preparation itself must have made no target-PR mutation.
+FAIL_RESOLVER_DOWNLOAD=true run_fallback_prepare
+assert_eq "$PREPARE_RC" 1 "fallback preparation fails closed when trusted resolver download fails"
+assert_eq "$PREPARED_RESOLVER" "" "failed fallback preparation exports no resolver path"
+assert_empty_writes "failed fallback preparation makes no target-PR mutation"
+
+# Execute the actual persist writer from the workflow in a scratch trusted
+# checkout. The two locally supplied commands are only its gate/fingerprint
+# dependencies; all relay source, lease, archive, marker, PATCH, and artifact
+# operations remain the extracted production block and the same gh shim.
+PERSIST="$TMP/persist.sh"
+awk '
+  /name: Persist archive and publish the exact-head gate/ { active=1 }
+  active && /^      - name: / && !/Persist archive and publish the exact-head gate/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$PERSIST"
+[ -s "$PERSIST" ] || { echo "could not extract relay persist writer" >&2; exit 1; }
+chmod +x "$PERSIST"
+TRUSTED="$TMP/trusted"
+mkdir -p "$TRUSTED/scripts/lib" "$TRUSTED/.github"
+cp "$ROOT/scripts/lib/feedback-policy-helpers.sh" "$ROOT/scripts/lib/feedback-archive-identities.sh" "$TRUSTED/scripts/lib/"
+cp "$ROOT/.github/review-policy.yml" "$TRUSTED/.github/review-policy.yml"
+cat >"$TRUSTED/scripts/review-feedback-surface-fingerprint.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${TEST_FINGERPRINT:-fingerprint}"
+SH
+cat >"$TRUSTED/scripts/codex-p1-gate.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'fake Codex P1 gate on expected head %s\n' "${CODEX_P1_EXPECTED_HEAD_SHA:-}"
+exit "${TEST_GATE_RC:-0}"
+SH
+chmod +x "$TRUSTED/scripts/review-feedback-surface-fingerprint.sh" "$TRUSTED/scripts/codex-p1-gate.sh"
+HANDOFF="$TMP/handoff.json"
+printf '**P1** Historical enrolled inline finding.\n' >"$TMP/ordinary-body"
+ARCHIVE=$("$ROOT/scripts/render-feedback-archive.sh" inline 555 'chatgpt-codex-connector[bot]' 2026-10-11T01:00:00Z "$TMP/ordinary-body")
+# Real chunk restoration cannot decode one part without its sibling comments.
+python3 - <<'PYTHON' >"$TMP/restoration-body"
+print('**P1** Historical large finding.\n' + 'retained text ' * 8000, end='')
+PYTHON
+"$ROOT/scripts/render-feedback-archive.sh" inline 555 'chatgpt-codex-connector[bot]' 2026-10-11T01:00:00Z "$TMP/restoration-body" >"$TMP/restoration-records"
+RESTORATION_RECORD=$(head -n 1 "$TMP/restoration-records")
+write_handoff() {
+  # event, artifact/source head; persist supplies the rest from trusted binding.
+  jq -n --arg repo "$BASE_REPO" --argjson pr 41 --argjson run 501 --arg event "$1" --arg head "$2" \
+    --arg actor alice --arg archive "$ARCHIVE" --arg restoration "$RESTORATION_RECORD" '{version:1,repo:$repo,pr:$pr,source_run_id:$run,requires_relay:true,is_fork:true,pr_actor:$actor,event_name:$event,head_sha:$head} +
+    (if $event=="issue_comment" then {archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:556},archive_records:[$restoration]}
+     elif $event=="pull_request" then {archive_source:{kind:"",login:"",id:0},archive_records:[]}
+     else {archive_source:{kind:"inline",login:"chatgpt-codex-connector[bot]",id:555},archive_records:[$archive]} end)'  >"$HANDOFF"
+}
+run_persist() {
+  : >"$GH_LOG"
+  rm -f "${HEAD_SEQUENCE_FILE:-}.count" 2>/dev/null || true
+  set +e
+  (cd "$TRUSTED" && PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" \
+    HEAD_SEQUENCE_FILE="$HEAD_SEQUENCE_FILE" RUNNER_TEMP="$TMP" REPO="$BASE_REPO" \
+    PR_NUMBER=41 SOURCE_RUN_ID=501 PUBLISHER_RUN_ID=999 ARTIFACT_ID=700 EXPECTED_IS_FORK=true \
+    EXPECTED_PR_ACTOR=alice EXPECTED_SOURCE_EVENT="$1" EXPECTED_SOURCE_HEAD="$2" \
+    HANDOFF_FILE="$HANDOFF" CHECK_NAME='Codex P1 unresolved threads' \
+    GITHUB_OUTPUT="$TMP/persist-output" "$PERSIST") \
+    >"$TMP/persist.out" 2>"$TMP/persist.err"
+  PERSIST_RC=$?
+  set -e
+}
+
+# A forged artifact event/head is rejected before the lease or archive writer.
+write_handoff pull_request "$(sha 88)"
+HEAD_SEQUENCE_FILE="$TMP/persist-heads"
+printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist pull_request "$SRC"
+assert_eq "$PERSIST_RC" 1 "actual persist writer rejects an artifact with a wrong source head"
+assert_empty_writes "wrong artifact source head reaches no lease or archive writer"
+write_handoff pull_request_review "$SRC"
+run_persist pull_request "$SRC"
+assert_eq "$PERSIST_RC" 1 "actual persist writer rejects an artifact with a wrong event"
+assert_empty_writes "wrong artifact event reaches no lease or archive writer"
+
+# A valid delayed archive preserves its historical record but opens and
+# evaluates the lease at the current bound API head, not the handoff source.
+# #1437: source enrollment is checked before either the lease or archive POST.
+write_handoff pull_request_review_comment "$SRC"
+jq '.archive_source.login="never-registered"' "$HANDOFF" >"$TMP/unregistered-handoff.json"
+mv "$TMP/unregistered-handoff.json" "$HANDOFF"
+printf '%s\n' "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist pull_request_review_comment "$SRC"
+assert_eq "$PERSIST_RC" 2 "actual persist writer rejects an unregistered tier/record source"
+assert_empty_writes "ineligible archived source cannot open a check lease or post records"
+
+write_handoff pull_request_review_comment "$SRC"
+printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist pull_request_review_comment "$SRC"
+assert_eq "$PERSIST_RC" 0 "actual persist writer accepts a valid delayed source archive"
+if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- $'head_sha=0000000000000000000000000000000000000012' "$GH_LOG" >/dev/null \
+  && ! grep -F -- $'head_sha=0000000000000000000000000000000000000011' "$GH_LOG" >/dev/null \
+  && grep -F -- "$ARCHIVE" "$GH_LOG" >/dev/null \
+  && grep -F -- 'conclusion=success' "$GH_LOG" >/dev/null \
+  && grep -F -- "fake Codex P1 gate on expected head $PUBLISH" "$GH_LOG" >/dev/null; then
+  pass "actual persist writer archives, gates, and publishes only the current PR API head"
+else
+  fail "actual persist writer did not preserve delayed archive/current-head separation: $(cat "$GH_LOG")"
+fi
+
+# Actual non-source and restoration producer shapes: empty source metadata is
+# harmless; explicit Actions issue-comment restores the exact single chunk.
+write_handoff pull_request "$SRC"
+printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist pull_request "$SRC"
+assert_eq "$PERSIST_RC" 0 "actual persist accepts an empty non-source handoff"
+if ! grep -F -- "$ARCHIVE" "$GH_LOG" >/dev/null; then pass "empty non-source handoff posts no archive"; else fail "empty handoff posted an archive"; fi
+write_handoff issue_comment "$SRC"
+printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+run_persist issue_comment "$SRC"
+assert_eq "$PERSIST_RC" 0 "actual persist accepts a real incomplete Actions restoration chunk"
+if grep -F -- "$RESTORATION_RECORD" "$GH_LOG" >/dev/null; then pass "actual persist preserves the exact restoration chunk"; else fail "restoration chunk was not posted"; fi
+# Explicit Actions restoration bypasses damaged enrollment only after the
+# existing trusted source/tuple binding and still persists the exact record.
+cp "$TRUSTED/.github/review-policy.yml" "$TMP/relay-enrolled-policy.yml"
+for damage in missing malformed; do
+  if [ "$damage" = missing ]; then printf 'available_reviewers: []\n' >"$TRUSTED/.github/review-policy.yml";
+  else printf 'feedback_archive: {identities: invalid}\n' >"$TRUSTED/.github/review-policy.yml"; fi
+  write_handoff issue_comment "$SRC"
+  jq --arg record "$ARCHIVE" '.archive_records=[$record]' "$HANDOFF" >"$TMP/complete-restoration.json"
+  mv "$TMP/complete-restoration.json" "$HANDOFF"
+  printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+  run_persist issue_comment "$SRC"
+  assert_eq "$PERSIST_RC" 0 "actual relay preserves explicit complete Actions restoration with $damage registry"
+  if grep -F -- "$ARCHIVE" "$GH_LOG" >/dev/null; then pass "$damage registry restoration retains exact record bytes"; else fail "$damage restoration omitted its body"; fi
+  jq '.archive_source={kind:"inline",login:"never-registered",id:555}' "$HANDOFF" >"$TMP/fresh-damaged.json"
+  mv "$TMP/fresh-damaged.json" "$HANDOFF"
+  run_persist issue_comment "$SRC"
+  assert_eq "$PERSIST_RC" 2 "$damage registry cannot grant fresh source restoration authority"
+  assert_empty_writes "fresh $damage source opens no lease or archive"
+done
+mv "$TMP/relay-enrolled-policy.yml" "$TRUSTED/.github/review-policy.yml"
+# Feed the existing resolver output to the actual privileged writer: these
+# legacy artifacts came from immutable default-branch issue-comment producers.
+write_run issue_comment "$ISSUE_HEAD" "$BASE_ID" "$BASE_REPO" main '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
+run_case 41
+assert_eq "$RC" 0 "legacy restoration source is verified as a base/default-branch issue-comment run"
+VERIFIED_EVENT=$(printf '%s' "$OUTPUT" | jq -r .source_event)
+VERIFIED_HEAD=$(printf '%s' "$OUTPUT" | jq -r .source_head_sha)
+for legacy_record in "$RESTORATION_RECORD" '<!-- mergepath-feedback-archive-relay:v2 run=501 publisher=777 status=complete -->'; do
+  write_handoff issue_comment "$SRC"
+  jq --arg record "$legacy_record" 'del(.archive_source) | .archive_records=[$record]' "$HANDOFF" >"$TMP/legacy-restoration.json"
+  mv "$TMP/legacy-restoration.json" "$HANDOFF"
+  printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+  run_persist "$VERIFIED_EVENT" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 0 "actual persist accepts legacy restoration with independently verified source context"
+  if grep -F -- "$legacy_record" "$GH_LOG" >/dev/null; then pass "legacy restoration exact prior record is preserved"; else fail "legacy prior record was not posted"; fi
+  run_persist "" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 1 "missing verified context cannot authorize legacy restoration"
+  assert_empty_writes "missing source context reaches no lease or archive writer"
+  jq '.event_name="pull_request"' "$HANDOFF" >"$TMP/forged-event.json"
+  mv "$TMP/forged-event.json" "$HANDOFF"
+  run_persist "$VERIFIED_EVENT" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 1 "forged pull-request handoff cannot match verified issue-comment context"
+  assert_empty_writes "source event mismatch reaches no lease or archive writer"
+  run_persist pull_request "$SRC"
+  assert_eq "$PERSIST_RC" 2 "verified pull-request context grants no legacy partial or terminal restoration"
+  assert_empty_writes "pull-request context cannot promote legacy restoration records"
+  jq '.event_name="issue_comment" | .archive_source={kind:"issue-comment",login:"github-actions[bot]",id:0}' "$HANDOFF" >"$TMP/invalid-source.json"
+  mv "$TMP/invalid-source.json" "$HANDOFF"
+  run_persist "$VERIFIED_EVENT" "$VERIFIED_HEAD"
+  assert_eq "$PERSIST_RC" 2 "present invalid source metadata cannot fall back to verified legacy restoration"
+  assert_empty_writes "invalid metadata reaches no lease or archive writer"
+done
+write_run issue_comment "$ISSUE_HEAD" "$BASE_ID" "$BASE_REPO" candidate-branch '[]' '.github/workflows/codex-p1-gate.yml@refs/heads/main'
+run_case 41
+assert_eq "$RC" 4 "candidate-branch issue-comment source cannot grant legacy restoration context"
+assert_empty_writes "unverified source resolver emits no privileged write"
+
+# Explicit Actions source metadata restores complete records independently of
+# enrollment. Legacy complete bodies still bind enrollment; event is not author.
+encoded=$(printf '%s' "$ARCHIVE" | sed -E 's/^<!-- mergepath-feedback-archive:v1 (.*) -->$/\1/')
+for mode in legacy restoration; do
+  for login in 'chatgpt-codex-connector[bot]' never-registered; do
+    write_handoff issue_comment "$SRC"
+    payload=$(printf '%s' "$encoded" | jq -Rr --arg login "$login" '@base64d | fromjson | .source_login=$login | @json | @base64')
+    jq --arg payload "$payload" --arg mode "$mode" '.archive_records=[("<!-- mergepath-feedback-archive:v2 id="+("a"*64)+" part=1/1 data="+$payload+" -->")] | if $mode=="legacy" then del(.archive_source) else . end' "$HANDOFF" >"$TMP/singleton.json"
+    mv "$TMP/singleton.json" "$HANDOFF"
+    printf '%s\n' "$PUBLISH" "$PUBLISH" "$PUBLISH" >"$HEAD_SEQUENCE_FILE"
+    run_persist issue_comment "$SRC"
+    if [ "$mode" = legacy ] && [ "$login" = never-registered ]; then
+      assert_eq "$PERSIST_RC" 2 "legacy complete unknown source cannot claim Actions restoration from event context alone"
+      assert_empty_writes "legacy unknown complete source opens no lease or archive"
+    else
+      assert_eq "$PERSIST_RC" 0 "actual persist preserves $login $mode complete v2 from verified Actions restoration"
+    fi
+    jq '.archive_source={kind:"inline",login:"never-registered",id:7}' "$HANDOFF" >"$TMP/fresh-unenrolled.json"
+    mv "$TMP/fresh-unenrolled.json" "$HANDOFF"
+    run_persist issue_comment "$SRC"
+    assert_eq "$PERSIST_RC" 2 "fresh $mode source metadata cannot inherit Actions restoration authority"
+    assert_empty_writes "fresh unenrolled $mode complete v2 opens no lease or archive"
+  done
+done
+write_handoff pull_request_review_comment "$SRC"
+
+# If the head moves only at the final read, the existing lease is closed as a
+# failure; no second lease is opened on the newly observed head.
+NEW_HEAD=$(sha 13)
+printf '%s\n' "$PUBLISH" "$PUBLISH" "$NEW_HEAD" >"$HEAD_SEQUENCE_FILE"
+run_persist pull_request_review_comment "$SRC"
+assert_eq "$PERSIST_RC" 0 "head drift closes the existing persist invocation"
+if [ "$(grep -Fc -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG")" -eq 1 ] \
+  && grep -F -- $'--method\tPATCH\trepos/acme/widget/check-runs/900' "$GH_LOG" >/dev/null \
+  && grep -F -- 'conclusion=failure' "$GH_LOG" >/dev/null \
+  && ! grep -F -- "head_sha=$NEW_HEAD" "$GH_LOG" >/dev/null; then
+  pass "final head movement fails only its old lease without retargeting the new head"
+else
+  fail "head movement retargeted or cleared a new head: $(cat "$GH_LOG")"
+fi
+
+# Failure publishers have a positively bound API-head snapshot available from
+# the source step. Execute both actual blocks with a failed *fresh* head read:
+# they must still retract a prior success on that known bound head rather than
+# leaving it untouched or selecting an artifact/source head.
+MISSING="$TMP/missing-handoff.sh"
+awk '
+  /name: Fail permanently when a read-only handoff is missing/ { active=1 }
+  active && /^      - name: Download the inert read-only handoff/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$MISSING"
+[ -s "$MISSING" ] || { echo "could not extract missing-handoff writer" >&2; exit 1; }
+chmod +x "$MISSING"
+run_missing_handoff() {
+  : >"$GH_LOG"
+  set +e
+  PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" FAIL_PR_HEAD_READ=true \
+    RUNNER_TEMP="$TMP" REPO="$BASE_REPO" PR_NUMBER=41 SOURCE_RUN_ID=501 \
+    BOUND_HEAD_SHA="$PUBLISH" CHECK_NAME='Codex P1 unresolved threads' "$MISSING" \
+    >"$TMP/missing.out" 2>"$TMP/missing.err"
+  MISSING_RC=$?
+  set -e
+}
+run_missing_handoff
+assert_eq "$MISSING_RC" 1 "actual missing-handoff writer retains its failure result after fresh read failure"
+if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null \
+  && ! grep -F -- "head_sha=$SRC" "$GH_LOG" >/dev/null; then
+  pass "missing-handoff writer falls back to the known bound API head"
+else
+  fail "missing-handoff writer lost its bound-head failure fallback: $(cat "$GH_LOG")"
+fi
+
+# Execute the actual failure publisher with an unavailable provenance read.
+REAL_RELAY_PYTHON="$(command -v python3)"
+export REAL_RELAY_PYTHON
+cat >"$BIN/python3" <<'PYSH'
+#!/usr/bin/env bash
+if [ "${FAIL_RELAY_PROVENANCE:-false}" = true ] && [[ "${1:-}" == *verified-relay-markers.py ]]; then
+  echo 'provenance API unavailable' >&2
+  exit 2
+fi
+if [ -n "${RELAY_PROVENANCE_RESULT:-}" ] && [[ "${1:-}" == *verified-relay-markers.py ]]; then
+  cat >/dev/null
+  cat "$RELAY_PROVENANCE_RESULT"
+  exit 0
+fi
+exec "$REAL_RELAY_PYTHON" "$@"
+PYSH
+chmod +x "$BIN/python3"
+FAIL_RELAY_PROVENANCE=true run_missing_handoff
+assert_eq "$MISSING_RC" 1 "provenance outage retains the deliberate failure result"
+if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null \
+  && grep -q 'Relay provenance is unavailable' "$TMP/missing.out"; then
+  pass "provenance outage still retracts prior PR-head clearance"
+else
+  fail "provenance outage aborted before the PR-head failure publication"
+fi
+
+CLEANUP="$TMP/cleanup.sh"
+awk '
+  /name: Close an abandoned read-only relay lease/ { active=1 }
+  active && /^      - name: / && !/Close an abandoned read-only relay lease/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$CLEANUP"
+[ -s "$CLEANUP" ] || { echo "could not extract relay cleanup writer" >&2; exit 1; }
+chmod +x "$CLEANUP"
+: >"$GH_LOG"
+set +e
+PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" FAIL_PR_HEAD_READ=true \
+  RUNNER_TEMP="$TMP" REPO="$BASE_REPO" PR_NUMBER=41 SOURCE_RUN_ID=501 CHECK_ID='' \
+  BOUND_HEAD_SHA="$PUBLISH" CHECK_NAME='Codex P1 unresolved threads' "$CLEANUP" \
+  >"$TMP/cleanup.out" 2>"$TMP/cleanup.err"
+CLEANUP_RC=$?
+set -e
+assert_eq "$CLEANUP_RC" 0 "actual no-lease cleanup completes its bound-head failure publication"
+if grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null \
+  && ! grep -F -- "head_sha=$SRC" "$GH_LOG" >/dev/null; then
+  pass "no-lease cleanup falls back to the known bound API head"
+else
+  fail "no-lease cleanup lost its bound-head failure fallback: $(cat "$GH_LOG")"
+fi
+
+# An unknown complete legacy source remains inert, but the existing failure
+# cleanup can durably hold this source run without attributing its old body.
+write_handoff issue_comment "$ISSUE_HEAD"
+unknown_payload=$(printf '%s' "$encoded" | jq -Rr '@base64d | fromjson | .source_login="never-registered" | @json | @base64')
+jq --arg payload "$unknown_payload" 'del(.archive_source) | .archive_records=[("<!-- mergepath-feedback-archive:v1 "+$payload+" -->")]' "$HANDOFF" >"$TMP/unknown-legacy-handoff.json"
+mv "$TMP/unknown-legacy-handoff.json" "$HANDOFF"
+legacy_bytes=$(cat "$HANDOFF")
+run_persist issue_comment "$ISSUE_HEAD"
+assert_eq "$PERSIST_RC" 2 "unknown complete legacy source refuses attribution before any archive write"
+assert_empty_writes "unknown complete legacy source remains inert"
+assert_eq "$(cat "$HANDOFF")" "$legacy_bytes" "rejected legacy handoff still contains the exact prior-body bytes"
+: >"$GH_LOG"
+set +e
+PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" FAIL_PR_HEAD_READ=true \
+  RUNNER_TEMP="$TMP" REPO="$BASE_REPO" PR_NUMBER=41 SOURCE_RUN_ID=501 CHECK_ID='' \
+  BOUND_HEAD_SHA="$PUBLISH" CHECK_NAME='Codex P1 unresolved threads' "$CLEANUP" \
+  >"$TMP/legacy-cleanup.out" 2>"$TMP/legacy-cleanup.err"
+CLEANUP_RC=$?
+set -e
+assert_eq "$CLEANUP_RC" 0 "existing cleanup retains a conservative failure after legacy source refusal"
+if grep -F -- 'mergepath-feedback-archive-relay:v1 run=501 status=failed' "$GH_LOG" >/dev/null \
+  && grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+  && grep -F -- 'conclusion=failure' "$GH_LOG" >/dev/null; then
+  pass "legacy refusal publishes existing non-review failure marker and bound-head failure"
+else
+  fail "legacy refusal failed to persist its conservative blocker"
+fi
+# Completion can suppress the no-lease failure only after provenance proof.
+printf '[{"id":99,"user":{"login":"github-actions[bot]"},"created_at":"2026-09-26T10:00:00Z","body":"<!-- mergepath-feedback-archive-relay:v1 run=501 status=complete -->"}]\n' > "$TMP/raw-completion.json"
+printf '[]\n' > "$TMP/unverified-completion.json"
+for disposition in unverified unavailable verified; do
+  : >"$GH_LOG"
+  proof="$TMP/unverified-completion.json"; unavailable=false
+  case "$disposition" in verified) proof="$TMP/raw-completion.json" ;; unavailable) unavailable=true ;; esac
+  set +e
+  PATH="$BIN:$PATH" GH_LOG="$GH_LOG" CANDIDATES="$CANDIDATES" FAIL_PR_HEAD_READ=true \
+    RELAY_COMMENTS_FILE="$TMP/raw-completion.json" RELAY_PROVENANCE_RESULT="$proof" FAIL_RELAY_PROVENANCE="$unavailable" \
+    RUNNER_TEMP="$TMP" REPO="$BASE_REPO" PR_NUMBER=41 SOURCE_RUN_ID=501 CHECK_ID='' \
+    BOUND_HEAD_SHA="$PUBLISH" CHECK_NAME='Codex P1 unresolved threads' "$CLEANUP" \
+    >"$TMP/cleanup.out" 2>"$TMP/cleanup.err"
+  CLEANUP_RC=$?
+  set -e
+  if [ "$disposition" = verified ]; then
+    if [ "$CLEANUP_RC" -eq 0 ] && ! grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null; then
+      pass "verified completion retains its already published relay result"
+    else fail "verified completion lost its completion authority"; fi
+  elif grep -F -- $'--method\tPOST\trepos/acme/widget/check-runs' "$GH_LOG" >/dev/null \
+       && grep -F -- "head_sha=$PUBLISH" "$GH_LOG" >/dev/null; then
+    pass "$disposition completion cannot suppress the no-lease failure"
+  else fail "$disposition completion suppressed the no-lease failure"; fi
+done
+
+# The bind step (Resolve the source PR) retries the resolver's retryable
+# rc 3 on the same bounded schedule as the failure publisher, and stops on the
+# rc 0 / rc 4 verdicts. The failure publisher exits 0 for a positively bound PR
+# that does not use the relay: its native gate job owns the PR-head check.
+BIND="$TMP/bind.sh"
+awk '
+  /name: Resolve the source PR and read-only boundary/ { active=1 }
+  active && /^      - name: Publish a PR-head failure when source resolution errors/ { exit }
+  active && /^        run: \|$/ { body=1; next }
+  body { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/codex-feedback-archive-relay.yml" >"$BIND"
+[ -s "$BIND" ] || { echo "could not extract relay bind step" >&2; exit 1; }
+chmod +x "$BIND"
+NOSLEEP="$TMP/nosleep-bin"
+mkdir -p "$NOSLEEP"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"$SLEEP_LOG"\n' >"$NOSLEEP/sleep"
+chmod +x "$NOSLEEP/sleep"
+# A stub resolver: fails with FLAKY_RC for the first FLAKY_FAILS calls, then
+# prints a bound JSON verdict (requires_relay=$STUB_REQUIRES_RELAY).
+FLAKY="$TMP/flaky-resolver.sh"
+cat >"$FLAKY" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+n=$(( $(cat "$FLAKY_COUNT" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$n" >"$FLAKY_COUNT"
+if [ "$n" -le "${FLAKY_FAILS:-0}" ]; then
+  echo "flaky resolver: simulated HTTP 502" >&2
+  exit "${FLAKY_RC:-3}"
+fi
+jq -nc --arg head "$STUB_HEAD" --argjson rr "${STUB_REQUIRES_RELAY:-true}" \
+  '{publish_head_sha:$head, is_fork:false, requires_relay:$rr, pr_actor:"nathanjohnpayne", source_event:"pull_request", source_head_sha:$head}'
+SH
+chmod +x "$FLAKY"
+jq -n '{workflow_run:{id:501,display_title:"Codex P1 Gate relay-v1 PR #41"}}' >"$TMP/bind-event.json"
+run_bind() {  # <fails> <rc>
+  : >"$TMP/bind-output"; : >"$TMP/sleep.log"; rm -f "$TMP/flaky.count"
+  set +e
+  PATH="$NOSLEEP:$PATH" SLEEP_LOG="$TMP/sleep.log" FLAKY_COUNT="$TMP/flaky.count" \
+    FLAKY_FAILS="$1" FLAKY_RC="$2" STUB_HEAD="$PUBLISH" STUB_REQUIRES_RELAY=true \
+    GITHUB_EVENT_PATH="$TMP/bind-event.json" GITHUB_OUTPUT="$TMP/bind-output" \
+    REPO="$BASE_REPO" SOURCE_RUN_ID=501 SOURCE_RESOLVER="$FLAKY" "$BIND" \
+    >"$TMP/bind.out" 2>"$TMP/bind.err"
+  BIND_RC=$?
+  set -e
+  BIND_CALLS=$(cat "$TMP/flaky.count" 2>/dev/null || echo 0)
+}
+run_bind 2 3
+assert_eq "$BIND_RC" 0 "bind step survives two transient resolver failures"
+assert_eq "$BIND_CALLS" 3 "bind step makes exactly three resolver attempts"
+assert_eq "$(sed -n 's/^source_bound=//p' "$TMP/bind-output")" true "bind step arms source_bound after a retried bind"
+assert_eq "$(sed -n 's/^head_sha=//p' "$TMP/bind-output")" "$PUBLISH" "bind step publishes the resolver's head after a retried bind"
+assert_eq "$(tr '\n' ' ' <"$TMP/sleep.log")" "5 10 " "bind step backs off between attempts only"
+run_bind 3 3
+assert_eq "$BIND_RC" 3 "bind step still fails after three transient failures"
+assert_eq "$BIND_CALLS" 3 "bind step stops at three attempts"
+assert_eq "$(tr '\n' ' ' <"$TMP/sleep.log")" "5 10 " "bind step does not sleep after the last attempt"
+run_bind 1 4
+assert_eq "$BIND_RC" 0 "bind step treats a not-bound verdict as terminal and inert"
+assert_eq "$BIND_CALLS" 1 "bind step does not retry the rc 4 verdict"
+assert_eq "$(sed -n 's/^source_bound=//p' "$TMP/bind-output")" false "not-bound verdict leaves source_bound=false"
+
+: >"$GH_LOG"
+set +e
+jq -n '{workflow_run:{id:501,display_title:"Codex P1 Gate relay-v1 PR #41"}}' >"$TMP/event.json"
+rm -f "$TMP/flaky.count"
+PATH="$NOSLEEP:$BIN:$PATH" GH_LOG="$GH_LOG" SLEEP_LOG="$TMP/sleep.log" \
+  FLAKY_COUNT="$TMP/flaky.count" FLAKY_FAILS=0 STUB_HEAD="$PUBLISH" STUB_REQUIRES_RELAY=false \
+  GITHUB_EVENT_PATH="$TMP/event.json" RUNNER_TEMP="$TMP" REPO="$BASE_REPO" \
+  SOURCE_RESOLVER="$FLAKY" SOURCE_RUN_ID=501 CHECK_NAME='Codex P1 unresolved threads' "$RECOVERY" \
+  >"$TMP/recovery.out" 2>"$TMP/recovery.err"
+RECOVERY_RC=$?
+set -e
+assert_eq "$RECOVERY_RC" 0 "failure publisher exits 0 for a bound PR that does not use the relay"
+assert_empty_writes "failure publisher makes no write for a PR that does not use the relay"
+
+if [ "$FAIL" -ne 0 ]; then
+  printf 'feedback-archive-relay-source: FAIL (%s failed, %s passed)\n' "$FAIL" "$PASS" >&2
+  exit 1
+fi
+printf 'feedback-archive-relay-source: PASS (%s assertions)\n' "$PASS"

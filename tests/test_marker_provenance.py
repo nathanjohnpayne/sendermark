@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""Exercise real marker readers against authenticated-API boundary fixtures."""
+import copy
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+import runpy
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / 'scripts/workflow/verified-relay-markers.py'
+
+
+class ReadBudget(unittest.TestCase):
+    def setUp(self):
+        self.module = runpy.run_path(str(SCRIPT))
+        self.now = 0.0
+        self.probe_seconds = 0.0
+        self.probe_results = []
+        self.api_results = []
+        self.sleeps = []
+        self.sleep_overrun = 0.0
+        self.calls = []
+        for patcher in (
+                mock.patch.object(self.module['time'], 'monotonic', side_effect=lambda: self.now),
+                mock.patch.object(self.module['time'], 'sleep', side_effect=self.fake_sleep),
+                mock.patch.object(self.module['shutil'], 'which', return_value='/fixture/gh'),
+                mock.patch.object(self.module['subprocess'], 'run', side_effect=self.fake_run)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.evidence = self.module['Evidence']('owner/repo', 7)
+
+    def fake_run(self, args, **kwargs):
+        self.calls.append((args, kwargs['timeout']))
+        if args[-1] == '--help':
+            self.now += self.probe_seconds
+            if self.probe_results:
+                result = self.probe_results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                return subprocess.CompletedProcess(args, *result)
+            return subprocess.CompletedProcess(args, 0, self.module['ESCAPE_FLAG'], '')
+        if self.api_results:
+            return subprocess.CompletedProcess(args, *self.api_results.pop(0))
+        return subprocess.CompletedProcess(args, 0, '{}', '')
+
+    def fake_sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds + self.sleep_overrun
+
+    def api_calls(self):
+        return [(args, timeout) for args, timeout in self.calls if args[-1] != '--help']
+
+    def test_slow_probe_leaves_only_fresh_remaining_api_allowance(self):
+        self.now, self.probe_seconds = 55.0, 3.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), '{}')
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[1][1], 2.0)
+
+    def test_probe_exhaustion_prevents_api_subprocess(self):
+        self.now, self.probe_seconds = 55.0, 6.0
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][0][-1], '--help')
+
+    def test_initial_exhaustion_prevents_even_the_probe(self):
+        self.now = 61.0
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(self.calls, [])
+
+    def test_json_read_needs_no_probe(self):
+        self.now = 55.0
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][1], 5.0)
+
+    def test_cached_read_still_needs_no_subprocess(self):
+        self.evidence.read_cache['actions/jobs/901/logs', False, True] = 'cached log'
+        self.now = 61.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), 'cached log')
+        self.assertEqual(self.calls, [])
+
+    def test_api_timeout_keeps_twenty_second_cap(self):
+        self.probe_seconds = 3.0
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), '{}')
+        self.assertEqual(self.calls[1][1], 20)
+
+    def test_timeout_then_success_retries_with_fresh_probe_and_api_allowances(self):
+        self.now, self.probe_seconds = 55.0, 1.0
+        self.probe_results = [subprocess.TimeoutExpired('help', 1),
+                              (0, self.module['ESCAPE_FLAG'], '')]
+        self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual([timeout for _, timeout in self.calls], [5.0, 4.0, 3.0])
+        self.assertIn(self.module['ESCAPE_FLAG'], self.calls[-1][0])
+
+    def test_persistent_timeout_stays_unknown_and_never_reads_text(self):
+        self.probe_results = [subprocess.TimeoutExpired('help', 10)] * 2
+        with self.assertRaisesRegex(ValueError, 'after two probes'):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertIsNone(self.evidence._escape_flag)
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(all(args[-1] == '--help' for args, _ in self.calls))
+
+    def test_failed_help_output_cannot_claim_support(self):
+        self.probe_results = [(1, self.module['ESCAPE_FLAG'], 'failed')] * 2
+        with self.assertRaisesRegex(ValueError, 'after two probes'):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertIsNone(self.evidence._escape_flag)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_os_error_then_successful_legacy_result_is_cached(self):
+        self.probe_results = [OSError('temporary executable failure'), (0, 'legacy help', '')]
+        self.evidence.api('actions/jobs/901/logs', text=True)
+        self.evidence.api('actions/jobs/902/logs', text=True)
+        self.assertIs(self.evidence._escape_flag, False)
+        self.assertEqual(len(self.calls), 4)
+        self.assertTrue(all(self.module['ESCAPE_FLAG'] not in args for args, _ in self.calls[2:]))
+
+    def test_exhaustion_between_attempts_prevents_retry_and_text_read(self):
+        self.now, self.probe_seconds = 59.0, 1.0
+        self.probe_results = [subprocess.TimeoutExpired('help', 1)]
+        with self.assertRaises(self.module['ReadBudgetExhausted']):
+            self.evidence.api('actions/jobs/901/logs', text=True)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][1], 1.0)
+
+
+    # #2722: transient relay reads retry inside the same deadline; every
+    # other failure, and an exhausted retry, still fails closed by name.
+    def test_transient_503_retries_with_backoff_then_reads(self):
+        self.api_results = [(1, '', 'gh: HTTP 503')]
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual(self.sleeps, [1.0])
+        calls = self.api_calls()
+        self.assertEqual([args for args, _ in calls], [calls[0][0]] * 2)
+        self.assertEqual([timeout for _, timeout in calls], [20, 20])
+
+    def test_network_error_retries(self):
+        self.api_results = [(1, '', 'error connecting to api.github.com'),
+                            (1, '', 'read: connection reset by peer')]
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(len(self.api_calls()), 3)
+
+    def test_persistent_5xx_fails_closed_after_three_attempts(self):
+        self.api_results = [(1, '', 'gh: HTTP 503'), (1, '', 'HTTP 502: Bad Gateway'),
+                            (1, '', 'gh: Server Error (HTTP 500)')]
+        with self.assertRaises(ValueError) as caught:
+            self.evidence.api('actions/jobs/901/logs')
+        self.assertNotIsInstance(caught.exception, self.module['ReadBudgetExhausted'])
+        self.assertIn('actions/jobs/901/logs (gh exit 1: gh: Server Error (HTTP 500))', str(caught.exception))
+        self.assertIn('persisted through 3 attempts', str(caught.exception))
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(len(self.api_calls()), 3)
+        self.assertEqual(self.evidence.read_cache, {})
+
+    def test_permanent_and_rate_limit_failures_are_not_retried(self):
+        for stderr in ('gh: Resource not accessible by integration (HTTP 403)',
+                       'gh: API rate limit exceeded (HTTP 403)',
+                       'gh: You have exceeded a secondary rate limit (HTTP 429)',
+                       'gh: Bad credentials (HTTP 401)',
+                       'gh: HTTP 500 retried upstream, then HTTP 403',
+                       'Feedback snapshot API-command budget exhausted (200).', ''):
+            with self.subTest(stderr=stderr):
+                self.calls.clear()
+                self.api_results = [(1, '', stderr), (0, '{}', '')]
+                with self.assertRaisesRegex(ValueError, 'could not read relay provenance endpoint'):
+                    self.evidence.api('actions/runs/900')
+                self.assertEqual((len(self.api_calls()), self.sleeps), (1, []))
+
+    def test_not_found_stays_an_absent_read_without_retry(self):
+        self.api_results = [(1, '', 'gh: Not Found (HTTP 404)')]
+        self.assertIsNone(self.evidence.api('actions/jobs/901/logs', text=True))
+        self.assertEqual((len(self.api_calls()), self.sleeps), (1, []))
+
+    def test_retry_never_extends_the_read_deadline(self):
+        self.now = 59.5
+        self.api_results = [(1, '', 'gh: HTTP 503'), (0, '{}', '')]
+        with self.assertRaisesRegex(ValueError, 'HTTP 503.*no time to retry after attempt 1'):
+            self.evidence.api('actions/runs/900')
+        self.assertEqual((len(self.api_calls()), self.sleeps), (1, []))
+
+    def test_backoff_overrun_fails_by_name_not_as_spent_budget(self):
+        # A late wake-up past the deadline is still the named read failure,
+        # never the ReadBudgetExhausted that legacy recovery treats as unproven.
+        self.now, self.sleep_overrun = 58.0, 2.0
+        self.api_results = [(1, '', 'gh: HTTP 503'), (0, '{}', '')]
+        with self.assertRaises(ValueError) as caught:
+            self.evidence.api('actions/runs/900')
+        self.assertNotIsInstance(caught.exception, self.module['ReadBudgetExhausted'])
+        self.assertIn('HTTP 503); read budget exhausted after attempt 1', str(caught.exception))
+        self.assertEqual((len(self.api_calls()), self.sleeps), (1, [1.0]))
+
+    def test_retry_timeout_uses_the_remaining_allowance(self):
+        self.now = 50.0
+        self.api_results = [(1, '', 'gh: HTTP 503'), (1, '', 'gh: HTTP 503'), (0, '{}', '')]
+        self.assertEqual(self.evidence.api('actions/runs/900'), {})
+        self.assertEqual([timeout for _, timeout in self.api_calls()], [10.0, 9.0, 7.0])
+
+    def test_text_retry_reuses_the_cached_probe(self):
+        self.api_results = [(1, '', 'gh: HTTP 503'), (0, 'log', '')]
+        self.assertEqual(self.evidence.api('actions/jobs/901/logs', text=True), 'log')
+        self.assertEqual(sum(args[-1] == '--help' for args, _ in self.calls), 1)
+        self.assertTrue(all(self.module['ESCAPE_FLAG'] in args for args, _ in self.api_calls()))
+
+
+REPO = 'acme/widget'
+MARKER = '<!-- mergepath-feedback-archive-relay:v2 run=12345 publisher=900 status=complete -->'
+LOG = '''2026-10-09T00:00:00Z ##[group]Run set -euo pipefail
+2026-10-09T00:00:00Z   shell: /usr/bin/bash -e {0}
+2026-10-09T00:00:00Z   env:
+2026-10-09T00:00:00Z     PR_NUMBER: 7
+2026-10-09T00:00:00Z     SOURCE_RUN_ID: 12345
+2026-10-09T00:00:00Z     HANDOFF_FILE: /tmp/handoff/codex-p1-read-only-handoff.json
+2026-10-09T00:00:00Z ##[endgroup]
+'''
+# The layout real runner logs use (#2159): ANSI-coloured script lines, then
+# `shell:` / `env:` at column 0 with keys two spaces deeper.
+ESC = '\x1b'
+RUNNER_LOG = (
+    '2026-10-12T22:22:49.5952240Z ##[group]Run set -euo pipefail\n'
+    f'2026-10-12T22:22:49.5953356Z {ESC}[36;1mset -euo pipefail{ESC}[0m\n'
+    f'2026-10-12T22:22:49.5964083Z {ESC}[36;1mjq . "$HANDOFF_FILE" >/dev/null{ESC}[0m\n'
+    '2026-10-12T22:22:49.6058998Z shell: /usr/bin/bash -e {0}\n'
+    '2026-10-12T22:22:49.6059204Z env:\n'
+    '2026-10-12T22:22:49.6061461Z   GH_TOKEN: ***\n'
+    '2026-10-12T22:22:49.6061870Z   PR_NUMBER: 7\n'
+    '2026-10-12T22:22:49.6062044Z   SOURCE_RUN_ID: 12345\n'
+    '2026-10-12T22:22:49.6062247Z   PUBLISHER_RUN_ID: 900\n'
+    '2026-10-12T22:22:49.6062840Z   EXPECTED_PR_ACTOR: dependabot[bot]\n'
+    '2026-10-12T22:22:49.6063760Z   HANDOFF_FILE: /home/runner/work/_temp/codex-p1-read-only-handoff/codex-p1-read-only-handoff.json\n'
+    '2026-10-12T22:22:49.6064477Z ##[endgroup]\n'
+)
+
+
+class RelayTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name)
+        self.run = {'id': 900, 'workflow_id': 89, 'event': 'workflow_run', 'path': '.github/workflows/codex-feedback-archive-relay.yml',
+                    'head_branch': 'main', 'head_sha': 'a' * 40, 'repository': {'full_name': REPO},
+                    'conclusion': 'success', 'created_at': '2026-10-09T00:00:00Z'}
+        self.job = {'id': 901, 'run_id': 900, 'steps': [
+            {'name': 'Persist archive and publish the exact-head gate', 'conclusion': 'success'}]}
+        self.responses = {
+            'repos/' + REPO: {'default_branch': 'renamed-main'},
+            'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml': {
+                'id': 89, 'path': '.github/workflows/codex-feedback-archive-relay.yml'},
+            'repos/' + REPO + '/actions/runs/900': self.run,
+            'repos/' + REPO + '/actions/runs/900/jobs?filter=all&per_page=100': [{'jobs': [self.job]}],
+            'repos/' + REPO + '/actions/jobs/901/logs': LOG,
+        }
+        self.comments = [{'user': {'login': 'github-actions[bot]'}, 'body': MARKER,
+                          'created_at': '2026-10-09T00:00:00Z'}]
+        gh = self.path / 'gh'
+        gh.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+root=Path(os.environ['PROVENANCE_CASE'])
+mode=(root/'gh_mode').read_text().strip() if (root/'gh_mode').exists() else 'modern'
+if sys.argv[1:3]==['api','--help']:
+    count=root/'help_calls'
+    attempt=int(count.read_text())+1 if count.exists() else 1
+    count.write_text(str(attempt))
+    if mode=='probe-fails' or mode=='probe-once' and attempt==1:
+        sys.stderr.write('temporary help failure'); raise SystemExit(1)
+    print('Usage: gh api <endpoint> [flags]')
+    if mode in ('modern','probe-once'): print('      --allow-escape-sequences   Allow printing terminal escape sequences')
+    raise SystemExit(0)
+allow='--allow-escape-sequences' in sys.argv
+if allow and mode not in ('modern','probe-once'):
+    sys.stderr.write('unknown flag: --allow-escape-sequences'); raise SystemExit(1)
+endpoint=sys.argv[-1]
+with (root/'calls').open('a') as out: out.write(endpoint+'\\n')
+responses=json.loads((root/'responses').read_text()); value=responses.get(endpoint)
+if value is None:
+    sys.stderr.write('Not Found (HTTP 404)'); raise SystemExit(1)
+if isinstance(value,dict) and '_error' in value:
+    sys.stderr.write(value['_error']); raise SystemExit(1)
+if isinstance(value,dict) and '_fail_first' in value:
+    failed=root/'failed_calls'; seen=json.loads(failed.read_text()) if failed.exists() else {}
+    seen[endpoint]=seen.get(endpoint,0)+1; failed.write_text(json.dumps(seen))
+    if seen[endpoint]<=value['_fail_first']:
+        sys.stderr.write(value['_stderr']); raise SystemExit(1)
+    value=value['then']
+if mode in ('modern','probe-once') and isinstance(value,str) and chr(27) in value and not allow:
+    sys.stderr.write('the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway'); raise SystemExit(1)
+print(value if isinstance(value,str) else json.dumps(value))
+''')
+        gh.chmod(0o755)
+
+    def invoke(self, record_sleeps=False):
+        (self.path / 'responses').write_text(json.dumps(self.responses))
+        env = dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ['PATH'], PROVENANCE_CASE=str(self.path),
+                   RELAY_SLEEP_LOG=str(self.path / 'sleeps'))
+        # Retry cases run the real entry point with only time.sleep replaced
+        # by a recorder, so backoff is asserted without waiting for it. The
+        # standard library's subprocess module polls a child through
+        # time.sleep when it waits with a timeout; those calls keep the real
+        # sleep and are not backoff, so they are not recorded.
+        command = ['python3', str(SCRIPT)]
+        if record_sleeps:
+            command[1:1] = ['-c', 'import os, runpy, sys, time\n'
+                            'real_sleep = time.sleep\n'
+                            'def sleep(seconds):\n'
+                            '    if sys._getframe(1).f_globals.get("__name__") == "subprocess":\n'
+                            '        return real_sleep(seconds)\n'
+                            '    with open(os.environ["RELAY_SLEEP_LOG"], "a") as log:\n'
+                            '        log.write(f"{seconds}\\n")\n'
+                            'time.sleep = sleep\n'
+                            'runpy.run_path(sys.argv.pop(1), run_name="__main__")']
+        result = subprocess.run(command + ['--repo', REPO, '--pr', '7'],
+                                input=json.dumps(self.comments), text=True, capture_output=True, env=env)
+        return result.returncode, json.loads(result.stdout) if result.stdout else [], result.stderr
+
+    def test_default_workflow_success_bound_to_source_and_pr_promotes_completion(self):
+        code, comments, error = self.invoke()
+        self.assertEqual(code, 0, error)
+        self.assertEqual(comments[0]['body'], '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->')
+
+    def test_fake_cli_transient_help_failure_retries_before_escaped_log(self):
+        (self.path / 'gh_mode').write_text('probe-once')
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = RUNNER_LOG
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+        self.assertEqual((self.path / 'help_calls').read_text(), '2')
+
+    def test_fake_cli_persistent_help_failure_never_promotes_completion(self):
+        (self.path / 'gh_mode').write_text('probe-fails')
+        code, comments, error = self.invoke()
+        self.assertEqual((code, comments), (2, []), error)
+        self.assertEqual((self.path / 'help_calls').read_text(), '2')
+        self.assertNotIn('repos/' + REPO + '/actions/jobs/901/logs',
+                         (self.path / 'calls').read_text().splitlines())
+
+    def test_default_branch_qualified_workflow_path_promotes_completion(self):
+        self.run['path'] += '@main'
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+
+    def test_repository_case_difference_preserves_authentic_completion(self):
+        self.run['repository']['full_name'] = REPO.upper()
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+
+    def test_historical_run_survives_default_branch_rename(self):
+        self.run['head_branch'] = 'previous-default'
+        self.run['path'] += '@previous-default'
+        self.assertEqual(len(self.invoke()[1]), 1)
+
+    def test_unreadable_or_wrong_workflow_identity_never_promotes(self):
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml'
+        for response in (None, {'id': 89, 'path': '.github/workflows/other.yml'}):
+            self.responses[endpoint] = response
+            self.assertEqual(self.invoke()[0], 2)
+
+    def test_other_ref_suffix_cannot_borrow_the_default_workflow(self):
+        self.run['path'] += '@codex/forged'
+        self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_pr_controlled_run_cannot_mint_completion_under_same_bot_login(self):
+        for key, value in (('event', 'pull_request'), ('workflow_id', 999),
+                           ('path', '.github/workflows/pr-controlled.yml')):
+            saved = self.run[key]
+            self.run[key] = value
+            code, comments, error = self.invoke()
+            self.assertEqual((code, comments), (0, []), error)
+            self.run[key] = saved
+
+    def test_another_pr_or_source_cannot_borrow_a_real_publisher(self):
+        endpoint = 'repos/' + REPO + '/actions/jobs/901/logs'
+        for wrong in (LOG.replace('PR_NUMBER: 7', 'PR_NUMBER: 8'),
+                      LOG.replace('SOURCE_RUN_ID: 12345', 'SOURCE_RUN_ID: 999')):
+            self.responses[endpoint] = wrong
+            self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_printed_env_lookalike_outside_runner_group_grants_nothing(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = LOG.replace('##[group]Run set -euo pipefail', 'untrusted application output')
+        self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_incomplete_or_failed_persistence_grants_nothing(self):
+        for conclusion in ('failure', 'skipped', None):
+            self.job['steps'][0]['conclusion'] = conclusion
+            self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_unreadable_provenance_is_an_infrastructure_error(self):
+        self.responses['repos/' + REPO + '/actions/runs/900'] = {'_error': 'rate limit exceeded (HTTP 403)'}
+        self.assertEqual(self.invoke()[0], 2)
+
+    # #2159: gh >= 2.102.0 refuses escape-bearing responses without the flag,
+    # and every runner job log is ANSI-coloured, so each Dependabot relay
+    # completion read as unreadable. The parser also never matched the
+    # runner's column-0 `env:` layout.
+    def test_dependabot_relay_runner_log_with_escape_sequences_promotes_completion(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = RUNNER_LOG
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+
+    def test_gh_without_the_escape_flag_still_reads_runner_logs(self):
+        (self.path / 'gh_mode').write_text('legacy')
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = RUNNER_LOG
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+
+    def test_runner_layout_wrong_pr_or_source_grants_nothing(self):
+        endpoint = 'repos/' + REPO + '/actions/jobs/901/logs'
+        for wrong in (RUNNER_LOG.replace('PR_NUMBER: 7', 'PR_NUMBER: 8'),
+                      RUNNER_LOG.replace('SOURCE_RUN_ID: 12345', 'SOURCE_RUN_ID: 999'),
+                      RUNNER_LOG.replace('codex-p1-read-only-handoff.json', 'other.json')):
+            self.responses[endpoint] = wrong
+            self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_env_lookalike_in_script_lines_cannot_override_the_step_env(self):
+        lookalike = ('env:\n  PR_NUMBER: 7\n  SOURCE_RUN_ID: 12345\n'
+                     '  HANDOFF_FILE: /tmp/codex-p1-read-only-handoff.json\n')
+        forged = RUNNER_LOG.replace('shell: /usr/bin/bash', lookalike + 'shell: /usr/bin/bash').replace('PR_NUMBER: 7\n2026', 'PR_NUMBER: 8\n2026')
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = forged
+        self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_unreadable_log_names_the_gh_refusal(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = {'_error': 'HTTP 403: Resource not accessible by integration'}
+        code, _, error = self.invoke()
+        self.assertEqual(code, 2)
+        self.assertIn('gh exit 1: HTTP 403: Resource not accessible by integration', error)
+
+    # #2722 acceptance: a transient 503 on the relay log retries, then
+    # publishes; a permanent read failure fails closed and stays visible.
+    def log_reads(self):
+        return (self.path / 'calls').read_text().splitlines().count('repos/' + REPO + '/actions/jobs/901/logs')
+
+    def sleeps(self):
+        log = self.path / 'sleeps'
+        return log.read_text().split() if log.exists() else []
+
+    def test_transient_503_on_relay_log_retries_then_promotes_completion(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = {
+            '_fail_first': 1, '_stderr': 'gh: HTTP 503', 'then': RUNNER_LOG}
+        code, comments, error = self.invoke(record_sleeps=True)
+        self.assertEqual(code, 0, error)
+        self.assertEqual([comment['body'] for comment in comments],
+                         ['<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->'])
+        self.assertEqual((self.log_reads(), self.sleeps()), (2, ['1.0']))
+
+    def test_persistent_503_on_relay_log_fails_closed_and_names_it(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = {
+            '_fail_first': 99, '_stderr': 'gh: HTTP 503', 'then': RUNNER_LOG}
+        code, comments, error = self.invoke(record_sleeps=True)
+        self.assertEqual((code, comments), (2, []), error)
+        self.assertIn('relay provenance unavailable: could not read relay provenance endpoint '
+                      'actions/jobs/901/logs (gh exit 1: gh: HTTP 503); transient failure persisted '
+                      'through 3 attempts', error)
+        self.assertEqual((self.log_reads(), self.sleeps()), (3, ['1.0', '2.0']))
+
+    def test_permanent_relay_log_failure_fails_closed_without_retry(self):
+        self.responses['repos/' + REPO + '/actions/jobs/901/logs'] = {
+            '_fail_first': 99, '_stderr': 'gh: Resource not accessible by integration (HTTP 403)', 'then': RUNNER_LOG}
+        code, comments, error = self.invoke(record_sleeps=True)
+        self.assertEqual((code, comments), (2, []), error)
+        self.assertIn('actions/jobs/901/logs (gh exit 1: gh: Resource not accessible by integration (HTTP 403))', error)
+        self.assertEqual((self.log_reads(), self.sleeps()), (1, []))
+
+    def test_duplicate_completions_reuse_provenance_within_one_read(self):
+        self.comments *= 2
+        self.assertEqual(len(self.invoke()[1]), 2)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertEqual(calls.count('repos/' + REPO + '/actions/jobs/901/logs'), 1)
+
+    def test_legacy_completion_requires_the_same_real_workflow_proof(self):
+        self.comments[0]['body'] = '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->'
+        self.responses['repos/' + REPO + '/actions/runs/12345'] = {
+            'created_at': '2026-10-09T00:00:00Z', 'updated_at': '2026-10-09T00:00:00Z'}
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml/runs?event=workflow_run&created=2026-10-09..2026-10-10&per_page=100'
+        self.responses[endpoint] = [{'workflow_runs': [self.run]}]
+        self.assertEqual(len(self.invoke()[1]), 1)
+        self.run['event'] = 'pull_request'
+        self.assertEqual(self.invoke()[:2], (0, []))
+
+    def test_large_legacy_history_filters_metadata_and_prefers_nearest_run(self):
+        self.comments[0]['body'] = '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=complete -->'
+        unrelated = [{**self.run, 'id': n, 'workflow_id': 999} for n in range(1000, 1060)]
+        distant = [{**self.run, 'id': n, 'created_at': '2026-10-09T12:00:00Z'} for n in range(1100, 1106)]
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml/runs?event=workflow_run&created=2026-10-09..2026-10-10&per_page=100'
+        self.responses[endpoint] = [{'workflow_runs': unrelated + distant + [self.run]}]
+        self.assertEqual(len(self.invoke()[1]), 1)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertFalse(any('/actions/runs/11' in call for call in calls))
+
+    def test_legacy_probes_are_bounded_and_follow_direct_publisher_proof(self):
+        self.comments.insert(0, dict(self.comments[0], body='<!-- mergepath-feedback-archive-relay:v1 run=999 status=complete -->'))
+        candidates = [{**self.run, 'id': n} for n in range(1000, 1006)]
+        endpoint = 'repos/' + REPO + '/actions/workflows/codex-feedback-archive-relay.yml/runs?event=workflow_run&created=2026-10-09..2026-10-10&per_page=100'
+        self.responses[endpoint] = [{'workflow_runs': candidates}]
+        for run in candidates:
+            self.responses[f'repos/{REPO}/actions/runs/{run["id"]}'] = run
+            self.responses[f'repos/{REPO}/actions/runs/{run["id"]}/jobs?filter=all&per_page=100'] = [{'jobs': []}]
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertLess(calls.index(f'repos/{REPO}/actions/runs/900'), calls.index(f'repos/{REPO}/actions/runs/999'))
+        self.assertEqual(sum(call in {f'repos/{REPO}/actions/runs/{n}' for n in range(1000, 1006)} for call in calls), 3)
+
+    def test_legacy_timeout_keeps_verified_v2_completion(self):
+        self.comments.insert(0, dict(self.comments[0], body='<!-- mergepath-feedback-archive-relay:v1 run=999 status=complete -->'))
+        (self.path / 'responses').write_text(json.dumps(self.responses))
+        module = runpy.run_path(str(SCRIPT))
+        actual_run = subprocess.run
+        timeouts = []
+        def provider(argv, **kwargs):
+            if argv[-1].endswith('/actions/runs/999'):
+                timeouts.append(kwargs['timeout'])
+                raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+            return actual_run(argv, **kwargs)
+        with mock.patch.dict(os.environ, PATH=str(self.path) + os.pathsep + os.environ['PATH'], PROVENANCE_CASE=str(self.path)), \
+                mock.patch.object(subprocess, 'run', side_effect=provider):
+            evidence = module['Evidence'](REPO, 7)
+            deadline = evidence.deadline
+            comments = module['verified'](self.comments, evidence)
+            self.assertEqual(evidence.deadline, deadline)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(len(timeouts), 1)
+        self.assertLessEqual(timeouts[0], 10)
+
+    def test_same_publisher_cannot_clear_another_source_and_reuses_reads(self):
+        self.comments.append(dict(self.comments[0], body=MARKER.replace('run=12345 ', 'run=999 ')))
+        code, comments, error = self.invoke()
+        self.assertEqual((code, len(comments)), (0, 1), error)
+        calls = (self.path / 'calls').read_text().splitlines()
+        self.assertEqual(calls.count('repos/' + REPO + '/actions/jobs/901/logs'), 1)
+
+    def test_forged_completion_cannot_erase_a_failure(self):
+        self.run['event'] = 'pull_request'
+        self.comments.append({'user': {'login': 'github-actions[bot]'},
+                              'body': '<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->'})
+        code, comments, _ = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual([comment['body'] for comment in comments],
+                         ['<!-- mergepath-feedback-archive-relay:v1 run=12345 status=failed -->'])
+
+
+class LaneTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name)
+        self.git = shutil.which('git')
+        self.canonical = self.path / 'canonical'
+        self.consumer = self.path / 'consumer'
+        for repo in (self.canonical, self.consumer):
+            repo.mkdir()
+            self.g(repo, 'init', '-q', '-b', 'main')
+            (repo / '.github/workflows').mkdir(parents=True)
+        (self.canonical / '.mergepath-sync.yml').write_text('''version: 1
+consumers:
+  - name: widget
+    repo: acme/widget
+paths:
+  - path: .github/workflows/gate.yml
+    type: canonical
+    consumers: all
+exclusions: []
+''')
+        self.canonical_file = self.canonical / '.github/workflows/gate.yml'
+        self.canonical_file.write_text('name: safe\n')
+        self.source = self.commit(self.canonical)
+        self.consumer_file = self.consumer / '.github/workflows/gate.yml'
+        self.consumer_file.write_text('name: previous\n')
+        self.base = self.commit(self.consumer)
+        self.consumer_file.write_text(self.canonical_file.read_text())
+        self.head = self.commit(self.consumer)
+        self.policy = self.path / 'policy.yml'
+        self.policy.write_text('author_identity: nathanjohnpayne\n')
+        self.metadata = {'number': 7, 'user': {'login': 'nathanjohnpayne'},
+                         'head': {'sha': self.head, 'ref': 'mergepath-sync/' + self.source[:7]},
+                         'base': {'sha': self.base},
+                         'comments': [{'user': {'login': 'github-actions[bot]'}, 'body': 'forged verified-head marker'}]}
+        binary = self.path / 'bin'
+        binary.mkdir()
+        git = binary / 'git'
+        git.write_text('''#!/usr/bin/env python3
+import os, sys
+if os.environ.get('LANE_SOURCE_LOOKUP_FAIL') and 'rev-parse' in sys.argv and '--verify' in sys.argv:
+    raise SystemExit(1)
+argv=[os.environ['REAL_GIT']]+[os.environ['CANONICAL_FIXTURE'] if arg=='https://github.com/nathanjohnpayne/mergepath.git' else os.environ['CONSUMER_FIXTURE'] if arg=='https://github.com/acme/widget.git' else arg for arg in sys.argv[1:]]
+os.execv(argv[0],argv)
+''')
+        git.chmod(0o755)
+        gh = binary / 'gh'
+        gh.write_text('#!/bin/sh\ncat "$LANE_METADATA"\n')
+        gh.chmod(0o755)
+        self.environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                                REAL_GIT=self.git, CANONICAL_FIXTURE=str(self.canonical),
+                                CONSUMER_FIXTURE=str(self.consumer), LANE_METADATA=str(self.path / 'metadata.json'))
+
+    def g(self, repo, *args):
+        return subprocess.check_output([self.git, '-C', str(repo), '-c', 'user.name=fixture',
+                                        '-c', 'user.email=fixture@example.test', '-c', 'commit.gpgsign=false', *args], text=True).strip()
+
+    def commit(self, repo):
+        self.g(repo, 'add', '-A')
+        self.g(repo, 'commit', '-qm', 'fixture')
+        return self.g(repo, 'rev-parse', 'HEAD')
+
+    def invoke(self):
+        (self.path / 'metadata.json').write_text(json.dumps(self.metadata))
+        return subprocess.run(['bash', str(ROOT / 'scripts/workflow/verify-live-propagation.sh'),
+                               REPO, '7', self.head, self.base, str(self.policy)],
+                              input=json.dumps(self.metadata), env=self.environment, text=True, capture_output=True)
+
+    def test_non_lane_ref_precedes_author_validation_but_unknown_prefix_refuses(self):
+        self.policy.write_text('propagation_prs:\n  branch_prefix: custom/\n')
+        self.metadata['head']['ref'] = 'codex/ordinary'
+        self.assertEqual(self.invoke().returncode, 1)
+        self.metadata['head']['ref'] = 'custom/' + self.source[:7]
+        self.assertEqual(self.invoke().returncode, 2)
+        self.policy.write_text('propagation_prs: [invalid YAML\n')
+        self.metadata['head']['ref'] = 'codex/ordinary'
+        self.assertEqual(self.invoke().returncode, 2)
+
+    def test_real_faithful_git_objects_clear_without_any_marker(self):
+        self.metadata.pop('comments')
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            'source_sha': self.source, 'head_sha': self.head, 'base_sha': self.base})
+
+    def test_setup_failures_are_indeterminate_not_negative_proof(self):
+        for command in ('mktemp', 'chmod', 'mkdir', 'cat'):
+            with self.subTest(command=command):
+                stub = self.path / 'bin' / command
+                stub.write_text('#!/bin/sh\nexit 1\n')
+                stub.chmod(0o755)
+                result = self.invoke()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, '')
+                stub.unlink()
+
+    def test_author_lookup_failure_is_indeterminate(self):
+        import shutil
+        real_jq = shutil.which('jq')
+        stub = self.path / 'bin' / 'jq'
+        stub.write_text('#!/bin/sh\nif [ "$1" = "-r" ] && [ "$2" = ".user.login" ]; then exit 1; fi\nexec "' + real_jq + '" "$@"\n')
+        stub.chmod(0o755)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_source_lookup_failure_is_indeterminate(self):
+        self.environment['LANE_SOURCE_LOOKUP_FAIL'] = '1'
+        result = self.invoke()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, '')
+
+    def test_faithful_lane_uses_available_yaml_parser_without_ruby(self):
+        ruby = self.path / 'bin/ruby'
+        ruby.write_text('#!/bin/sh\nprintf called > "$LANE_RUBY_LOG"\nexit 127\n')
+        ruby.chmod(0o755)
+        self.environment['LANE_RUBY_LOG'] = str(self.path / 'ruby-called')
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.path / 'ruby-called').exists())
+
+    def test_forged_bot_marker_cannot_exempt_modified_workflow(self):
+        self.consumer_file.write_text('name: PR-controlled unsafe workflow\n')
+        self.head = self.commit(self.consumer)
+        self.metadata['head']['sha'] = self.head
+        result = self.invoke()
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_unmerged_canonical_source_and_policy_opt_out_refuse(self):
+        self.g(self.canonical, 'checkout', '-qb', 'unmerged')
+        self.canonical_file.write_text('name: proposed canonical\n')
+        source = self.commit(self.canonical)
+        self.g(self.canonical, 'checkout', '-q', 'main')
+        self.metadata['head']['ref'] = 'mergepath-sync/' + source[:7]
+        self.assertNotEqual(self.invoke().returncode, 0)
+        self.metadata['head']['ref'] = 'mergepath-sync/' + self.source[:7]
+        self.policy.write_text('author_identity: nathanjohnpayne\npropagation_prs:\n  enabled: false\n')
+        self.assertEqual(self.invoke().returncode, 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Cockpit is hub-only; the CI kit wrapper remains safe on every consumer.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+
+# Marker FIRST: bootstrap residue never changes the consumer verdict.
+if [ ! -f scripts/sync-to-downstream.sh ]; then
+  echo "check_cockpit: SKIP (consumer checkout; Cockpit is hub-only)"
+  exit 0
+fi
+
+# shellcheck source=../lib/ci-check-modes.sh
+. "$ROOT/scripts/lib/ci-check-modes.sh"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_cockpit [--check | --self-test]" >&2
+  exit 2
+fi
+for subject in scripts/cockpit.sh tests/test_cockpit.sh tests/test_cockpit.py specs/cockpit_foundation.md \
+  mergepath/cockpit/__main__.py mergepath/cockpit/server.py mergepath/cockpit/github.py \
+  mergepath/cockpit/author_budget.py tests/test_cockpit_author_budget.py \
+  mergepath/cockpit/inventory.py mergepath/cockpit/scheduler.py mergepath/cockpit/bootstrap.html \
+  mergepath/cockpit/bootstrap.js mergepath/cockpit/index.html mergepath/cockpit/assets/cockpit.css \
+  mergepath/cockpit/assets/components.js mergepath/cockpit/assets/app.js tests/test_cockpit_ui.cjs \
+  mergepath/cockpit/assets/layout.js mergepath/cockpit/assets/layout.css tests/test_cockpit_layout_ui.cjs \
+  mergepath/cockpit/actions.py mergepath/cockpit/assets/actions.js mergepath/cockpit/assets/actions.css \
+  mergepath/cockpit/assets/actions_init.js tests/test_cockpit_actions.py tests/test_cockpit_actions_ui.cjs specs/cockpit_actions.md \
+  mergepath/cockpit/ci.py \
+  mergepath/cockpit/assets/ci.js \
+  mergepath/cockpit/assets/ci.css \
+  tests/test_cockpit_ci.py \
+  tests/test_cockpit_ci_ui.cjs \
+  tests/test_cockpit_logs.py \
+  specs/cockpit_ci.md \
+  mergepath/cockpit/prs.py \
+  mergepath/cockpit/pr_settings.json \
+  mergepath/cockpit/assets/prs.js \
+  mergepath/cockpit/assets/pr_rows.js \
+  mergepath/cockpit/assets/prs.css \
+  tests/test_cockpit_prs.py \
+  tests/test_cockpit_prs_ui.cjs \
+  specs/cockpit_prs.md \
+  mergepath/cockpit/fleet.py mergepath/cockpit/assets/fleet.js mergepath/cockpit/assets/fleet.css \
+  tests/test_cockpit_fleet.py tests/test_cockpit_fleet_ui.cjs specs/cockpit_fleet.md \
+  mergepath/cockpit/sync.py mergepath/cockpit/sync_worker.py mergepath/cockpit/assets/sync.js mergepath/cockpit/assets/sync.css \
+  tests/test_cockpit_sync.py tests/test_cockpit_sync_ui.cjs specs/cockpit_sync.md \
+  mergepath/cockpit/agents.py mergepath/cockpit/assets/agents.js mergepath/cockpit/assets/agents.css \
+  tests/test_cockpit_agents.py tests/test_cockpit_agents_ui.cjs specs/cockpit_agents.md \
+  mergepath/cockpit/live_agents.py mergepath/cockpit/assets/live_agents.js mergepath/cockpit/assets/live_agents.css \
+  tests/test_cockpit_live_agents.py tests/test_cockpit_live_agents_ui.cjs specs/cockpit_live_agents.md \
+  mergepath/cockpit/assets/fonts/local-fonts.css mergepath/cockpit/assets/fonts/manifest.json; do
+  [ -f "$subject" ] || { echo "check_cockpit: missing $subject" >&2; exit 1; }
+done
+# One parse per file: `bash -n a.sh b.sh` reads only a.sh and treats b.sh as
+# its first positional argument, so a broken second file passed (#1832).
+for subject in scripts/cockpit.sh tests/test_cockpit.sh; do
+  bash -n "$subject" || { echo "check_cockpit: bash -n failed for $subject" >&2; exit 1; }
+done
+# Parse subjects are discovered by glob so a new Cockpit file is covered
+# without a hand edit here. A glob that matches nothing fails instead of
+# passing vacuously, which would hide a moved or renamed directory.
+python3 - <<'PY'
+import ast
+import sys
+from pathlib import Path
+for pattern in ('mergepath/cockpit/*.py', 'tests/test_cockpit*.py'):
+    subjects = sorted(Path('.').glob(pattern))
+    if not subjects:
+        sys.exit('check_cockpit: no files match ' + pattern)
+    for subject in subjects:
+        ast.parse(subject.read_text(), filename=str(subject))
+PY
+for pattern in 'mergepath/cockpit/*.js' 'mergepath/cockpit/assets/*.js' 'tests/test_cockpit*.cjs'; do
+  matched=0
+  for subject in $pattern; do
+    [ -f "$subject" ] || continue
+    node --check "$subject" || { echo "check_cockpit: node --check failed for $subject" >&2; exit 1; }
+    matched=$((matched + 1))
+  done
+  [ "$matched" -gt 0 ] || { echo "check_cockpit: no files match $pattern" >&2; exit 1; }
+done
+# Cockpit JSON (pr_settings.json and everything under assets/) must parse.
+# One Python pass reads every file, so a path with whitespace is never split and a
+# discovery error fails the check instead of being swallowed by a pipeline.
+python3 - <<'PY_JSON' || exit 1
+import json, pathlib, sys
+files = sorted(path for path in pathlib.Path("mergepath/cockpit").rglob("*.json") if path.is_file())
+if not files:
+    sys.exit("check_cockpit: no JSON files under mergepath/cockpit")
+for path in files:
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        sys.exit(f"check_cockpit: invalid JSON in {path}: {error}")
+PY_JSON
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+  bash tests/test_cockpit.sh
+fi
+echo "check_cockpit: PASS"

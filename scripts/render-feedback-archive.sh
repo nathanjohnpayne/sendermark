@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Render complete, GitHub-visible history records for an edited/deleted PR-level
+# comment, inline comment, or top-level review body. Near-limit bodies are split
+# across records that accounting must reconstruct completely. The workflow owns
+# the write; this helper is pure.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HELPERS="$SCRIPT_DIR/lib/feedback-policy-helpers.sh"
+[ -r "$HELPERS" ] || { echo "render-feedback-archive: missing $HELPERS" >&2; exit 2; }
+# shellcheck source=lib/feedback-policy-helpers.sh
+. "$HELPERS"
+ARCHIVE_IDENTITIES_HELPER="$SCRIPT_DIR/lib/feedback-archive-identities.sh"
+[ -r "$ARCHIVE_IDENTITIES_HELPER" ] || { echo "render-feedback-archive: missing $ARCHIVE_IDENTITIES_HELPER" >&2; exit 2; }
+# shellcheck source=lib/feedback-archive-identities.sh
+. "$ARCHIVE_IDENTITIES_HELPER"
+
+if [ "$#" -lt 5 ] || [ "$#" -gt 6 ]; then
+  echo "usage: $0 SOURCE_KIND SOURCE_ID SOURCE_LOGIN ARCHIVED_AT PREVIOUS_BODY_FILE [GHAS_TIER]" >&2
+  exit 2
+fi
+
+SOURCE_KIND="$1"
+SOURCE_ID="$2"
+SOURCE_LOGIN="$3"
+ARCHIVED_AT="$4"
+PREVIOUS_BODY_FILE="$5"
+# Resolved by the CALLING workflow, never here (#1113): a
+# github-advanced-security[bot] body carries no severity marker this
+# script's text-only classifiers (codex_tiers_of / coderabbit_tiers_of)
+# can find -- it only links to the alert. Resolving that link's current
+# severity needs a live code-scanning/alerts GET, which this script's
+# documented sourcing contract deliberately excludes ("the render script
+# itself stays pure -- no network calls"). The caller resolves it (see
+# .github/workflows/codex-p1-gate.yml's archive-edited-feedback job) and
+# hands the already-mapped p0-p3 tier or unknown lookup result here,
+# exactly like it hands the previous body.
+GHAS_TIER="${6:-}"
+case "$GHAS_TIER" in
+  ''|p0|p1|p2|p3|unknown) ;;
+  *) echo "render-feedback-archive: GHAS_TIER must be p0, p1, p2, p3, unknown, or empty; got '$GHAS_TIER'" >&2; exit 2 ;;
+esac
+
+case "$SOURCE_KIND" in
+  issue-comment|inline|review-body) ;;
+  *) echo "render-feedback-archive: source kind must be issue-comment, inline, or review-body" >&2; exit 2 ;;
+esac
+case "$SOURCE_ID" in
+  ''|*[!0-9]*) echo "render-feedback-archive: source id must be an integer" >&2; exit 2 ;;
+esac
+[ "$SOURCE_ID" -gt 0 ] || { echo "render-feedback-archive: source id must be positive" >&2; exit 2; }
+[ -n "$SOURCE_LOGIN" ] || { echo "render-feedback-archive: source login is required" >&2; exit 2; }
+[ -n "$ARCHIVED_AT" ] || { echo "render-feedback-archive: archived timestamp is required" >&2; exit 2; }
+[ -r "$PREVIOUS_BODY_FILE" ] || { echo "render-feedback-archive: previous body is unreadable" >&2; exit 2; }
+
+# Archive and relay-terminal comments are themselves part of the immutable
+# history surface. If github-actions[bot]'s record is edited or deleted, the
+# issue_comment event gives us its previous exact body. Re-emit a single valid
+# record byte-for-byte so the workflow can restore it instead of silently
+# dropping the only durable copy. Never promote a lookalike from another login
+# into a trusted Actions-authored record.
+RESTORED_RECORD=""
+if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot]' ] && RESTORED_RECORD=$(awk '
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v1 [A-Za-z0-9+\/=]+ -->$/ \
+    { record=$0; next }
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive:v2 id=[0-9a-f]{64} part=[0-9]+\/[0-9]+ data=[A-Za-z0-9+\/=]+ -->$/ \
+    { record=$0; next }
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive-relay:v1 run=[0-9]+ status=(complete|failed) -->$/ \
+    { record=$0; next }
+  NR == 1 && $0 ~ /^<!-- mergepath-feedback-archive-relay:v2 run=[0-9]+ publisher=[0-9]+ status=complete -->$/ \
+    { record=$0; next }
+  { extra=1 }
+  END { if (record != "" && !extra) print record; else exit 1 }
+' "$PREVIOUS_BODY_FILE"); then
+  jq -n --arg record "$RESTORED_RECORD" --argjson id "$SOURCE_ID" '
+    {event_name:"issue_comment",archive_source:{kind:"issue-comment",login:"github-actions[bot]",id:$id},archive_records:[$record]}
+  ' | feedback_archive_validate_records /dev/stdin || exit 2
+  printf '%s\n' "$RESTORED_RECORD"
+  exit 0
+fi
+
+# Actions cannot be enrolled as a reviewer. After the exact restoration path
+# above, unrelated issue-comment text has nothing to archive regardless of
+# registry state; it must not turn an otherwise inert event into a failure.
+if [ "$SOURCE_KIND" = issue-comment ] && [ "$SOURCE_LOGIN" = 'github-actions[bot]' ]; then
+  exit 0
+fi
+
+feedback_archive_registry_load "${CONFIG:-$SCRIPT_DIR/../.github/review-policy.yml}" || exit 2
+
+# Authorize before classifying or encoding a candidate-controlled prior body.
+# Current reviewer/provider lists cannot replace retained historical enrollment.
+provider_rc=0
+SOURCE_PROVIDERS=$(feedback_archive_source_providers "$SOURCE_KIND" "$SOURCE_LOGIN") || provider_rc=$?
+[ "$provider_rc" -ne 1 ] || exit 0
+[ "$provider_rc" -eq 0 ] || exit 2
+
+# jq raw-input readers can split a multibyte character at their read boundary
+# (#1741). --rawfile preserves the complete body, including trailing newlines,
+# and emits the same canonical JSON string that accounting fingerprints.
+BODY_JSON=$(jq -nc --rawfile body "$PREVIOUS_BODY_FILE" '$body') \
+  || { echo "render-feedback-archive: could not encode previous body" >&2; exit 2; }
+BODY=$(jq -r '.' <<EOF
+$BODY_JSON
+EOF
+)
+
+# A delayed enrolled inline source can have lost both its retained/current
+# GHAS role after login reuse. Recognize only the existing alert-link syntax
+# and preserve possible severity without a privileged read or past-provider
+# attribution. Eligible quoted alert links share this conservative burden.
+ALERT_NUMBER=""
+if [ "$SOURCE_KIND" = inline ]; then
+  ALERT_NUMBER=$(ghas_alert_number_from_body "$BODY")
+  if [ -z "$GHAS_TIER" ] && [ -n "$ALERT_NUMBER" ]; then GHAS_TIER=unknown; fi
+fi
+if [ -n "$GHAS_TIER" ] && ! printf '%s' "$SOURCE_PROVIDERS" | jq -e 'index("ghas") != null' >/dev/null; then
+  [ "$GHAS_TIER" = unknown ] && [ "$SOURCE_KIND" = inline ] && [ -n "$ALERT_NUMBER" ] || {
+    echo "render-feedback-archive: known GHAS tier supplied without a GHAS role or unknown inline alert-link evidence" >&2; exit 2;
+  }
+fi
+
+CODEX_TIERS=$(codex_tiers_of "$BODY" | jq -Rsc 'split("\n") | map(select(. != ""))')
+VISIBLE=$(coderabbit_finding_scan "$BODY") \
+  || { echo "render-feedback-archive: could not scan CodeRabbit body" >&2; exit 2; }
+CODERABBIT_TIERS=$(coderabbit_tiers_of "$VISIBLE" | jq -Rsc 'split("\n") | map(select(. != ""))') \
+  || { echo "render-feedback-archive: could not classify CodeRabbit tier evidence" >&2; exit 2; }
+if [ "$GHAS_TIER" = unknown ]; then
+  # Possible severities, not a claim that the lookup established any tier.
+  # Existing policy filtering may ignore known tiers; only ignoring every
+  # GHAS tier intentionally removes this unresolved history obligation.
+  GHAS_TIERS='["p0","p1","p2","p3"]'
+elif [ -n "$GHAS_TIER" ]; then
+  GHAS_TIERS=$(jq -nc --arg t "$GHAS_TIER" '[$t]')
+else
+  GHAS_TIERS='[]'
+fi
+
+# Markerless enrolled edits have nothing to preserve. The retained registry
+# decides source eligibility; accounting independently binds the source id.
+if [ "$(printf '%s' "$CODEX_TIERS" | jq 'length')" -eq 0 ] \
+   && [ "$(printf '%s' "$CODERABBIT_TIERS" | jq 'length')" -eq 0 ] \
+   && [ "$(printf '%s' "$GHAS_TIERS" | jq 'length')" -eq 0 ]; then
+  exit 0
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  BODY_FINGERPRINT=$(printf '%s' "$BODY_JSON" | sha256sum | awk '{print substr($1, 1, 12)}')
+elif command -v shasum >/dev/null 2>&1; then
+  BODY_FINGERPRINT=$(printf '%s' "$BODY_JSON" | shasum -a 256 | awk '{print substr($1, 1, 12)}')
+else
+  echo "render-feedback-archive: neither sha256sum nor shasum is available" >&2
+  exit 2
+fi
+
+PAYLOAD=$(jq -nc \
+  --rawfile body "$PREVIOUS_BODY_FILE" \
+  --arg source_kind "$SOURCE_KIND" \
+  --argjson source_comment_id "$SOURCE_ID" \
+  --arg source_login "$SOURCE_LOGIN" \
+  --arg archived_at "$ARCHIVED_AT" \
+  --arg body_fingerprint "$BODY_FINGERPRINT" \
+  --argjson codex_tiers "$CODEX_TIERS" \
+  --argjson coderabbit_tiers "$CODERABBIT_TIERS" \
+  --argjson ghas_tiers "$GHAS_TIERS" '
+    {
+      archive_version: 2,
+      source_kind: $source_kind,
+      source_comment_id: $source_comment_id,
+      source_login: $source_login,
+      archived_at: $archived_at,
+      body_fingerprint: $body_fingerprint,
+      body: $body,
+      codex_tiers: $codex_tiers,
+      coderabbit_tiers: $coderabbit_tiers,
+      ghas_tiers: $ghas_tiers
+    }
+  ')
+# Encode bytes directly; feeding the Unicode payload to jq's raw-input reader
+# would introduce the same boundary corruption after the body was fingerprinted.
+ENCODED=$(printf '%s' "$PAYLOAD" | base64 | tr -d '\n') \
+  || { echo "render-feedback-archive: could not encode archive payload" >&2; exit 2; }
+if [ "${#ENCODED}" -le 60000 ]; then
+  printf '<!-- mergepath-feedback-archive:v1 %s -->\n' "$ENCODED"
+  exit 0
+fi
+
+# One GitHub comment cannot hold the worst-case JSON/base64 expansion of a
+# near-limit reviewer body. Split the encoded payload into independently
+# restorable comments; accounting reconstructs the complete set and rejects a
+# missing part. The archive id binds every part to this exact payload.
+if command -v sha256sum >/dev/null 2>&1; then
+  ARCHIVE_ID=$(printf '%s' "$PAYLOAD" | sha256sum | awk '{print $1}')
+else
+  ARCHIVE_ID=$(printf '%s' "$PAYLOAD" | shasum -a 256 | awk '{print $1}')
+fi
+CHUNK_SIZE=60000
+TOTAL=$(( (${#ENCODED} + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+MAX_CHUNKS=32
+if [ "$TOTAL" -gt "$MAX_CHUNKS" ]; then
+  echo "render-feedback-archive: encoded archive requires $TOTAL chunks; maximum is $MAX_CHUNKS" >&2
+  exit 2
+fi
+PART=1
+OFFSET=0
+while [ "$OFFSET" -lt "${#ENCODED}" ]; do
+  CHUNK=${ENCODED:$OFFSET:$CHUNK_SIZE}
+  printf '<!-- mergepath-feedback-archive:v2 id=%s part=%s/%s data=%s -->\n' \
+    "$ARCHIVE_ID" "$PART" "$TOTAL" "$CHUNK"
+  PART=$((PART + 1))
+  OFFSET=$((OFFSET + CHUNK_SIZE))
+done

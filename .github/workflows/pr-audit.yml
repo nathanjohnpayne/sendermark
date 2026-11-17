@@ -1,0 +1,1213 @@
+name: Weekly PR Audit
+
+# Cron-driven retroactive check that the previous week's merged PRs
+# satisfied the review policy. Six checks per merged PR:
+#
+#   1. Self-Review section present in PR body (Dependabot exempted)
+#   2. external-review-labeled PRs have either an APPROVED CLI
+#      reviewer review OR a review from the Codex GitHub app bot;
+#      Dependabot PRs require an APPROVED CLI reviewer review
+#   3. No bot self-approval (reviewer identity approving its own PR)
+#   4. needs-human-review label not still present at merge time
+#   5. policy-violation label not still present at merge time
+#   6. human-hold label not still present at merge time
+#
+# Violations are aggregated into a single audit issue per run.
+# See REVIEW_POLICY.md, .github/review-policy.yml, and #36 for
+# the canonical policy and the most recent semantics changes.
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9:00 UTC
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: read
+  contents: read
+
+jobs:
+  audit:
+    name: Audit Merged PRs
+    # Reject manual dispatch from a non-default ref (#550 Codex P1): on
+    # workflow_dispatch GitHub runs the workflow DEFINITION from the chosen
+    # ref, which the checkout pin cannot constrain — a feature branch could
+    # leak REVIEWER_ASSIGNMENT_TOKEN before checkout. Scheduled runs and
+    # default-branch dispatch pass; a feature-branch dispatch is skipped.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Pin to the trusted default branch (#548): this workflow has a
+      # workflow_dispatch trigger and runs the inline actions/github-script
+      # audit under the cross-repo REVIEWER_ASSIGNMENT_TOKEN, reading
+      # .github/review-policy.yml from the checkout. Without an explicit ref a
+      # manually-dispatched branch could supply tampered policy/code that runs
+      # under that privileged PAT. Always audit from the canonical default branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # The audit reads via gh / github-script with an explicit token; it
+          # never does git-authenticated writes, so don't leave the checkout
+          # token in .git/config (#548 defense-in-depth).
+          persist-credentials: false
+
+      - name: Install js-yaml
+        run: npm install --no-save --ignore-scripts --legacy-peer-deps js-yaml
+
+      - name: Audit merged PRs for review policy compliance
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.REVIEWER_ASSIGNMENT_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { execFileSync } = require('child_process');
+            const yaml = require('js-yaml');
+
+            // Bounded to match PR_BODY_CONTRACT_TIMEOUT_SECONDS in
+            // scripts/lib/pr-body-contract.sh (#1281). This call site does not
+            // go through that lib, so it carries the bound itself; the parity
+            // suite asserts the two agree. Timeouts are recorded per PR and
+            // fail the audit after the remaining coverage is reported.
+            const PR_BODY_PARSE_TIMEOUT_MS = 120000;
+            // Stop starting PRs before the job's 30-minute bound; leave time
+            // for the parser's full bound and publication of partial coverage.
+            const AUDIT_DEADLINE_MS = Date.now() + 25 * 60 * 1000;
+            const AUDIT_REPORT_RESERVE_MS = 60000;
+            let auditExpired = false;
+            let reportDeadlineMs = AUDIT_DEADLINE_MS;
+
+            function auditDeadlineError() {
+              return Object.assign(new Error('Audit time allowance exhausted'), {code: 'AUDIT_DEADLINE'});
+            }
+            function auditRemainingMs(reporting = false) {
+              return Math.floor((reporting ? reportDeadlineMs : AUDIT_DEADLINE_MS - AUDIT_REPORT_RESERVE_MS) - Date.now());
+            }
+            function requireAuditTime() {
+              if (auditExpired || auditRemainingMs() <= 0) throw auditDeadlineError();
+            }
+            function auditTimeout(maximum) {
+              requireAuditTime();
+              return Math.max(1, Math.min(maximum, auditRemainingMs()));
+            }
+            async function boundedAuditCall(invoke, reporting = false) {
+              const allowance = auditRemainingMs(reporting);
+              if ((!reporting && auditExpired) || allowance <= 0) throw auditDeadlineError();
+              const controller = new AbortController();
+              let timer;
+              let timedOut = false;
+              const expiration = new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                  timedOut = true;
+                  if (!reporting) auditExpired = true;
+                  reject(auditDeadlineError());
+                  controller.abort();
+                }, allowance);
+              });
+              try {
+                return await Promise.race([Promise.resolve().then(() => invoke(controller.signal)), expiration]);
+              } catch (error) {
+                if (timedOut) throw auditDeadlineError();
+                throw error;
+              } finally {
+                clearTimeout(timer);
+              }
+            }
+            async function auditPaginate(endpoint, options = {}) {
+              return boundedAuditCall(signal => github.paginate(endpoint, {
+                ...options, request: {...options.request, signal},
+              }));
+            }
+            async function auditGraphql(query, variables = {}) {
+              return boundedAuditCall(signal => github.graphql(query, {
+                ...variables, request: {...variables.request, signal},
+              }));
+            }
+
+
+            function parsePrBodyContract(body) {
+              return JSON.parse(execFileSync(
+                process.execPath,
+                ['scripts/lib/pr-body-contract.mjs', '--json'],
+                {
+                  input: body || '', encoding: 'utf8',
+                  timeout: auditTimeout(PR_BODY_PARSE_TIMEOUT_MS), killSignal: 'SIGKILL',
+                }
+              ));
+            }
+
+            // Read reviewer accounts and the Codex bot login from
+            // review-policy.yml. The Codex bot login is read from
+            // codex.bot_login (added in #31) so that the OpenAI
+            // Codex GitHub app's reviews count as satisfying the
+            // external-review requirement, in addition to the
+            // nathanpayne-* CLI reviewer identities. See #26 for
+            // the bot identity decision and #36 for the audit-side
+            // allow-list change.
+            let reviewerAccounts;
+            let dependabotReviewerAccounts;
+            let authorIdentity;
+            let codexBotLogin;
+            let reactionFreshnessWindowSeconds;
+            let codexEnabled;
+            try {
+              const config = yaml.load(fs.readFileSync('.github/review-policy.yml', 'utf8'));
+              reviewerAccounts = config.available_reviewers || [];
+              // #2874: Dependabot-only approvers count for Check 2's
+              // Dependabot rule and nowhere else.
+              dependabotReviewerAccounts = Array.isArray(config.dependabot_reviewer_identities)
+                ? config.dependabot_reviewer_identities : [];
+              authorIdentity = config.author_identity || 'nathanjohnpayne';
+              codexBotLogin = (config.codex && config.codex.bot_login) || 'chatgpt-codex-connector[bot]';
+              reactionFreshnessWindowSeconds =
+                (config.codex && config.codex.reaction_freshness_window_seconds) || 1800;
+              // Default true (matches codex-review-check.sh CODEX_ENABLED:-true).
+              codexEnabled = !(config.codex && config.codex.enabled === false);
+            } catch (e) {
+              console.log('WARNING: Could not read review-policy.yml, using defaults');
+              reviewerAccounts = ['nathanpayne-claude', 'nathanpayne-codex', 'nathanpayne-cursor'];
+              dependabotReviewerAccounts = [];
+              authorIdentity = 'nathanjohnpayne';
+              codexBotLogin = 'chatgpt-codex-connector[bot]';
+              reactionFreshnessWindowSeconds = 1800;
+              codexEnabled = true;
+            }
+
+            // The Codex bot's review-state semantics differ from
+            // CLI reviewer identities, so the external-review check
+            // below treats them on separate code paths rather than
+            // unioning them into a single allow-list. See the
+            // Check 2 block for the full rationale; the short
+            // version is that CLI identities still require
+            // state === 'APPROVED' but the Codex bot can clear
+            // with a COMMENTED review on the current HEAD that
+            // carries no unaddressed P0/P1 inline findings, because
+            // the GitHub app never emits APPROVED (see #29 for
+            // observational evidence).
+            //
+            // Codex clearance is state-aware (#249): a Codex review
+            // that is present but flags P0/P1 findings does NOT
+            // clear the audit gate. The clearance definition is the
+            // same one `scripts/codex-review-check.sh` enforces at
+            // merge time — a COMMENTED review from the Codex bot on
+            // the current HEAD SHA with zero unresolved P0/P1 inline
+            // findings (P0/P1 detected via the `![P0 Badge]` /
+            // `![P1 Badge]` markdown markers Codex inlines into its
+            // findings). When the merge-gate helper for P0/P1
+            // counting from #235 lands, refactor the inline JS below
+            // to shell out to that shared helper so the two gates
+            // cannot drift. See #249.
+
+            const since = new Date();
+            since.setDate(since.getDate() - 7);
+            const sinceISO = since.toISOString();
+            const today = new Date().toISOString().split('T')[0];
+
+            // Get merged PRs from the past 7 days
+            let prs = [];
+            let discoveryError = '';
+            try {
+              prs = await auditPaginate(
+                github.rest.pulls.list,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'closed',
+                  sort: 'updated',
+                  direction: 'desc',
+                  per_page: 100,
+                }
+              );
+              if (!Array.isArray(prs)) throw new Error('Unreadable PR inventory');
+            } catch (error) {
+              discoveryError = error.message;
+            }
+
+
+            const mergedPRs = prs.filter(
+              pr => pr.merged_at && new Date(pr.merged_at) >= since
+            );
+
+            const violations = [];
+            const recordedOverrides = [];
+            const parserErrors = [];
+            const auditErrors = [];
+            let reportPublicationError = "";
+            let unauditedPRs = [];
+            let auditedPRCount = 0;
+
+            async function labelWasPresentAtMerge(pr, labelName) {
+              const events = await auditPaginate(
+                github.rest.issues.listEvents,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  per_page: 100,
+                }
+              );
+              const mergedAt = new Date(pr.merged_at).getTime();
+              let present = false;
+              for (const event of events.sort(
+                (a, b) => new Date(a.created_at) - new Date(b.created_at)
+              )) {
+                if (new Date(event.created_at).getTime() > mergedAt) {
+                  continue;
+                }
+                if (!event.label || event.label.name !== labelName) {
+                  continue;
+                }
+                if (event.event === 'labeled') {
+                  present = true;
+                } else if (event.event === 'unlabeled') {
+                  present = false;
+                }
+              }
+              return present;
+            }
+
+            async function auditOnePR(pr) {
+              const prViolations = [];
+              const isDependabot = pr.user.login === 'dependabot[bot]';
+              let bodyContract = { author: '', authorCount: 0, hasSelfReview: false };
+              try {
+                bodyContract = parsePrBodyContract(pr.body);
+              } catch (e) {
+                // A timeout makes this PR's policy audit incomplete, even
+                // for Dependabot. Do not classify the unparsed body as a
+                // missing declaration or heading, or let an override excuse it.
+                if (e?.code === 'AUDIT_DEADLINE') throw e;
+                if (e?.code === 'ETIMEDOUT') {
+                  parserErrors.push({
+                    number: pr.number, title: pr.title, author: pr.user.login,
+                    issues: ['PR body parser timed out (ETIMEDOUT); policy audit incomplete for this PR.'],
+                  });
+                  return;
+                }
+                if (!isDependabot) {
+                  prViolations.push('Could not parse PR body contract');
+                }
+              }
+
+              // Shared-author identity must be known before either Codex or
+              // an independent CLI approval can excuse review clearance.
+              const validAuthorDeclaration = pr.user.login !== authorIdentity ||
+                (bodyContract.authorCount === 1 && Boolean(bodyContract.author) &&
+                  reviewerAccounts.filter(r => String(r).toLowerCase().endsWith(
+                    '-' + String(bodyContract.author).toLowerCase()
+                  )).length === 1);
+              if (!validAuthorDeclaration) {
+                prViolations.push('Missing, ambiguous, or unconfigured `Authoring-Agent` declaration');
+              }
+
+              // Fetch all reviews for this PR once, up front. Both
+              // Check 2 (external-review approval) and Check 3 (bot
+              // self-approval) consume them, and an earlier version
+              // of this script fetched twice. CodeRabbit caught the
+              // duplicate on PR #68.
+              //
+              // Paginate via `github.paginate` (PR #255 round 2 Codex
+              // P2): the unpaginated `listReviews` call returns at
+              // most 30 items in chronological order, so on a PR with
+              // a long review history the latest Codex review on
+              // `pr.head.sha` can sit on a later page and never reach
+              // the HEAD-scoped filter below. The result was a
+              // false-positive policy violation even when Codex had
+              // genuinely cleared on HEAD. `per_page: 100 +
+              // page traversal` is the standard GitHub-API fix and
+              // matches the patterns already used at the
+              // `pulls.list` and `pulls.listReviewComments` call
+              // sites in this file.
+              const reviews = await auditPaginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                }
+              );
+
+              // Check 1: Missing Self-Review section
+              //
+              // Skip for Dependabot PRs. Dependabot doesn't author a
+              // body with the Self-Review template, and the
+              // pre-merge gate in pr-review-policy.yml already
+              // skips Dependabot via the pull request author login
+              // (not github.actor, which can drift on reruns). The
+              // audit was previously flagging every Dependabot PR as
+              // a false positive — see #20.
+              if (!isDependabot) {
+                if (!bodyContract.hasSelfReview) {
+                  prViolations.push('Missing `## Self-Review` section');
+                }
+              }
+
+              // Check 2: Had needs-external-review label — verify approval
+              //
+              // Also runs unconditionally for Dependabot PRs (see #20):
+              // even patch/minor bumps must have ONE reviewer-identity
+              // approval before merge. The existing
+              // .github/workflows/dependabot-auto-merge.yml posts
+              // `gh pr review --approve` via REVIEWER_ASSIGNMENT_TOKEN
+              // before enabling auto-merge, so well-behaved auto-merge
+              // PRs satisfy this naturally. Only Dependabot PRs that
+              // were merged manually WITHOUT any reviewer-identity
+              // approval will be flagged — which is the real gap.
+              const hadExternalLabel = pr.labels.some(
+                l => l.name === 'needs-external-review'
+              );
+              const dependabotNeedsApproval = isDependabot;
+
+              // Exemption (#229): PRs opened by `scripts/sync-to-downstream.sh`
+              // propagate already-reviewed mergepath commits to downstream
+              // consumers. Re-reviewing a propagation PR on each consumer
+              // is redundant (the upstream commit was reviewed in mergepath
+              // itself), so the audit's external-review violation check is
+              // skipped for these PRs. Dependabot's separate rule
+              // (cliApprovedReviews) is unaffected.
+              //
+              // Four guards, all required, defending against spoofing
+              // (CodeRabbit ⚠️ Major on PR #230 round 1 — naming alone is
+              // not a trusted-provenance signal):
+              //
+              //   1. PR author == author_identity from review-policy.yml
+              //      (typically `nathanjohnpayne`). The propagation script
+              //      runs under that identity per CLAUDE.md's active-account
+              //      convention; a PR from any other login isn't from the
+              //      sync flow.
+              //   2. Head ref comes from the same repo (not a fork). Forks
+              //      can't impersonate the propagation flow because the
+              //      sync script pushes directly to the consumer repo's
+              //      own `mergepath-sync/*` namespace.
+              //   3. Head branch namespace `mergepath-sync/*` — owned by
+              //      the sync script's branch-naming convention
+              //      (`mergepath-sync/<short-sha>`) and never used for
+              //      hand-authored work.
+              //   4. PR title contains `mergepath@[0-9a-f]{7,40}` — the
+              //      canonical title marker the sync script emits,
+              //      identifying the upstream commit. Per-commit sync PRs
+              //      use `(mergepath@<sha>)`; `--sync-all` PRs use
+              //      `to mergepath@<sha>`.
+              //
+              // Hand-creating all four signals at once is possible but is
+              // an explicit, traceable action that would surface during
+              // self-review.
+              //
+              // #528 (ruled DEFER + DOCUMENT): this audit identifies a
+              // propagation PR by a FINGERPRINT (trusted author + same-repo
+              // head + mergepath-sync/<sha> branch + mergepath@<sha> title
+              // marker), NOT by re-running the merge lane's full byte-for-byte
+              // verify-propagation-pr.sh proof. That is accepted
+              // defense-in-depth, not a gap: pr-audit is a RETROSPECTIVE
+              // detector (it flags an already-merged PR that skipped review),
+              // while the load-bearing teeth — the byte-level faithful-mirror
+              // proof — runs at MERGE time in pr-review-policy.yml +
+              // merge-clearance-gate. A forged fingerprint cannot MERGE without
+              // also passing that proof, so duplicating the heavy verify here
+              // would add audit cost without closing a demonstrated bypass.
+              // Revisit if a fingerprint-only merge bypass is ever shown.
+              const isTrustedSyncAuthor =
+                pr.user && pr.user.login === authorIdentity;
+              const isSameRepoHead =
+                pr.head && pr.head.repo &&
+                pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
+              const hasSyncBranchName =
+                pr.head && pr.head.ref &&
+                pr.head.ref.startsWith('mergepath-sync/');
+              const hasMergepathMarker =
+                /\bmergepath@[0-9a-f]{7,40}\b/.test(pr.title || '');
+              const isMergepathSyncPR =
+                isTrustedSyncAuthor &&
+                isSameRepoHead &&
+                hasSyncBranchName &&
+                hasMergepathMarker;
+
+              if (hadExternalLabel || dependabotNeedsApproval) {
+                // For the external-review path we accept either:
+                //   - an APPROVED review from a CLI reviewer identity
+                //     (nathanpayne-claude / nathanpayne-codex / etc.), OR
+                //   - a CLEARED review from the Codex GitHub app bot,
+                //     where "cleared" is the same two-condition
+                //     definition the merge gate uses (#249):
+                //       1. a COMMENTED review from the Codex bot on
+                //          the PR's HEAD SHA, AND
+                //       2. zero unresolved P0/P1 inline findings on
+                //          that review (P0/P1 markers are the
+                //          `![P0 Badge]` / `![P1 Badge]` images Codex
+                //          embeds in its inline finding bodies).
+                //
+                // The state-agnostic exception is intentionally
+                // SCOPED to the Codex bot only. CLI reviewer
+                // identities still require state === 'APPROVED'
+                // because a non-opinionated COMMENTED review from
+                // a CLI reviewer is not a clearance signal under
+                // policy. nathanpayne-codex caught this on PR #68
+                // round 1 — earlier draft accepted any review from
+                // any external approver, which would have let a
+                // Phase 4b fallback PR with only a COMMENTED CLI
+                // review pass the audit.
+                //
+                // Codex P0/P1 gating (#249): the prior version used
+                // `codexBotReviews.length === 0` as the block
+                // condition — so any Codex review (even one actively
+                // raising P0/P1 findings) satisfied the gate. The
+                // tightened gate mirrors `scripts/codex-review-check.sh`'s
+                // gate (c) two-condition shape on the PR's HEAD SHA.
+                // TODO(#235): once the merge-gate ships a shared
+                // `codex-p1-gate` helper (or equivalent extraction
+                // from codex-review-check.sh), refactor the inline
+                // computation below to call it so the audit gate and
+                // merge gate cannot drift.
+                const cliApprovedReviews = reviews.filter(
+                  r => r.state === 'APPROVED' &&
+                       reviewerAccounts.includes(r.user.login)
+                );
+
+                const headSha = pr.head && pr.head.sha;
+
+                // Codex reviews on the PR's HEAD SHA. The merge-time
+                // gate uses commit_id == HEAD_SHA to scope findings
+                // to the latest review round; the audit applies the
+                // same scope. If the audit's notion of HEAD ever
+                // drifts (e.g. force-pushes post-merge), tighten
+                // here — but post-merge HEAD is immutable in
+                // practice.
+                const codexReviewsOnHead = reviews.filter(
+                  r => r.user.login === codexBotLogin &&
+                       headSha &&
+                       r.commit_id === headSha
+                );
+
+                const codexCommentedOnHead = codexReviewsOnHead.filter(
+                  r => r.state === 'COMMENTED'
+                );
+
+                // Codex clearance mirrors the live gate: the latest
+                // substantive head-pinned review or anchored verdict must
+                // clear required findings. Unanchored reactions do not
+                // grant clearance or invalidate an independent approval.
+                //
+                // Inline P0/P1 findings live on /pulls/{pr}/comments,
+                // keyed to a review via pull_request_review_id; resolution
+                // state lives on the GraphQL reviewThreads view, joined by
+                // comment databaseId (same join as scripts/codex-p1-gate.sh).
+                let inlineComments = [];
+                try {
+                  inlineComments = await auditPaginate(
+                    github.rest.pulls.listReviewComments,
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      pull_number: pr.number,
+                      per_page: 100,
+                    }
+                  );
+                } catch (e) {
+                  console.log(
+                    `WARNING: could not fetch inline comments for PR #${pr.number}; ` +
+                    `treating Codex clearance as NOT met for safety. Error: ${e.message}`
+                  );
+                  inlineComments = null;
+                }
+
+                // Comment-databaseId → { resolved, threadLatestAt } map,
+                // paginated over all review threads. null = lookup failed →
+                // fail CLOSED (#449): every P0/P1 finding is then treated as
+                // unresolved, so the review path cannot clear on a lookup
+                // failure. Inner comments(first:100) matches
+                // scripts/codex-p1-gate.sh (a single P0/P1 thread with
+                // >100 replies is not a real shape).
+                //
+                // threadLatestAt is the newest comment time in the thread.
+                // GitHub exposes NO thread resolvedAt and NO resolve
+                // timeline event (verified by schema introspection), so this
+                // retrospective audit cannot read WHEN a thread was resolved.
+                // A thread resolved AFTER merge would otherwise wrongly clear
+                // (Codex P1 on #460). The clearance algorithm below bounds
+                // resolution by merge time using the newest comment as a
+                // proxy: a resolved thread is honored only when it shows no
+                // comment activity after merged_at (and merged_at is known).
+                // Residual: a silent UI-button resolve with no following
+                // comment can't be dated — the codex-p1-gate REQUIRED check
+                // is the at-merge primary enforcement, this audit the
+                // retrospective backstop.
+                let resolutionByCommentId = {};
+                try {
+                  let cursor = null;
+                  for (;;) {
+                    const tresp = await auditGraphql(
+                      `query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+                         repository(owner:$owner,name:$name){
+                           pullRequest(number:$pr){
+                             reviewThreads(first:100, after:$cursor){
+                               pageInfo { hasNextPage endCursor }
+                               nodes { isResolved comments(first:100){ nodes { databaseId createdAt } } }
+                             }
+                           }
+                         }
+                       }`,
+                      {
+                        owner: context.repo.owner,
+                        name: context.repo.repo,
+                        pr: pr.number,
+                        cursor,
+                      }
+                    );
+                    const rt = tresp.repository.pullRequest.reviewThreads;
+                    for (const t of rt.nodes) {
+                      let threadLatestAt = '';
+                      for (const c of t.comments.nodes) {
+                        if (c.createdAt && c.createdAt > threadLatestAt) {
+                          threadLatestAt = c.createdAt;
+                        }
+                      }
+                      for (const c of t.comments.nodes) {
+                        resolutionByCommentId[String(c.databaseId)] = {
+                          resolved: t.isResolved,
+                          threadLatestAt,
+                        };
+                      }
+                    }
+                    if (!rt.pageInfo.hasNextPage) break;
+                    cursor = rt.pageInfo.endCursor;
+                  }
+                } catch (e) {
+                  console.log(
+                    `WARNING: reviewThreads resolution lookup failed for PR #${pr.number}; ` +
+                    `failing closed (P0/P1 findings treated as unresolved). Error: ${e.message}`
+                  );
+                  resolutionByCommentId = null;
+                }
+
+                const mergedAt = pr.merged_at || '';
+
+                // HEAD-anchored Codex issue-comment verdict ("Codex Review:
+                // Didn't find any major issues" + "Reviewed commit: <sha>"),
+                // mirrored from scripts/codex-review-check.sh's
+                // CODEX_VERDICT_JSON (#600/#567) and its #609 poller
+                // counterpart (#612). Sha-anchored like a review object
+                // (commit_id === headSha), not time-window-anchored like a
+                // reaction — the sha binding IS the provenance, so no
+                // merge-time freshness bound applies here, matching how the
+                // review path (above) carries no mergedAt upper bound either.
+                // KEEP IN SYNC with the mirrored runner in
+                // scripts/ci/check_pr_audit_codex_clearance.
+                // null (not []) on fetch failure — fail closed (Codex P2 round
+                // 3 on #640), mirroring inlineComments below. An empty-array
+                // fallback silently treated a fetch failure as "no verdict
+                // comments exist," which could let a stale/missing signal
+                // wrongly clear (or wrongly fail to flag) a PR the merge gate
+                // would have decided differently.
+                let issueComments = null;
+                try {
+                  issueComments = await auditPaginate(
+                    github.rest.issues.listComments,
+                    {
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: pr.number,
+                      per_page: 100,
+                    }
+                  );
+                } catch (e) {
+                  console.log(
+                    `WARNING: could not fetch issue comments for PR #${pr.number}; ` +
+                    `verdict-comment clearance path disabled (fail closed). Error: ${e.message}`
+                  );
+                  issueComments = null;
+                }
+
+                if (issueComments !== null) {
+                  try {
+                    issueComments = JSON.parse(execFileSync('python3', [
+                      'scripts/workflow/resolve-codex-verdict-anchors.py',
+                      '--repo', `${context.repo.owner}/${context.repo.repo}`,
+                      '--bot', codexBotLogin,
+                    ], {input: JSON.stringify(issueComments), encoding: 'utf8', timeout: auditTimeout(35000), killSignal: 'SIGKILL',
+                      maxBuffer: Math.max(1024 * 1024, Buffer.byteLength(JSON.stringify(issueComments), 'utf8') * 6)}));
+                  } catch (e) {
+                    if (e?.code === 'ETIMEDOUT' || e?.code === 'AUDIT_DEADLINE') throw e;
+                    issueComments = null; // Missing/unreadable resolver cannot grant clearance.
+                    console.log(`WARNING: Codex anchor resolution failed for PR #${pr.number}`);
+                  }
+                }
+
+                // ── Clearance algorithm (#249/#449/#450/#612) ─────────
+                // KEEP IN SYNC with the mirrored runner in
+                // scripts/ci/check_pr_audit_codex_clearance.
+                //
+                // Gate on codexEnabled (#460 Codex P2): when codex.enabled is
+                // false, scripts/codex-review-check.sh ignores Codex bot
+                // reviews/reactions entirely (gate (c) clears only via a Phase
+                // 4b substitute APPROVED). The audit must match — otherwise a
+                // stray 👍 from a still-installed App on a codex-disabled repo
+                // would mark a merge compliant the merge gate never cleared.
+                // codexCleared stays false, so the audit falls through to the
+                // CLI-APPROVED requirement below.
+                let codexCleared = false;
+                // Latest Codex signal on HEAD, any disposition/kind (#612)
+                // — feeds the Phase 4b/CLI-approval staleness guard below.
+                // Populated even when codexCleared stays false, mirroring
+                // codex-review-check.sh's CODEX_HEAD_VERDICT_ANY_TIME
+                // carrying into its Phase 4b substitute guard regardless of
+                // clearance disposition.
+                let latestAnyCodexSignalTime = '';
+
+                // ── Three independent signal scans (#612 rounds 1-4) ──────
+                // Each of verdict / reaction / review is scanned for its
+                // TIMESTAMP unconditionally — independent of inlineComments,
+                // issueComments, and sameAgentContext availability wherever
+                // the underlying data allows it. Only the CLEARANCE decision
+                // (below) gates on same-agent-or-CLI-approval and requires
+                // BOTH inlineComments and issueComments to be known. This
+                // split exists because four rounds of review kept finding
+                // the same bug shape: nesting a signal's timestamp inside an
+                // availability/gating check for one PURPOSE (clearance)
+                // silently also hid it from a DIFFERENT purpose (the Phase
+                // 4b staleness guard, which needs "is there a newer Codex
+                // signal at all" regardless of whether that signal clears
+                // anything or who authored the PR).
+
+                // Verdict: HEAD-anchored issue-comment ("Codex Review:
+                // Didn't find any major issues" + "Reviewed commit: <sha>").
+                // Needs issueComments (#612 round 3). Latest-first,
+                // then-affirmative — a newer non-affirmative verdict
+                // supersedes an older clean one (#608 P1 shape). Ties
+                // replace-on->=, matching max_by(.created_at) (round 3).
+                // Merge-time bounded: a verdict posted after merged_at must
+                // not participate in this retrospective audit at all.
+                let latestVerdictTime = '';
+                let verdictAffirmative = false;
+                if (codexEnabled && issueComments !== null) {
+                  const headLower = (headSha || '').toLowerCase();
+                  if (headLower) {
+                    let latestVerdict = null;
+                    for (const c of issueComments) {
+                      if (!c.user || c.user.login !== codexBotLogin) continue;
+                      if (!(mergedAt && c.created_at && c.created_at <= mergedAt)) continue;
+                      const body = (c.body || '').toLowerCase();
+                      const shaMatches = [
+                        ...body.matchAll(/reviewed commit[^0-9a-z_\r\n]{0,6}([^\r\n]*)/g),
+                      ].map(m => m[1].replace(/^[`*\s]+|[`*\s]+$/g, ''));
+                      const fieldCount = (body.match(/reviewed commit/g) || []).length;
+                      const exact = /^[0-9a-f]{40}$/.test(headLower) && shaMatches.length > 0
+                        && shaMatches.length === fieldCount && shaMatches.every(s => s === headLower);
+                      const clean = /^\s*codex review:\s*didn.?t find any major issues\b/im.test(c.body || '');
+                      const ambiguousNegative = !clean && /^\s*codex review:/im.test(c.body || '')
+                        && (shaMatches.length === 0 || new Set(shaMatches).size > 1 || shaMatches.length !== fieldCount || shaMatches.some(s => s === headLower || !/^[0-9a-f]{40}$/.test(s)));
+                      if (!exact && !ambiguousNegative) continue;
+                      if (!latestVerdict || c.created_at >= latestVerdict.created_at) {
+                        latestVerdict = {
+                          created_at: c.created_at,
+                          affirmative: exact && clean,
+                        };
+                      }
+                    }
+                    if (latestVerdict) {
+                      latestVerdictTime = latestVerdict.created_at || '';
+                      verdictAffirmative = latestVerdict.affirmative === true;
+                    }
+                  }
+                }
+
+                // Review: latest Codex COMMENTED review on HEAD. The
+                // review's own existence/timestamp needs only
+                // codexCommentedOnHead (always computed) — NOT inlineComments
+                // (#612 round 4); only the P0/P1 CLEANLINESS check below
+                // needs inline comments, not the timestamp itself.
+                //
+                // Both clearance and CLI-approval staleness are bounded by
+                // merge time. A later review cannot retrospectively justify
+                // or disqualify a merge; unknown merge time grants no review
+                // clearance. The verdict path applies the same boundary.
+                let latestReviewTime = '';
+                let latestReviewTimeForStaleness = '';
+                let latestCodexReview = null;
+                if (codexEnabled && codexCommentedOnHead.length > 0) {
+                  // Without inline comments, every HEAD review conservatively
+                  // bounds CLI-approval freshness; none grants clearance.
+                  const substantiveReviews = inlineComments === null
+                    ? codexCommentedOnHead
+                    : codexCommentedOnHead.filter(r => {
+                        const comments = inlineComments.filter(c => c.pull_request_review_id === r.id);
+                        return comments.length === 0 || comments.some(c => !c.in_reply_to_id && c.user && c.user.login === codexBotLogin) || /\S/.test(r.body || '');
+                      });
+                  if (inlineComments !== null) {
+                    latestCodexReview = substantiveReviews.filter(r => mergedAt && r.submitted_at && r.submitted_at <= mergedAt).reduce(
+                      (latest, r) => (!latest || r.submitted_at > latest.submitted_at) ? r : latest,
+                      null
+                    );
+                    latestReviewTime = latestCodexReview ? (latestCodexReview.submitted_at || '') : '';
+                  }
+                  for (const r of substantiveReviews) {
+                    const t = r.submitted_at || '';
+                    if (mergedAt && t && t <= mergedAt && t > latestReviewTimeForStaleness) {
+                      latestReviewTimeForStaleness = t;
+                    }
+                  }
+                }
+
+                // Staleness baseline: the max of both anchored,
+                // merge-time-bounded timestamps — correct regardless of
+                // inlineComments/issueComments availability or same-agent
+                // context. The clearance block below does not need to (and
+                // does not) recompute this; it is already complete.
+                for (const t of [latestVerdictTime, latestReviewTimeForStaleness]) {
+                  if (t && t > latestAnyCodexSignalTime) latestAnyCodexSignalTime = t;
+                }
+
+                // ── Clearance decision (#612) ──────────────────────────────
+                // Requires BOTH inlineComments (P0/P1 state) AND issueComments
+                // (verdict supersession) to be known (#612 round 4): a
+                // failure on EITHER leaves codexCleared false — we cannot
+                // rule out a signal we failed to fetch (an unresolved P0/P1,
+                // or a superseding negative verdict) that the merge gate
+                // would have seen and that a partial-data audit cannot.
+                if (codexEnabled && inlineComments !== null && issueComments !== null) {
+                  // Unresolved P0/P1 findings on the latest review. P0/P1
+                  // markers are the `![P0 Badge]` / `![P1 Badge]` images
+                  // Codex embeds; scope to the bot author so an author
+                  // quote-reply doesn't read as a finding (#249). A
+                  // finding counts as unresolved unless its thread is
+                  // RESOLVED *and that resolution is bounded by merge time*
+                  // (#449 + #460).
+                  const p01Regex = /!\[P[01] Badge\]/;
+                  let reviewHasUnresolvedP01 = false;
+                  let reviewHasBlockingRoots = false;
+                  if (latestCodexReview) {
+                    const p01 = inlineComments.filter(
+                      c => c.user && c.user.login === codexBotLogin &&
+                           c.pull_request_review_id === latestCodexReview.id &&
+                           p01Regex.test(c.body || '')
+                    );
+                    const blockingReviewRegex = /!\[P[01] Badge\]|\*\*P[01]/;
+                    reviewHasBlockingRoots = blockingReviewRegex.test(latestCodexReview.body || '') ||
+                      inlineComments.some(c => c.user && c.user.login === codexBotLogin &&
+                        c.pull_request_review_id === latestCodexReview.id && !c.in_reply_to_id &&
+                        blockingReviewRegex.test(c.body || ''));
+                    if (resolutionByCommentId === null) {
+                      reviewHasUnresolvedP01 = p01.length > 0; // fail closed
+                    } else {
+                      // A P0/P1 finding counts as resolved ONLY when its
+                      // thread is resolved AND that resolution is bounded by
+                      // merge: merged_at is known and the thread shows no
+                      // comment activity after it. GitHub exposes no
+                      // resolvedAt, so post-merge comment activity is the
+                      // conservative proxy — a thread resolved after merge
+                      // must not retroactively clear the audit (Codex P1 on
+                      // #460). Fail closed on unknown merged_at.
+                      const resolvedAtMerge = (cid) => {
+                        const e = resolutionByCommentId[String(cid)];
+                        if (!e || e.resolved !== true) return false;
+                        if (!mergedAt) return false;
+                        if (e.threadLatestAt && e.threadLatestAt > mergedAt) return false;
+                        return true;
+                      };
+                      reviewHasUnresolvedP01 = p01.some(c => !resolvedAtMerge(c.id));
+                    }
+                  }
+
+                  // Same-agent context (Codex P2 on #460 r3): a Codex signal
+                  // substitutes for gate (b)'s reviewer approval ONLY when
+                  // the PR's Authoring-Agent resolves to an available
+                  // reviewer identity (e.g. `Authoring-Agent: claude` →
+                  // nathanpayne-claude). codex-review-check.sh gates branch 2
+                  // (#170) on this; the audit must too, or a cross-agent /
+                  // missing-Authoring-Agent PR merged on Codex's signal alone
+                  // (which the merge gate rejects) would pass this audit.
+                  // Mirrors the shell's AUTHORING_AGENT →
+                  // SAME_AGENT_REVIEWER suffix match.
+                  let sameAgentContext = false;
+                  if (bodyContract.authorCount === 1 && bodyContract.author) {
+                    const authoringAgent = bodyContract.author;
+                    sameAgentContext = reviewerAccounts.some(
+                      r => String(r).toLowerCase().endsWith('-' + authoringAgent)
+                    );
+                  }
+
+                  // Latest anchored review/verdict wins; a newer negative
+                  // verdict must not let an older clean run clear.
+                  let latestKind = '';
+                  let latestTime = '';
+                  for (const [kind, time] of [
+                    ['review', latestReviewTime],
+                    ['verdict', latestVerdictTime],
+                  ]) {
+                    if (time && time >= latestTime) {
+                      latestKind = kind;
+                      latestTime = time;
+                    }
+                  }
+                  // An anchored review or affirmative verdict substitutes for reviewer
+                  // approval only with same-agent context or an existing
+                  // independent CLI approval.
+                  const gateBSatisfied = validAuthorDeclaration && (cliApprovedReviews.length > 0 ||
+                    (sameAgentContext && (latestKind !== 'review' || !reviewHasBlockingRoots)));
+                  if (latestKind === 'review') {
+                    codexCleared = gateBSatisfied && !reviewHasUnresolvedP01;
+                  } else if (latestKind === 'verdict') {
+                    codexCleared = gateBSatisfied && verdictAffirmative && !reviewHasUnresolvedP01;
+                  }
+                }
+
+                // ─────────────────────────────────────────────────
+                // Dual-violation note (#287):
+                //
+                // The two `prViolations.push(...)` blocks below can
+                // BOTH fire for a single PR — specifically, a
+                // Dependabot PR that also carries the
+                // `needs-external-review` label and merged with zero
+                // reviewer-identity approvals. In that case the audit
+                // emits both:
+                //
+                //   1. "External-review PR merged with no APPROVED
+                //      review …" (from the hadExternalLabel branch)
+                //   2. "Dependabot PR merged with no reviewer identity
+                //      approval …" (from the dependabotNeedsApproval
+                //      branch)
+                //
+                // This is INTENTIONAL, not an over-emit bug. The two
+                // policy conditions are independent: one comes from
+                // the external-review label being present at merge,
+                // the other from Dependabot's narrower clearance rule
+                // (Codex doesn't count for Dependabot — only a CLI
+                // reviewer-identity APPROVED review does). When both
+                // are simultaneously true, the audit correctly
+                // surfaces both — collapsing them into a single line
+                // would hide which gate the merge bypassed.
+                // ─────────────────────────────────────────────────
+
+                // Phase 4b / CLI-approval staleness guard (#612, Codex P2
+                // round 1 on #640): a CLI reviewer-identity APPROVED review
+                // does not excuse the external-review requirement when a
+                // NEWER Codex signal (reaction / review / verdict, any
+                // disposition) exists on the current HEAD — mirrors
+                // codex-review-check.sh's Phase 4b substitute latest-
+                // signal-wins guard. We only reach this check when
+                // codexCleared is false, so any Codex signal newer than the
+                // latest CLI approval is, by construction, a non-clearing
+                // one; without this guard an early stale APPROVED could mask
+                // a later Codex verdict that actually disqualified the
+                // merge. No Codex signal at all (latestAnyCodexSignalTime
+                // empty) preserves the pre-#612 behavior exactly.
+                let latestCliApprovedTime = '';
+                for (const r of cliApprovedReviews) {
+                  if (r.submitted_at && r.submitted_at > latestCliApprovedTime) {
+                    latestCliApprovedTime = r.submitted_at;
+                  }
+                }
+                // Strict > (Codex P2 round 2 on #640), matching
+                // codex-review-check.sh's `[[ "$PHASE_4B_TIME" >
+                // "$LATEST_CODEX_SIGNAL_TIME" ]]` exactly — GitHub API
+                // timestamps are second-granular, so a same-second tie must
+                // fail closed to the Codex signal, not the approval.
+                //
+                // `issueComments !== null` is a separate, additional
+                // requirement (Codex P2 round 5): an empty
+                // latestAnyCodexSignalTime normally means "no Codex signal
+                // exists at all," but when the issue-comments fetch failed it
+                // instead means "we could not check for a verdict comment" —
+                // an unknown, not a verified absence. Equating the two let a
+                // fetch failure make a stale CLI approval look trivially
+                // fresh, hiding exactly the newer-negative-verdict staleness
+                // this guard exists to catch. A failed fetch must not be
+                // treated as equivalent to a verified clean signal.
+                //
+                // Gated on codexEnabled (Codex P2 round 7): when
+                // codex.enabled is false, Codex signals never participate in
+                // clearance at all (all three signal computations above are
+                // already codexEnabled-gated, so latestAnyCodexSignalTime is
+                // always empty in that config) — a transient issueComments
+                // fetch failure must not invalidate an otherwise-fresh CLI
+                // approval over a signal source the repo doesn't use.
+                const hasFreshCliApproval = validAuthorDeclaration && cliApprovedReviews.length > 0 &&
+                  (!codexEnabled || issueComments !== null) &&
+                  (!latestAnyCodexSignalTime || latestCliApprovedTime > latestAnyCodexSignalTime);
+
+                if (hadExternalLabel &&
+                    !hasFreshCliApproval &&
+                    !codexCleared &&
+                    !isMergepathSyncPR) {
+                  // Distinguish the two failure modes so the audit
+                  // issue points at the right diagnosis: no Codex
+                  // review at all vs. a Codex review with
+                  // unresolved P0/P1 findings.
+                  if (codexReviewsOnHead.length === 0) {
+                    prViolations.push(
+                      'External-review PR merged with no APPROVED review from a CLI reviewer identity and no Codex bot review on the merge HEAD'
+                    );
+                  } else {
+                    prViolations.push(
+                      'External-review PR merged with a Codex bot review on HEAD that did not clear (no COMMENTED state on HEAD, or unresolved P0/P1 inline findings); see #249'
+                    );
+                  }
+                }
+
+                // Dependabot PRs use a strictly narrower rule: only
+                // an APPROVED review from a CLI reviewer identity
+                // counts. Codex doesn't review Dependabot PRs in
+                // the Phase 4a flow, so this is just defensive
+                // against future weirdness — and reuses the
+                // cliApprovedReviews array computed above.
+                //
+                // See the dual-violation note above: a Dependabot PR
+                // also carrying `needs-external-review` will trip
+                // both pushes on the same iteration. By design — the
+                // two pushes report independent policy conditions.
+                // #2874: a Dependabot-only approver counts only when the
+                // merged PR passes the same commit-provenance rule as the
+                // gate's Dependabot arm (scripts/lib/dependabot-commit-
+                // provenance.sh): every listed commit authored by
+                // dependabot[bot], committed by web-flow or dependabot[bot]
+                // and signature-verified, the head among them, under the
+                // endpoint's 250-commit ceiling. Opened-by-Dependabot alone
+                // is not proof. An unreadable list fails closed.
+                let dependabotLaneVerified = false;
+                const hasDependabotOnlyApproval = dependabotNeedsApproval &&
+                  reviews.some(r => r.state === 'APPROVED' &&
+                                    dependabotReviewerAccounts.includes(r.user.login));
+                if (hasDependabotOnlyApproval) {
+                  try {
+                    const prCommits = await auditPaginate(
+                      github.rest.pulls.listCommits,
+                      {
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        pull_number: pr.number,
+                        per_page: 100,
+                      }
+                    );
+                    const mergedHead = pr.head && pr.head.sha;
+                    dependabotLaneVerified =
+                      prCommits.length > 0 && prCommits.length < 250 &&
+                      prCommits.some(c => c.sha === mergedHead) &&
+                      prCommits.every(c =>
+                        c.author && c.author.login === 'dependabot[bot]' &&
+                        c.committer && ['web-flow', 'dependabot[bot]'].includes(c.committer.login) &&
+                        c.commit && c.commit.verification && c.commit.verification.verified === true);
+                  } catch (e) {
+                    if (e && e.code === 'AUDIT_DEADLINE') throw e;
+                    console.log(
+                      `WARNING: could not read commits for PR #${pr.number}; ` +
+                      `not counting Dependabot-only approvers for safety. Error: ${e.message}`
+                    );
+                  }
+                }
+                const dependabotApprovedReviews = reviews.filter(
+                  r => r.state === 'APPROVED' &&
+                       (reviewerAccounts.includes(r.user.login) ||
+                        (dependabotLaneVerified &&
+                         dependabotReviewerAccounts.includes(r.user.login)))
+                );
+                if (dependabotNeedsApproval && dependabotApprovedReviews.length === 0) {
+                  prViolations.push(
+                    'Dependabot PR merged with no reviewer identity approval (auto-merge approval missing or removed)'
+                  );
+                }
+              }
+
+              // Check 3: Self-approval from bot accounts
+              // Under the shared identity model, all PRs are authored by
+              // authorIdentity (nathanjohnpayne). The human IS that identity,
+              // so nathanjohnpayne approving is legitimate (human tiebreaker).
+              // Only flag if a reviewer bot account approved its own PR.
+              // Reuses the `reviews` array fetched at the top of this
+              // PR's iteration.
+              const botSelfApproval = reviews.some(
+                r => r.user.login === pr.user.login &&
+                     r.state === 'APPROVED' &&
+                     reviewerAccounts.includes(r.user.login)
+              );
+
+              if (botSelfApproval) {
+                prViolations.push('Bot self-approval detected (reviewer account approved its own PR)');
+              }
+
+              // Check 4: Had needs-human-review label — verify it was removed before merge.
+              // Under the shared identity model, nathanjohnpayne is the PR author
+              // and cannot self-approve via the GitHub review API. The human
+              // resolves escalation by removing the label (which unblocks the
+              // label-gate check). If the label is still present at merge time,
+              // it means the label gate was bypassed.
+              const hadHumanLabel = await labelWasPresentAtMerge(
+                pr,
+                'needs-human-review'
+              );
+
+              if (hadHumanLabel) {
+                prViolations.push(
+                  'Merged with `needs-human-review` label still present — human resolution was bypassed'
+                );
+              }
+
+              // Check 5: Had policy-violation label — should not have been merged
+              const hadPolicyViolation = await labelWasPresentAtMerge(
+                pr,
+                'policy-violation'
+              );
+
+              if (hadPolicyViolation) {
+                prViolations.push(
+                  'Merged with `policy-violation` label still present'
+                );
+              }
+
+              // Check 6: Had human-hold label — should not have been merged.
+              const hadHumanHold = await labelWasPresentAtMerge(
+                pr,
+                'human-hold'
+              );
+
+              if (hadHumanHold) {
+                prViolations.push(
+                  'Merged with `human-hold` label still present — human hard hold was bypassed'
+                );
+              }
+
+              // Read scoped author records from the same durable PR history
+              // the operator wrote before merging. These are recorded owner
+              // instructions, not independent proof of the original chat.
+              let recordedOverride = null;
+              if (!hadHumanHold && !hadPolicyViolation) {
+                try {
+                  const comments = await auditPaginate(github.rest.issues.listComments, {
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    issue_number: pr.number, per_page: 100,
+                  });
+                  if (comments.some(comment => comment.user?.login === authorIdentity &&
+                      (comment.body || '').startsWith('<!-- mergepath-owner-admin-override:v1 -->'))) {
+                    const { execFileSync } = require('child_process');
+                    const overrideReviews = await auditPaginate(github.rest.pulls.listReviews, {
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      pull_number: pr.number, per_page: 100,
+                    });
+                    const overrideInline = await auditPaginate(github.rest.pulls.listReviewComments, {
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      pull_number: pr.number, per_page: 100,
+                    });
+                    const result = JSON.parse(execFileSync('python3', ['scripts/workflow/owner-admin-override.py', 'audit'], {
+                      input: JSON.stringify({pr, author: authorIdentity, codex_bot_login: codexBotLogin, comments, reviews: overrideReviews, inline_comments: overrideInline, needs_human_review_at_merge: hadHumanLabel, hard_hold_at_merge: hadHumanHold || hadPolicyViolation}), encoding: 'utf8', timeout: auditTimeout(35000), killSignal: 'SIGKILL',
+                    }));
+                    if (result.recorded_override) recordedOverride = result;
+                  }
+                } catch (e) {
+                  if (e?.code === 'ETIMEDOUT' || e?.code === 'AUDIT_DEADLINE') throw e;
+                  core.warning(`Owner override record unreadable for #${pr.number}: ${e.message}`);
+                }
+              }
+              requireAuditTime();
+              if (recordedOverride) {
+                recordedOverrides.push({number: pr.number, issues: prViolations, record: recordedOverride});
+              } else if (prViolations.length > 0) {
+                violations.push({
+                  number: pr.number,
+                  title: pr.title,
+                  author: pr.user.login,
+                  issues: prViolations,
+                });
+              }
+              auditedPRCount += 1;
+            }
+
+            for (const [index, pr] of mergedPRs.entries()) {
+              if (auditExpired || auditRemainingMs() <= 0) {
+                unauditedPRs = mergedPRs.slice(index);
+                break;
+              }
+              try {
+                await auditOnePR(pr);
+              } catch (error) {
+                auditErrors.push({number: pr.number, title: pr.title, author: pr.user.login,
+                  issues: [`PR audit infrastructure failure (${error.code || error.name}): ${error.message}`]});
+              }
+            }
+
+            const incomplete = Boolean(discoveryError) || parserErrors.length > 0 || auditErrors.length > 0 || unauditedPRs.length > 0;
+            reportDeadlineMs = Math.min(AUDIT_DEADLINE_MS, Date.now() + AUDIT_REPORT_RESERVE_MS);
+            if (violations.length > 0 || recordedOverrides.length > 0 || incomplete) {
+              let body = `## PR Review Policy Violations\n\n`;
+              body += `**Audit period:** ${sinceISO.split('T')[0]} to ${today}\n`;
+              body += `**Violations found:** ${violations.length}\n\n`;
+              body += `**Audit coverage:** ${incomplete ? 'incomplete' : 'complete'} (${auditedPRCount}/${discoveryError ? 'unknown total' : mergedPRs.length} PRs audited)\n`;
+              body += `**Parser infrastructure errors:** ${parserErrors.length}\n\n`;
+              body += `### Details\n\n`;
+
+              for (const v of violations) {
+                body += `- **#${v.number}** — ${v.title} (by ${v.author})\n`;
+                for (const issue of v.issues) {
+                  body += `  - ${issue}\n`;
+                }
+              }
+
+              if (discoveryError) body += `\n### PR discovery incomplete\n\n${discoveryError}\n`;
+              if (auditErrors.length > 0) {
+                body += `\n### Audit infrastructure errors\n\n`;
+                for (const error of auditErrors) {
+                  body += `- **#${error.number}** — ${error.title} (by ${error.author})\n`;
+                  for (const issue of error.issues) body += `  - ${issue}\n`;
+                }
+              }
+              if (parserErrors.length > 0) {
+                body += `\n### Parser infrastructure errors\n\n`;
+                for (const error of parserErrors) {
+                  body += `- **#${error.number}** — ${error.title} (by ${error.author})\n`;
+                  for (const issue of error.issues) body += `  - ${issue}\n`;
+                }
+              }
+              if (unauditedPRs.length > 0) {
+                body += `\n### Unaudited PRs — audit time budget exhausted\n\n`;
+                for (const pr of unauditedPRs) {
+                  body += `- **#${pr.number}** — ${pr.title} (by ${pr.user.login})\n`;
+                }
+              }
+
+              if (recordedOverrides.length > 0) {
+                body += `\n### Recorded owner overrides\n\n`;
+                for (const override of recordedOverrides) {
+                  body += `- **#${override.number}** — [authorization record](${override.record.comment_url}) for \`${override.record.record.head_sha}\` at ${override.record.record.authorized_at}\n`;
+                  for (const issue of override.issues) body += `  - Overridden: ${issue}\n`;
+                  for (const gate of override.record.record.observed_red_gates) body += `  - Recorded non-green gate: ${JSON.stringify(gate)}\n`;
+                }
+              }
+
+              body += `\n---\n\n`;
+              if (violations.length > 0) {
+                body += `Per REVIEW_POLICY.md, the unexplained violations above require human review within one business day.\n\n`;
+              }
+              body += `cc @nathanjohnpayne`;
+
+              // Preserve the entire report before its issue write. Base64 chunks keep
+              // untrusted titles from becoming runner commands and round-trip UTF-8.
+              const encodedReport = Buffer.from(body, 'utf8').toString('base64');
+              const chunks = encodedReport.match(/.{1,4096}/g) || [''];
+              chunks.forEach((chunk, index) => console.log(`PR_AUDIT_REPORT_BASE64 ${index + 1}/${chunks.length} ${chunk}`));
+              try {
+                if (core.summary) await boundedAuditCall(() => core.summary.addRaw(body).write(), true);
+              } catch (error) {
+                core.warning(`Job-summary publication failed; encoded report retained in the log: ${error.message}`);
+              }
+              try {
+                await boundedAuditCall(signal => github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `Weekly PR Audit — ${today}`,
+                  body,
+                  labels: ['audit'],
+                  request: {signal},
+                }), true);
+                console.log(`Created audit issue with ${violations.length} violations.`);
+              } catch (error) {
+                reportPublicationError = `Audit issue publication failed; report retained in summary/log (${error.code || error.name}).`;
+              }
+            } else {
+              console.log('No policy violations found for the past 7 days.');
+            }
+            const failureReasons = [];
+            if (incomplete) {
+              failureReasons.push(`PR audit incomplete: ${parserErrors.length} parser timeouts; ${auditErrors.length} audit errors; ${unauditedPRs.length} PRs unaudited; discovery ${discoveryError ? 'incomplete' : 'complete'}.`);
+            }
+            if (reportPublicationError) failureReasons.push(reportPublicationError);
+            if (failureReasons.length > 0) core.setFailed(failureReasons.join(' '));

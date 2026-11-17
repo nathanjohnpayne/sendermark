@@ -1,0 +1,28 @@
+# Code Review Requirements
+
+All AI-generated code must undergo peer review before merge. Follow the code review workflow in REVIEW_POLICY.md. Use .github/review-policy.yml for thresholds and protected paths.
+
+## Self-Review (Required for Every PR)
+
+Before opening or updating a pull request, perform a structured self-review and include it in the PR description under a `## Self-Review` heading covering:
+
+- Correctness against the stated requirements or ticket
+- Regression risk---does this change break existing behavior?
+- Style and convention adherence per this repository's standards
+- Test coverage---are new paths tested and existing tests still passing?
+- Security and dependency hygiene
+
+## Review Workflow
+
+- All code is authored and committed as `nathanjohnpayne`.
+- Review under your agent's reviewer identity (e.g., `nathanpayne-claude`).
+- Only `nathanjohnpayne` merges to the target branch.
+- Never approve your own PR. Self-approvals are automatically dismissed.
+- Never remove `needs-external-review`, `needs-human-review`, `policy-violation`, or `human-hold` labels. Agents may add `human-hold` to freeze a PR.
+- Before merge, verify there are zero unresolved GitHub review conversations per REVIEW_POLICY.md.
+- When external review is required, post a handoff message as described in REVIEW_POLICY.md.
+- See REVIEW_POLICY.md for the complete workflow, handoff format, and post-merge issue rules.
+
+## CodeRabbit Review
+
+Phase 2.5 (CodeRabbit) runs only when `scripts/coderabbit-should-invoke.sh <PR#>` exits 0 (#1084). `coderabbit.enabled: true` is necessary but not sufficient — the `coderabbit.invoke` mode (`always` / `complex-changes` / `never`) decides whether this PR gets the Phase 2.5 pass, and the decider resolves every ambiguous configuration to invoke. Run it rather than reading `enabled` directly. Exit 1 means skip Phase 2.5 and proceed. When it exits 0, CodeRabbit provides automated review (Phase 2.5): do not wait for it before Phase 3 unless the decider reports `wait: true` (`coderabbit.wait_for_review`, default `false`, #2166), address its comments as they arrive, and before merge confirm CodeRabbit has reported on the merge head with `scripts/coderabbit-wait.sh <PR#>`, because the required severity gate reads green until CodeRabbit publishes. CodeRabbit is advisory via CI, but unresolved GitHub review conversations still block merge until cleared under REVIEW_POLICY.md.

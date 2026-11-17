@@ -1,0 +1,114 @@
+# .repo-template.yml
+#
+# Per-repo overrides for CI lint scripts under scripts/ci/. Read by:
+#   - scripts/ci/check_spec_test_alignment
+#
+# Keep this file small and only add entries when the default conventions
+# (filename match of test against spec basename) don't cover the case.
+
+# Map each spec_id (frontmatter or basename) to one or more test files.
+# Used by check_spec_test_alignment when the default filename search
+# wouldn't find the test.
+spec_test_map:
+  branch_requirements: tests/test_branch_requirements.sh
+  git_identity_hygiene: tests/test_git_identity_hygiene.sh
+  approval_triage:
+    - tests/test_self_approval_detector.sh
+  daily_feedback_rollup_workflow: tests/test_465_fail_closed.sh
+  yq_bootstrap:
+    - tests/test_resolve_pr_threads_verified_propagation.sh
+  coderabbit_config:
+    - tests/test_check_coderabbit_config.sh
+  merge_review_disagreement:
+    - tests/test_gh_pr_guard.sh
+  bootstrap_git_execution:
+    - tests/test_gh_as_author.sh
+  load_review_config: tests/test_load_review_config.sh
+  owner_admin_override: tests/test_owner_admin_override.py
+  stalled_pr_resume: tests/test_stalled_pr_resume.sh
+  author_merge_token:
+    - tests/test_author_merge_token.sh
+    - tests/test_approval_merge_continuation.sh
+  cockpit_sync:
+    - tests/test_cockpit_sync.py
+    - tests/test_cockpit_sync_ui.cjs
+    - tests/test_cockpit.py
+  cockpit_fleet:
+    - tests/test_cockpit_fleet.py
+    - tests/test_cockpit_fleet_ui.cjs
+  cockpit_live_agents:
+    - tests/test_cockpit_live_agents.py
+    - tests/test_cockpit_live_agents_ui.cjs
+  cockpit_agents:
+    - tests/test_cockpit_agents.py
+    - tests/test_cockpit_agents_ui.cjs
+  cockpit_actions:
+    - tests/test_cockpit_actions.py
+    - tests/test_cockpit_actions_ui.cjs
+  cockpit_ci:
+    - tests/test_cockpit_ci.py
+    - tests/test_cockpit_ci_ui.cjs
+    - tests/test_cockpit_logs.py
+  cockpit_prs:
+    - tests/test_cockpit_prs.py
+    - tests/test_cockpit_prs_ui.cjs
+  sync_audit_json: tests/test_sync_audit_json.sh
+  phase_4b_immutable_input: tests/test_phase_4b_immutable_input.sh
+  phase_4b_round_cap: tests/test_phase_4b_round_cap.sh
+  phase_4b_escalation:
+    - tests/test_phase_4b_escalation.cjs
+    - tests/test_phase_4b_automation.sh
+  phase_4b_heartbeat:
+    - tests/test_phase_4b_heartbeat.sh
+    - tests/test_phase_4b_accounting.sh
+  cockpit:
+    - tests/test_cockpit.sh
+  pr_body_contract:
+    - tests/test_pr_body_contract_parity.sh
+    - tests/test_pr_body_workflow_bounds.py
+  codex_request_evidence:
+    - tests/test_codex_request_evidence.sh
+    - tests/test_codex_verdict_anchor_resolution.py
+  codex_review_ledger: tests/test_codex_review_ledger.sh
+  codex_usage_limit_marker: tests/test_codex_usage_limit_marker.sh
+  coderabbit_phase_25_invocation:
+    - tests/test_coderabbit_should_invoke.sh
+  coderabbit_review_sensing:
+    - tests/test_coderabbit_wait_status_probe.sh
+    - tests/test_phase_4b_automation.sh
+    # The waiter's freshness-rung and response-shape criteria (#967/#968/#985)
+    # are asserted here rather than in the probe suite.
+    - tests/test_coderabbit_wait_statuscontext_ratelimit.sh
+  review_feedback_accounting:
+    - tests/test_review_feedback_accounting.sh
+    - tests/test_marker_provenance.py
+  # NOTE - avoid a colon followed by a space anywhere in a comment inside this
+  # block. check_spec_test_alignment parses it line by line and treats any
+  # line containing one as a key, silently rebinding the current spec and
+  # attaching the entries below it to the wrong name. A mapping written with
+  # such a comment reads correctly and does not work.
+  worktree_cleanup_audit:
+    # Covered by the helper's own suite rather than a spec-named file. The
+    # cases that assert the exit contract (unreadable and unwritable snapshot
+    # paths, the eligibility short-circuit, the cause-specific remedy) are
+    # inseparable from the classification fixtures they run against, so a
+    # separate file would duplicate the whole fixture repo.
+    - tests/test_worktree_cleanup.sh
+  doc_ownership_validation:
+    - tests/test_check_doc_ownership.sh
+  repo_lint_execution:
+    - tests/test_repo_lint_optimization.sh
+    - tests/test_655_repo_lint_local_observed.sh
+  merge_group_required_checks:
+    - scripts/ci/check_merge_group_required_checks
+  # The publisher's fence and fixtures live in the merge-clearance suite
+  # (Test 25) rather than a file of their own: a new tests/ file wired into
+  # a propagated scripts/ci/check_* needs its own manifest requires: entry,
+  # which grows the diff for bookkeeping rather than content. The default
+  # filename search cannot find it, hence this entry (#845).
+  required_check_publisher:
+    - tests/test_merge_clearance_gate.sh
+# Glob patterns that identify test files. Supplements the default
+# ("tests/**/*.test.*") which doesn't cover shell-based tests.
+test_globs:
+  - "tests/**"

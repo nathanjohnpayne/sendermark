@@ -1,0 +1,890 @@
+#!/usr/bin/env bash
+# tests/test_codex_review_check_verdict.sh
+#
+# Regression coverage for the HEAD-anchored Codex issue-comment verdict
+# clearance path in scripts/codex-review-check.sh (#600 / #567).
+#
+# Codex posts its review verdict as a PR ISSUE COMMENT
+# (issues/{pr}/comments) — "Codex Review: Didn't find any major issues.
+# <quip>" + a "Reviewed commit: <sha>" line — NOT always a review object,
+# and its 👍 reaction expires after reaction_freshness_window_seconds. So a
+# genuinely-clean Codex clearance can exist ONLY as that comment. #600
+# extends gate (b) branch 2 and gate (c) to honor it, fail-closed.
+#
+# The full gate (c) runs the entire codex-review-check flow (CI + gate (b) +
+# issue comments + reactions + reviewThreads), which needs network; this
+# test pins (1) the structural presence of the verdict signal + both gate
+# hooks in the real script, and (2) the verdict-matching jq logic inline —
+# the same inline-literal pattern test_codex_review_check_resolution.sh uses.
+# KEEP THE INLINE FILTER BELOW IN SYNC with the CODEX_HEAD_VERDICT_TIME
+# filter in scripts/codex-review-check.sh.
+#
+# Bash 3.2 portable. Runs without network.
+
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT="$ROOT/scripts/codex-review-check.sh"
+[ -r "$SCRIPT" ] || { echo "missing $SCRIPT" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available" >&2; exit 0; }
+
+PASS=0; FAIL=0
+pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+# ── #1157: mutable Codex Review Summary issue comment ---------------------
+#
+# The connector now creates one marker-tagged summary comment while a review
+# is Running, then edits that same comment to Completed. The Code Review row
+# carries an abbreviated commit, so diagnostic mode can use Completed as
+# exact-head completion evidence even when a clean pass produced no review
+# object and no legacy `Reviewed commit:` verdict. Running is liveness only.
+SUMMARY_SELECTOR=$(sed -n \
+  '/^# BEGIN codex_review_summary_selector$/,/^# END codex_review_summary_selector$/p' \
+  "$SCRIPT")
+# #1550: the row grammar lives in scripts/lib/codex-request-evidence.sh so the
+# requester's resume check reads it too. The gate keeps a delegating
+# crc_select_codex_review_summary; assert the composition the gate runs.
+EVIDENCE_LIB="$(dirname "$SCRIPT")/lib/codex-request-evidence.sh"
+if [ -n "$SUMMARY_SELECTOR" ] \
+   && grep -q '^crc_select_codex_review_summary()' <<<"$SUMMARY_SELECTOR" \
+   && grep -q 'crqe_select_codex_review_summary' <<<"$SUMMARY_SELECTOR" \
+   && [ -r "$EVIDENCE_LIB" ] \
+   && grep -q 'codex-pull-request-review-summary' "$EVIDENCE_LIB" \
+   && grep -q 'updated_at' "$EVIDENCE_LIB"; then
+  # shellcheck source=../scripts/lib/codex-request-evidence.sh
+  . "$EVIDENCE_LIB"
+  eval "$SUMMARY_SELECTOR"
+  pass "#1157: codex-review-check.sh exposes the marker-scoped mutable summary selector (shared lib, #1550)"
+else
+  fail "#1157: codex-review-check.sh is missing the marker-scoped mutable summary selector"
+fi
+
+# Without the lib the gate fails closed (exit 3) instead of reporting "no
+# summary": in diagnostic mode a newer Running summary is what keeps a stale
+# same-head review from clearing (#1157), so a silent null could clear it.
+missing_lib_rc=0
+missing_lib_out=$(env -u BASH_ENV bash -c '
+  __CODEX_CHECK_DIR=/nonexistent
+  eval "$1"
+  crc_select_codex_review_summary "$2" "chatgpt-codex-connector[bot]" d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708
+  echo reached-after-selector
+' _ "$SUMMARY_SELECTOR" '[{"user":{"login":"chatgpt-codex-connector[bot]"},"body":"<!-- codex-pull-request-review-summary -->","id":1}]' 2>/dev/null) || missing_lib_rc=$?
+if [ "$missing_lib_rc" = 3 ] && [ -z "$missing_lib_out" ]; then
+  pass "#1550: crc_select_codex_review_summary fails closed (exit 3) when the shared lib is absent"
+else
+  fail "#1550: crc_select_codex_review_summary without the shared lib returned rc=$missing_lib_rc output='$missing_lib_out', expected exit 3 and no output"
+fi
+
+SUMMARY_BOT="chatgpt-codex-connector[bot]"
+SUMMARY_HEAD="d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"
+
+summary_body() { # status commit trigger
+  printf '<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| 📝 **Code Review** | %s | `%s` | %s |\n\n<details><summary>ℹ️ About Codex in GitHub</summary></details>' "$1" "$2" "$3"
+}
+
+mk_summary() { # login body created updated id
+  jq -n --arg login "$1" --arg body "$2" --arg created "$3" --arg updated "$4" --argjson id "$5" \
+    '[{user:{login:$login},body:$body,created_at:$created,updated_at:$updated,id:$id}]'
+}
+
+run_summary() {
+  crc_select_codex_review_summary "$1" "$SUMMARY_BOT" "$SUMMARY_HEAD"
+}
+
+if declare -F crc_select_codex_review_summary >/dev/null 2>&1; then
+  SUMMARY_COMPLETED=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '✅ **Completed** <relative-time datetime="2026-08-30T07:19:37Z">now</relative-time>' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 101)
+  GOT=$(run_summary "$SUMMARY_COMPLETED")
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at,.trigger] | @tsv')" = $'completed\td05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708\t2026-08-30T07:19:41Z\tManual request' ]; then
+    pass "#1157 summary: exact-head Completed uses edited updated_at as terminal time"
+  else
+    fail "#1157 summary: exact-head Completed parse mismatch: $GOT"
+  fi
+
+  SUMMARY_RUNNING=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:17:18Z" 102)
+  GOT=$(run_summary "$SUMMARY_RUNNING")
+  if [ "$(echo "$GOT" | jq -r '[.status,.commit,.observed_at] | @tsv')" = $'running\td05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708\t2026-08-30T07:17:18Z' ]; then
+    pass "#1157 summary: exact-head Running is represented distinctly from Completed"
+  else
+    fail "#1157 summary: exact-head Running parse mismatch: $GOT"
+  fi
+
+  STALE=$(mk_summary "$SUMMARY_BOT" \
+    "$(summary_body '✅ **Completed** now' aaaa1111 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 103)
+  if [ "$(run_summary "$STALE")" = "null" ]; then
+    pass "#1157 summary: stale commit prefix is rejected"
+  else
+    fail "#1157 summary: stale commit prefix was accepted"
+  fi
+
+  WRONG_AUTHOR=$(mk_summary "nathanjohnpayne" \
+    "$(summary_body '✅ **Completed** now' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 104)
+  if [ "$(run_summary "$WRONG_AUTHOR")" = "null" ]; then
+    pass "#1157 summary: a human-authored lookalike is rejected"
+  else
+    fail "#1157 summary: a human-authored lookalike was accepted"
+  fi
+
+  NO_MARKER_BODY=$(summary_body '✅ **Completed** now' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request' | sed '1d')
+  NO_MARKER=$(mk_summary "$SUMMARY_BOT" "$NO_MARKER_BODY" \
+    "2026-08-30T07:16:18Z" "2026-08-30T07:19:41Z" 105)
+  if [ "$(run_summary "$NO_MARKER")" = "null" ]; then
+    pass "#1157 summary: an unmarked bot table is rejected"
+  else
+    fail "#1157 summary: an unmarked bot table was accepted"
+  fi
+
+  TWO=$(jq -n --arg bot "$SUMMARY_BOT" --arg old "$(summary_body '✅ **Completed** now' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'PR opened')" --arg new "$(summary_body '🔄 **Running** since 1 minute ago' d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708 'Manual request')" '[
+    {user:{login:$bot},body:$old,created_at:"2026-08-30T07:00:00Z",updated_at:"2026-08-30T07:05:00Z",id:106},
+    {user:{login:$bot},body:$new,created_at:"2026-08-30T07:10:00Z",updated_at:"2026-08-30T07:11:00Z",id:107}
+  ]')
+  GOT=$(run_summary "$TWO")
+  if [ "$(echo "$GOT" | jq -r '[.status,.comment_id] | @tsv')" = $'running\t107' ]; then
+    pass "#1157 summary: newest exact-head edited comment wins"
+  else
+    fail "#1157 summary: newest exact-head edited comment did not win: $GOT"
+  fi
+fi
+
+if grep -q 'LATEST_SIGNAL_KIND="summary"' "$SCRIPT" \
+   && grep -q '\[ -n "\$CODEX_SUMMARY_STATUS" \]' "$SCRIPT" \
+   && grep -q 'if \[ "\$CODEX_SUMMARY_STATUS" = "completed" \]; then' "$SCRIPT" \
+   && grep -q 'head-anchored Completed Codex review summary' "$SCRIPT" \
+   && grep -q 'Codex review summary is Running on current HEAD' "$SCRIPT"; then
+  pass "#1157: latest summary state participates in diagnostic ordering; Completed clears and Running does not"
+else
+  fail "#1157: diagnostic gate does not order both summary states or distinguish Completed from Running"
+fi
+
+# ── 1. Structural: the shared verdict signal is computed from issue
+#      comments, gated on codex.enabled, HEAD-anchored + affirmative-matched,
+#      and referenced to #600.
+if grep -q "CODEX_HEAD_VERDICT_TIME" "$SCRIPT" \
+   && grep -q 'issues/\$PR_NUMBER/comments' "$SCRIPT" \
+   && grep -qi "didn.?t find any major issues" "$SCRIPT" \
+   && grep -Fq "reviewed commit[^0-9a-z_" "$SCRIPT" \
+   && grep -Fq '$shas | all(. == $head)' "$SCRIPT" \
+   && grep -q "#600" "$SCRIPT"; then
+  pass "codex-review-check.sh computes the HEAD-anchored affirmative issue-comment verdict signal (#600)"
+else
+  fail "codex-review-check.sh is missing the verdict signal (CODEX_HEAD_VERDICT_TIME / issue-comments fetch / affirmative regex / reviewed-commit scan / exact anchor / #600)"
+fi
+
+# ── 1b. Structural (#705): same-content carry-forward is present, is routed
+#       through the trusted workflow helper, and is only added as a fallback
+#       when no current-head Codex signal exists.
+if grep -q "CODEX_CARRYFORWARD_VERDICT_TIME" "$SCRIPT" \
+   && grep -q "external_review_carryforward.sh" "$SCRIPT" \
+   && grep -q 'LATEST_SIGNAL_KIND="carry_verdict"' "$SCRIPT" \
+   && grep -q "#705" "$SCRIPT"; then
+  pass "codex-review-check.sh carries forward prior clean Codex verdicts for unchanged external-review fingerprints (#705)"
+else
+  fail "codex-review-check.sh is missing same-content Codex verdict carry-forward (#705)"
+fi
+
+# ── 2. Structural: gate (b) branch 2 accepts the verdict comment as a
+#      same-agent cross-review signal (elif after the 👍 branch).
+if grep -q 'elif \[ -n "\$CODEX_HEAD_VERDICT_TIME" \]; then' "$SCRIPT" \
+   && grep -q "branch 2: same-agent + Codex verdict comment" "$SCRIPT"; then
+  pass "gate (b) branch 2 accepts the HEAD-anchored verdict comment (#600)"
+else
+  fail "gate (b) branch 2 does not accept the verdict comment"
+fi
+
+# ── 3. Structural: gate (c) folds the verdict into a UNIFIED latest-signal-wins
+#      decision (not a fallback after CLEARED), and the verdict path clears ONLY
+#      when the latest verdict is affirmative AND there are zero unaddressed
+#      P0/P1 — a non-affirmative latest verdict fails closed (#608 P1).
+if grep -q "LATEST_SIGNAL_KIND" "$SCRIPT" \
+   && grep -Eq 'if \[ -n "\$CODEX_HEAD_VERDICT_TIME" \] && \[ "\$UNADDRESSED_COUNT" -eq 0 \]; then' "$SCRIPT" \
+   && grep -q "fail closed, does not clear (#608 P1)" "$SCRIPT"; then
+  pass "gate (c) folds the verdict into latest-signal-wins; a non-affirmative latest verdict fails closed (#608 P1)"
+else
+  fail "gate (c) is missing the unified latest-signal-wins decision or the verdict fail-closed branch"
+fi
+
+# ── 3b. Structural (#608): latest-verdict-first (a newer non-affirmative
+#      verdict supersedes an older clean one), and the latest verdict timestamp
+#      (any disposition) is carried into the Phase 4b substitute freshness guard.
+if grep -q "CODEX_HEAD_VERDICT_ANY_TIME" "$SCRIPT" \
+   && grep -q "max_by(.created_at)" "$SCRIPT" \
+   && grep -qF '(?im)^' "$SCRIPT" \
+   && grep -qi "codex review:" "$SCRIPT" \
+   && grep -q "#608" "$SCRIPT"; then
+  pass "codex-review-check.sh selects latest verdict first, anchors the affirmative match to the Codex verdict header, and folds the any-verdict timestamp into the Phase 4b guard (#608 P1/P2/CR-Major)"
+else
+  fail "codex-review-check.sh is missing the latest-verdict-first restructure (max_by / CODEX_HEAD_VERDICT_ANY_TIME / #608)"
+fi
+
+# ── 3c. Structural (#727, Codex P2 on #729): the CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE
+#      env var overrides the policy value, taking precedence over
+#      `codex_field allow_phase_4b_substitute bool`. The post-clearance fast-path
+#      probe sets it to false so gate (c) requires an ACTUAL Codex bot signal and
+#      is NOT satisfied by the same reviewer APPROVED that clears gate (b) — the
+#      env override must win, else a bare under-threshold approval would arm the
+#      shortened CodeRabbit wait and reopen the pre-review merge race.
+if grep -Eq 'ALLOW_PHASE_4B_SUBSTITUTE=\$\{CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE:-\$\(codex_field allow_phase_4b_substitute bool\)\} \|\| exit 3$' "$SCRIPT"; then
+  pass "gate (c) honors the CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE env override, precedence over policy (#727 fast-path probe requires an actual Codex signal)"
+else
+  fail "codex-review-check.sh does not let CODEX_REVIEW_CHECK_ALLOW_PHASE_4B_SUBSTITUTE override the policy value (#727)"
+fi
+
+# ── 3d. Structural (#1062): the completed-workflow continuation can reuse
+#      gates (a) and (b) without imposing gate (c) on an under-threshold PR.
+#      The mode is an explicit non-inheritable flag, requires a real registered
+#      APPROVED review (no same-agent exclusion and no Codex branch-2
+#      substitution), and returns before gate (c).
+if grep -q -- '--approval-readiness-only' "$SCRIPT" \
+   && grep -q 'APPROVAL_READINESS_ONLY=1' "$SCRIPT" \
+   && grep -q 'GATE_B_SAME_AGENT_REVIEWER=""' "$SCRIPT" \
+   && grep -q 'CURRENT_RUN_ID="\$GITHUB_RUN_ID"' "$SCRIPT" \
+   && grep -q 'external clearance intentionally delegated to the threshold-aware merge-clearance gate' "$SCRIPT"; then
+  pass "approval-readiness mode reuses current-head CI/annex plus registered approval without imposing Phase 4 or self-deadlocking (#1062)"
+else
+  fail "approval-readiness mode is missing its explicit flag, reviewer semantics, self-run guard, or pre-gate-(c) return (#1062)"
+fi
+
+# ── 4. Inline logic: the verdict-matching jq filter. KEEP IN SYNC with
+#      scripts/codex-review-check.sh CODEX_VERDICT_JSON. The filter selects the
+#      LATEST HEAD-anchored verdict FIRST (any disposition), then requires that
+#      latest verdict to be affirmative — so a newer NON-affirmative verdict on
+#      the same HEAD supersedes an older clean one and fails closed (Codex P1 on
+#      #608). VERDICT_FILTER returns the affirmative-gated clearance timestamp
+#      (CODEX_HEAD_VERDICT_TIME); ANY_FILTER returns the latest verdict
+#      timestamp regardless of disposition (CODEX_HEAD_VERDICT_ANY_TIME, used by
+#      the Phase 4b freshness guard).
+BOT="chatgpt-codex-connector[bot]"
+HEAD="d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"
+LATEST_HEAD_VERDICT=$(python3 - "$SCRIPT" <<'SELECTOR'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+start = source.index('  CODEX_VERDICT_JSON=$(echo ')
+marker = '--arg bot "$BOT_LOGIN" --arg sha "$HEAD_SHA" ' + chr(39)
+start = source.index(marker, start) + len(marker)
+end = source.index("\n  ')", start)
+print(source[start:end])
+SELECTOR
+)
+VERDICT_FILTER="$LATEST_HEAD_VERDICT"'
+    | if . == null then "" elif .affirmative then .created_at else "" end'
+ANY_FILTER="$LATEST_HEAD_VERDICT"'
+    | if . == null then "" else .created_at end'
+
+# fixture builder — guarantees valid JSON encoding (real newlines, apostrophes)
+mk() { jq -n --arg login "$1" --arg body "$2" --arg t "$3" \
+  '[{user:{login:$login},body:$body,created_at:$t}]'; }
+run_verdict() { printf '%s' "$1" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$VERDICT_FILTER"; }
+
+check_case() { # desc expected fixture
+  local desc="$1" expected="$2" fixture="$3" got
+  got="$(run_verdict "$fixture")"
+  if [ "$got" = "$expected" ]; then
+    pass "verdict filter: $desc"
+  else
+    fail "verdict filter: $desc — expected '$expected', got '$got'"
+  fi
+}
+
+# A negative response cannot disappear merely because its head is unknown.
+for negative in 'Codex Review: Found issues.' 'Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Reviewed commit: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+'; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "$negative" "2026-07-01T12:00:00Z"))"
+  check_case "newer missing or conflicting foreign anchors supersede older clearance" "" "$history"
+  observed="$(printf '%s' "$history" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER")"
+  if [ "$observed" = "2026-07-01T12:00:00Z" ]; then pass "ambiguous foreign response raises freshness floor";
+  else fail "ambiguous foreign response lost from freshness floor: $observed"; fi
+done
+
+# Every Reviewed commit field participates, including malformed values.
+for bad_anchor in "${HEAD:0:6}" zzzzzz '@@' ''; do
+  check_case "mixed full HEAD and malformed anchor refuses ($bad_anchor)" "" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD
+Reviewed commit: $bad_anchor" "2026-07-03T10:00:00Z")"
+done
+
+
+# Preserve an ambiguous newer negative response in both clearance and freshness.
+for anchor in "${HEAD:0:10}" '' "${HEAD}.junk" "${HEAD}
+Reviewed commit: @@"; do
+  history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: $anchor" "2026-07-01T12:00:00Z"))"
+  check_case "newer malformed negative supersedes older exact clean ($anchor)" "" "$history"
+  observed="$(printf '%s' "$history" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER")"
+  if [ "$observed" = "2026-07-01T12:00:00Z" ]; then
+    pass "newer malformed negative raises freshness floor ($anchor)"
+  else
+    fail "newer malformed negative lost from freshness ordering ($anchor): $observed"
+  fi
+done
+history="$(jq -s 'add' <(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T10:00:00Z") <(mk "$BOT" "Codex Review: Found issues.
+Reviewed commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "2026-07-01T12:00:00Z"))"
+check_case "valid negative on another full head does not demote this head" "2026-07-01T10:00:00Z" "$history"
+
+# #1752: two full object IDs sharing seven characters must not borrow
+# the same short verdict. Every abbreviation and overlong token refuses.
+for n in 6 7 8 12 20 39; do
+  check_case "abbreviated Reviewed commit ($n chars) refuses" "" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: ${HEAD:0:$n}" "2026-07-01T10:00:00Z")"
+done
+for token in "${HEAD}a" "${HEAD}g" "${HEAD}-not-a-sha" "${HEAD}/suffix" "${HEAD}.junk" "${HEAD}_junk"; do
+  check_case "overlong or malformed SHA refuses" "" \
+    "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $token" "2026-07-01T10:00:00Z")"
+done
+check_case "conflicting full anchors refuse" "" \
+  "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD
+Reviewed commit: ${HEAD:0:7}000000000000000000000000000000000" "2026-07-01T10:00:00Z")"
+
+# A guard-removed filter demonstrates the colliding-prefix failure for both
+# distinct full object IDs without mining commits or mutating source files.
+collision_fixture="$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: ${HEAD:0:7}" "2026-07-01T10:00:00Z")"
+legacy_filter="$(printf '%s' "$LATEST_HEAD_VERDICT" | sed 's/all(. == $head)/any(. as $s | $head | startswith($s))/')"
+for collision_head in "$HEAD" "${HEAD:0:7}fffffffffffffffffffffffffffffffff"; do
+  guarded="$(printf '%s' "$collision_fixture" | jq -c --arg bot "$BOT" --arg sha "$collision_head" "$LATEST_HEAD_VERDICT")"
+  legacy="$(printf '%s' "$collision_fixture" | jq -c --arg bot "$BOT" --arg sha "$collision_head" "$legacy_filter")"
+  if [ "$guarded" = null ] && [ "$(printf '%s' "$legacy" | jq -r '.affirmative')" = true ]; then
+    pass "colliding-prefix verdict refuses; legacy control clears a distinct full SHA"
+  else
+    fail "collision control: guarded=$guarded legacy=$legacy"
+  fi
+done
+
+# 4a. accept: affirmative + 8-char prefix + markdown-bold, over newlines.
+check_case "affirmative + full SHA + markdown-bold anchor → clears" \
+  "2026-07-01T10:00:00Z" \
+  "$(mk "$BOT" "Codex Review: Didn't find any major issues. Swish!
+**Reviewed commit:** d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T10:00:00Z")"
+
+# 4b. fail-closed: Reviewed commit does not prefix HEAD (stale head).
+check_case "stale-HEAD verdict (Reviewed commit != HEAD prefix) → empty" \
+  "" \
+  "$(mk "$BOT" "Didn't find any major issues. Breezy!
+Reviewed commit: aaaa1111bbbb" "2026-07-01T10:00:00Z")"
+
+# 4c. fail-closed: findings verdict (not the affirmative shape).
+check_case "findings verdict (non-affirmative body) → empty" \
+  "" \
+  "$(mk "$BOT" "Codex Review: Found 2 issues to address.
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T10:00:00Z")"
+
+# 4d. fail-closed: affirmative but NO Reviewed-commit anchor line.
+check_case "affirmative but no Reviewed-commit line → empty" \
+  "" \
+  "$(mk "$BOT" "Didn't find any major issues. Chef's kiss." "2026-07-01T10:00:00Z")"
+
+# 4e. fail-closed: right phrase + anchor but WRONG author (human quote-reply).
+check_case "wrong author echoing the phrase + anchor → empty" \
+  "" \
+  "$(mk "nathanpayne-claude" "Codex said: Didn't find any major issues.
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T10:00:00Z")"
+
+# 4f. accept: full 40-char sha (exact match is a prefix of itself).
+check_case "full 40-char Reviewed-commit sha → clears" \
+  "2026-07-01T11:00:00Z" \
+  "$(mk "$BOT" "Codex Review: Didn't find any major issues.
+Reviewed commit: $HEAD" "2026-07-01T11:00:00Z")"
+
+# 4g. accept: apostrophe-less 'Didnt' + backticked sha.
+check_case "apostrophe-less 'Didnt' + backticked sha → clears" \
+  "2026-07-01T09:00:00Z" \
+  "$(mk "$BOT" "Codex Review: Didnt find any major issues.
+Reviewed commit: \`d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708\`" "2026-07-01T09:00:00Z")"
+
+# 4h. latest-wins: two qualifying comments → max(created_at).
+check_case "two qualifying verdicts → picks the latest created_at" \
+  "2026-07-01T12:00:00Z" \
+  "$(jq -n --arg bot "$BOT" --arg h "$HEAD" '[
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T10:00:00Z"},
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues. Keep them coming!\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T12:00:00Z"}
+   ]')"
+
+# 4i. P1 (#608) latest-wins fail-closed: older AFFIRMATIVE then a NEWER
+#     NON-affirmative verdict on the same HEAD → clearance signal is EMPTY
+#     (the newer negative verdict supersedes the older clean one).
+NEWER_NEGATIVE="$(jq -n --arg bot "$BOT" '[
+   {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T10:00:00Z"},
+   {user:{login:$bot},body:("Codex Review: Found 2 issues to address.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T12:00:00Z"}
+ ]')"
+check_case "older affirmative + NEWER non-affirmative verdict → clearance empty (P1 #608)" \
+  "" "$NEWER_NEGATIVE"
+
+# 4j. latest-wins accept: older NON-affirmative then a NEWER affirmative → the
+#     newer affirmative clears (returns its created_at).
+check_case "older non-affirmative + NEWER affirmative verdict → clears on the newer" \
+  "2026-07-01T12:00:00Z" \
+  "$(jq -n --arg bot "$BOT" '[
+     {user:{login:$bot},body:("Codex Review: Found 1 issue.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T10:00:00Z"},
+     {user:{login:$bot},body:("Codex Review: Didn'"'"'t find any major issues.\nReviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708"),created_at:"2026-07-01T12:00:00Z"}
+   ]')"
+
+# 4k. ANY-timestamp (Phase 4b guard, #608 P2): the latest HEAD-anchored verdict
+#     timestamp is carried REGARDLESS of disposition, so a newer NEGATIVE
+#     verdict still raises the freshness floor above a stale Phase 4b approval.
+run_any() { printf '%s' "$1" | jq -r --arg bot "$BOT" --arg sha "$HEAD" "$ANY_FILTER"; }
+GOT_ANY="$(run_any "$NEWER_NEGATIVE")"
+if [ "$GOT_ANY" = "2026-07-01T12:00:00Z" ]; then
+  pass "verdict ANY-timestamp: newer non-affirmative verdict is carried for the Phase 4b guard (#608 P2)"
+else
+  fail "verdict ANY-timestamp: expected 2026-07-01T12:00:00Z, got '$GOT_ANY'"
+fi
+
+# 4l. CodeRabbit Major (#608): a HEAD-anchored NEGATIVE verdict that QUOTES a
+#     prior affirmative (blockquote) must NOT read as affirmative — the match is
+#     anchored to the "Codex Review:" header line, so quoted text is ignored.
+check_case "negative verdict quoting an affirmative (blockquote) → clearance empty (anchored, #608)" \
+  "" \
+  "$(mk "$BOT" "Codex Review: Found 2 issues to address.
+
+> Codex Review: Didn't find any major issues
+
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T13:00:00Z")"
+
+# 4m. accept: a genuine affirmative whose body has a leading preamble line, with
+#     the "Codex Review:" verdict header on its own line (multiline anchor).
+check_case "affirmative header on a later line (multiline anchor) → clears" \
+  "2026-07-01T14:00:00Z" \
+  "$(mk "$BOT" "Here are some automated review suggestions.
+Codex Review: Didn't find any major issues.
+Reviewed commit: d05ff4d0e1a2b3c4d5e6f70819a2b3c4d5e6f708" "2026-07-01T14:00:00Z")"
+
+# ── 5. Gate (c) unified latest-signal-wins (#608 P1). Model the case block in
+#      codex-review-check.sh: pick the newest of {👍, review, verdict} (ties go
+#      verdict > review > 👍), then clear per that signal's disposition. KEEP IN
+#      SYNC with the LATEST_SIGNAL_KIND case in codex-review-check.sh.
+gatec_clears() { # thumbs_t review_t verdict_any_t verdict_affirm(0/1) unaddressed
+  local tt="$1" rt="$2" vt="$3" va="$4" uc="$5"
+  local kind="" time="" sig k t
+  for sig in "review|$rt" "verdict|$vt"; do
+    k=${sig%%|*}; t=${sig#*|}
+    [ -n "$t" ] || continue
+    if [ -z "$time" ] || [[ "$t" > "$time" ]] || [ "$t" = "$time" ]; then
+      time="$t"; kind="$k"
+    fi
+  done
+  case "$kind" in
+    review) if [ "$uc" -eq 0 ]; then echo yes; else echo no; fi ;;
+    verdict) if [ "$va" = "1" ] && [ "$uc" -eq 0 ]; then echo yes; else echo no; fi ;;
+    *) echo no ;;
+  esac
+}
+gc() { # desc expected thumbs review verdict affirm unaddressed
+  local desc="$1" exp="$2" got
+  got=$(gatec_clears "$3" "$4" "$5" "$6" "$7")
+  if [ "$got" = "$exp" ]; then pass "gate (c) latest-signal: $desc"; else fail "gate (c) latest-signal: $desc — expected $exp got $got"; fi
+}
+# THE #608 P1 regression: an older clean 👍/review must NOT clear when a NEWER
+# non-affirmative verdict exists on HEAD.
+gc "older 👍 + NEWER non-affirmative verdict → NO (P1 #608)"        no  "2026-07-01T10:00:00Z" ""                    "2026-07-01T12:00:00Z" 0 0
+gc "older clean review + NEWER non-affirmative verdict → NO (#608)" no  ""                    "2026-07-01T10:00:00Z" "2026-07-01T12:00:00Z" 0 0
+gc "same-second 👍 vs non-affirmative verdict → verdict wins tie → NO" no "2026-07-01T10:00:00Z" ""                 "2026-07-01T10:00:00Z" 0 0
+gc "older negative verdict + NEWER unanchored 👍 → NO"             no  "2026-07-01T12:00:00Z" ""                    "2026-07-01T10:00:00Z" 0 0
+gc "verdict-only affirmative + 0 findings → YES"                    yes ""                    ""                    "2026-07-01T10:00:00Z" 1 0
+gc "verdict-only affirmative + unaddressed findings → NO"           no  ""                    ""                    "2026-07-01T10:00:00Z" 1 2
+gc "thumbs-only → NO"                                               no  "2026-07-01T10:00:00Z" ""                    ""                    0 0
+gc "review-only clean → YES"                                        yes ""                    "2026-07-01T10:00:00Z" ""                    0 0
+gc "no signals at all → NO"                                         no  ""                    ""                    ""                    0 0
+
+# Exercise the production gate ordering, with an impossible future thumbs
+# timestamp and a backdated current head. No copied clearance algorithm.
+SIGNAL_BLOCK=$(sed -n '/^LATEST_SIGNAL_KIND=""/,/^done$/p' "$SCRIPT")
+for anchored_kind in none review verdict; do
+  CODEX_REVIEW_TIME=""; CODEX_HEAD_VERDICT_ANY_TIME=""
+  case "$anchored_kind" in
+    review) CODEX_REVIEW_TIME=2026-07-01T10:00:00Z ;;
+    verdict) CODEX_HEAD_VERDICT_ANY_TIME=2026-07-01T10:00:00Z ;;
+  esac
+  LATEST_THUMBS_UP_TIME=2999-01-01T00:00:00Z
+  eval "$SIGNAL_BLOCK"
+  wanted="$anchored_kind"; [ "$wanted" != none ] || wanted=""
+  if [ "$LATEST_SIGNAL_KIND" = "$wanted" ]; then
+    pass "#1751: production gate ignores unanchored reaction with $anchored_kind evidence"
+  else
+    fail "#1751: reaction contaminated production gate ordering: $LATEST_SIGNAL_KIND"
+  fi
+done
+
+# ── #814: the diagnostic bypass is a FLAG, not an inheritable env var.
+#
+# This script is the delegate of a REQUIRED status check in every fleet repo.
+# --diagnostic-signal-only skips gate (b) and disables the #705 carry-forward,
+# which WEAKENS the gate — so the risk is not what it does when asked for, but
+# whether a caller can get it without asking. An environment variable is
+# inherited by every child process, so merge-clearance-gate.sh, agent-review.yml
+# and the auto-clear workflow would pick it up from a runner env or a
+# workflow-level `env:` block and silently stop checking reviewer approval
+# (CodeRabbit Major on #835). A flag cannot be inherited.
+#
+# Structural, matching this file's documented approach; the behavioural check
+# (env var inert, flag effective) was run live against a real PR and is not
+# automated here, because driving the full flow needs a gh stub harness this
+# suite does not have.
+knob_ok=1
+# The bypass is reachable ONLY through the flag.
+grep -q -- '--diagnostic-signal-only) DIAGNOSTIC_SIGNAL_ONLY=1 ;;' "$SCRIPT" || knob_ok=0
+grep -q '^SKIP_REVIEWER_APPROVAL="\$DIAGNOSTIC_SIGNAL_ONLY"' "$SCRIPT" || knob_ok=0
+grep -q '^REQUIRE_HEAD_SIGNAL="\$DIAGNOSTIC_SIGNAL_ONLY"' "$SCRIPT" || knob_ok=0
+# No environment variable may enable it. This is the assertion that fails if
+# anyone reintroduces the inheritable form.
+if grep -qE 'CODEX_REVIEW_CHECK_(SKIP_REVIEWER_APPROVAL|REQUIRE_HEAD_SIGNAL)' "$SCRIPT"; then
+  knob_ok=0
+fi
+# Defaults off, and the skip cannot mask a real approval.
+grep -q '^DIAGNOSTIC_SIGNAL_ONLY=0' "$SCRIPT" || knob_ok=0
+grep -q 'if \[ -z "\$APPROVING_REVIEWER" \] && \[ "\$SKIP_REVIEWER_APPROVAL" = "1" \]; then' "$SCRIPT" || knob_ok=0
+# The gate (b) hard failure is still reachable without the flag.
+grep -q 'fail_gate "no reviewer identity in available_reviewers has a latest-state APPROVED' "$SCRIPT" || knob_ok=0
+if [ "$knob_ok" = 1 ]; then
+  pass "#814: the gate bypass is flag-only, defaults off, has no env-var path, and cannot mask a real approval"
+else
+  fail "#814: the gate bypass lost one of its non-inheritability guarantees"
+fi
+
+# Diagnostic mode asks only whether Codex produced a current-head signal for
+# the Phase 4b barrier. Its caller supplies the author explicitly, so a legacy
+# or external-contributor PR without an Authoring-Agent marker must not abort
+# before that signal check runs. Execute the real script with fixture PR bodies
+# and stop it at the immediately-following commit read: this proves the parser
+# branch was bypassed, rather than merely proving that expected source text
+# exists somewhere in the file.
+BEHAVIOR_TMP="$(mktemp -d "${TMPDIR:-/tmp}/codex-check-body.XXXXXX")"
+trap 'rm -rf "$BEHAVIOR_TMP"' EXIT
+mkdir -p "$BEHAVIOR_TMP/bin"
+cat >"$BEHAVIOR_TMP/policy.yml" <<'POLICY'
+author_identity: nathanjohnpayne
+available_reviewers:
+  - nathanpayne-claude
+  - nathanpayne-codex
+codex:
+  enabled: true
+  require_ci_green: false
+POLICY
+cat >"$BEHAVIOR_TMP/bin/gh" <<'GHSTUB'
+#!/usr/bin/env bash
+if [ "$1" = api ] && [[ "$2" == repos/*/pulls/7 ]]; then
+  jq -n --arg author "${FIXTURE_PR_AUTHOR:?}" --arg body "${FIXTURE_PR_BODY-}" \
+    '{head:{sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},user:{login:$author},body:$body}'
+  exit 0
+fi
+echo "fixture commit stop" >&2
+exit 1
+GHSTUB
+chmod +x "$BEHAVIOR_TMP/bin/gh"
+
+run_body_fixture() {
+  local author=$1 mode=$2 body=${3:-} output rc
+  set +e
+  output=$(PATH="$BEHAVIOR_TMP/bin:$PATH" GH_TOKEN=fixture \
+    MERGEPATH_REVIEW_POLICY_PATH="$BEHAVIOR_TMP/policy.yml" \
+    FIXTURE_PR_AUTHOR="$author" FIXTURE_PR_BODY="$body" \
+    "$SCRIPT" $mode 7 owner/repo 2>&1)
+  rc=$?
+  set -e
+  printf '%s\n%s\n' "$rc" "$output"
+}
+
+fixture_result="$(run_body_fixture nathanjohnpayne --diagnostic-signal-only)"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'diagnostic-signal-only: skipping Authoring-Agent' <<<"$fixture_output" \
+   && grep -q 'failed to fetch commit date' <<<"$fixture_output" \
+   && ! grep -q 'PR body declares' <<<"$fixture_output"; then
+  pass "#1121: diagnostic-signal-only executes past a markerless PR body"
+else
+  fail "#1121: diagnostic markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
+fi
+
+fixture_result="$(run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'non-shared-author PR: skipping Authoring-Agent' <<<"$fixture_output" \
+   && grep -q 'failed to fetch commit date' <<<"$fixture_output" \
+   && ! grep -q 'PR body declares' <<<"$fixture_output"; then
+  pass "#1121: a markerless non-shared-author PR executes past identity parsing"
+else
+  fail "#1121: non-shared-author markerless fixture did not bypass identity parsing (rc=$fixture_rc output=$fixture_output)"
+fi
+
+# Direct callers have the same structured-parser prerequisite as dispatcher
+# callers. Shadow every supported implementation with an unavailable tool;
+# execute the actual checker, retaining all other native fixture utilities.
+mkdir -p "$BEHAVIOR_TMP/no-parsers"
+for parser in yq python3 ruby; do
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$BEHAVIOR_TMP/no-parsers/$parser"
+  chmod +x "$BEHAVIOR_TMP/no-parsers/$parser"
+done
+fixture_result="$(PATH="$BEHAVIOR_TMP/no-parsers:$PATH" run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] \
+   && grep -q 'could not be parsed; author_identity and codex.\* settings are unknown' <<<"$fixture_output" \
+   && ! grep -q 'fixture commit stop\|failed to fetch commit date' <<<"$fixture_output"; then
+  pass "#2314: direct checker without a working YAML parser refuses before commit lookup"
+else
+  fail "#2314: missing parser did not fail closed (rc=$fixture_rc output=$fixture_output)"
+fi
+
+fixture_result="$(run_body_fixture nathanjohnpayne '' 'Authoring-Agent: unknown')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] && grep -q 'does not map to exactly one configured reviewer' <<<"$fixture_output"; then
+  pass "#1121: an unregistered Authoring-Agent fails closed before gate evaluation"
+else
+  fail "#1121: unregistered Authoring-Agent fixture did not fail closed (rc=$fixture_rc output=$fixture_output)"
+fi
+
+# ── #2901: every codex.* field comes from the parsed governing policy ------
+#
+# The old line-oriented awk reader matched only an unquoted, block-style
+# `field:` key. A quoted key or a flow mapping read as unset and took the
+# default, which is permissive for enabled and allow_phase_4b_substitute. Run
+# the extracted reader against fixtures, then run the same fixtures through
+# the legacy awk reader (mutation self-check): each spelling the fix exists for
+# must be misread there, or these cases would not detect a regression to it.
+POLICY_FIELD_READER=$(sed -n \
+  '/^# BEGIN codex_policy_field$/,/^# END codex_policy_field$/p' "$SCRIPT")
+if [ -n "$POLICY_FIELD_READER" ] && grep -q '^codex_field()' <<<"$POLICY_FIELD_READER"; then
+  pass "#2901: codex-review-check.sh exposes the parsed-policy codex_field reader"
+else
+  fail "#2901: codex-review-check.sh is missing the BEGIN/END codex_policy_field block"
+fi
+if grep -nE '^[^#]*\$\(codex_field [a-z_]+\)' "$SCRIPT" >/dev/null; then
+  fail "#2901: a codex_field call site omits its expected kind: $(grep -nE '^[^#]*\$\(codex_field [a-z_]+\)' "$SCRIPT" | head -3)"
+else
+  pass "#2901: every codex_field call site names the kind it expects"
+fi
+
+# shellcheck source=../scripts/lib/feedback-policy-helpers.sh
+. "$ROOT/scripts/lib/feedback-policy-helpers.sh"
+LEGACY_CODEX_FIELD_AWK='
+  /^codex:/ {in_block=1; next}
+  in_block && /^[^[:space:]#]/ {in_block=0}
+  in_block && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+
+# read_new <yaml> <field> <kind> -> "rc=<n> val=<value>"
+read_new() {
+  local rc=0 val=""
+  printf '%s\n' "$1" > "$BEHAVIOR_TMP/field-policy.yml"
+  val=$(env -u BASH_ENV bash -c '
+    . "$1/scripts/lib/feedback-policy-helpers.sh"
+    eval "$2"
+    CONFIG=$3
+    AUTHOR_POLICY_JSON=$(policy_yaml_to_json "$3") || AUTHOR_POLICY_JSON=""
+    codex_field "$4" "$5"
+  ' _ "$ROOT" "$POLICY_FIELD_READER" "$BEHAVIOR_TMP/field-policy.yml" "$2" "$3" 2>/dev/null) || rc=$?
+  printf 'rc=%s val=%s' "$rc" "$val"
+}
+# read_legacy <yaml> <field> -> what the pre-#2901 reader produced. It had
+# no failure mode: an unreadable value fell through to the caller's default.
+read_legacy() {
+  printf '%s\n' "$1" | awk -v field="$2" "$LEGACY_CODEX_FIELD_AWK" | {
+    read -r v || true; printf 'rc=0 val=%s' "$v"; }
+}
+
+# case_field <label> <yaml> <field> <kind> <expected> <legacy-must-differ 0|1>
+case_field() {
+  local label=$1 yaml=$2 field=$3 kind=$4 want=$5 must_differ=$6 got legacy
+  got=$(read_new "$yaml" "$field" "$kind")
+  if [ "$got" = "$want" ]; then
+    pass "#2901 $label: $field reads '$got'"
+  else
+    fail "#2901 $label: $field read '$got', expected '$want'"
+  fi
+  [ "$must_differ" = 1 ] || return 0
+  legacy=$(read_legacy "$yaml" "$field")
+  if [ "$legacy" != "$want" ]; then
+    pass "#2901 mutation $label: the legacy awk reader misreads $field ('$legacy'), so this case detects a regression"
+  else
+    fail "#2901 mutation $label: the legacy awk reader already reads $field correctly; the case proves nothing"
+  fi
+}
+
+BASE=$'author_identity: nathanjohnpayne\navailable_reviewers:\n  - nathanpayne-claude'
+REFUSE='rc=1 val='
+
+# Block style, unquoted: both readers agree (regression guard for the norm).
+case_field "block style" "$BASE"$'\ncodex:\n  enabled: false\n  allow_phase_4b_substitute: false\n  bot_login: "custom-codex[bot]"' enabled bool 'rc=0 val=false' 0
+case_field "block style" "$BASE"$'\ncodex:\n  allow_phase_4b_substitute: false' allow_phase_4b_substitute bool 'rc=0 val=false' 0
+case_field "block style quoted value" "$BASE"$'\ncodex:\n  bot_login: "custom-codex[bot]"' bot_login string 'rc=0 val=custom-codex[bot]' 0
+case_field "quoted scalar value" "$BASE"$'\ncodex:\n  enabled: "false"' enabled bool 'rc=0 val=false' 0
+case_field "absent key" "$BASE"$'\ncodex:\n  require_ci_green: true' enabled bool 'rc=0 val=' 0
+case_field "absent block" "$BASE" allow_phase_4b_substitute bool 'rc=0 val=' 0
+
+# Quoted keys.
+case_field "quoted key" "$BASE"$'\ncodex:\n  "enabled": false' enabled bool 'rc=0 val=false' 1
+case_field "quoted key" "$BASE"$'\ncodex:\n  "allow_phase_4b_substitute": false' allow_phase_4b_substitute bool 'rc=0 val=false' 1
+case_field "single-quoted key" "$BASE"$'\ncodex:\n  \'bot_login\': custom-codex[bot]' bot_login string 'rc=0 val=custom-codex[bot]' 1
+case_field "quoted key" "$BASE"$'\ncodex:\n  "reaction_freshness_window_seconds": 600' reaction_freshness_window_seconds int 'rc=0 val=600' 1
+
+# Flow mappings.
+case_field "flow mapping" "$BASE"$'\ncodex: {enabled: false}' enabled bool 'rc=0 val=false' 1
+case_field "flow mapping" "$BASE"$'\ncodex: {allow_phase_4b_substitute: false}' allow_phase_4b_substitute bool 'rc=0 val=false' 1
+case_field "flow mapping" "$BASE"$'\ncodex: {bot_login: "custom-codex[bot]"}' bot_login string 'rc=0 val=custom-codex[bot]' 1
+case_field "flow mapping" "$BASE"$'\ncodex: {require_ci_green: false}' require_ci_green bool 'rc=0 val=false' 1
+
+# Values of the wrong kind refuse instead of defaulting. The legacy reader
+# handed these to the caller, which either refused (enabled: maybe) or, for a
+# list or mapping, saw a value it could not tell from unset.
+case_field "wrong kind" "$BASE"$'\ncodex:\n  enabled: [false]' enabled bool "$REFUSE" 1
+case_field "wrong kind" "$BASE"$'\ncodex:\n  allow_phase_4b_substitute: {value: false}' allow_phase_4b_substitute bool "$REFUSE" 1
+case_field "wrong kind" "$BASE"$'\ncodex:\n  bot_login: [custom-codex]' bot_login string "$REFUSE" 1
+case_field "null value" "$BASE"$'\ncodex:\n  allow_phase_4b_substitute:' allow_phase_4b_substitute bool "$REFUSE" 1
+case_field "empty string" "$BASE"$'\ncodex:\n  bot_login: ""' bot_login string "$REFUSE" 1
+case_field "non-mapping block" "$BASE"$'\ncodex: false' enabled bool "$REFUSE" 1
+case_field "negative integer" "$BASE"$'\ncodex:\n  reaction_freshness_window_seconds: -5' reaction_freshness_window_seconds int "$REFUSE" 0
+
+# A policy that cannot be parsed refuses every field.
+for f in enabled:bool allow_phase_4b_substitute:bool bot_login:string; do
+  case_field "unparseable policy" "$BASE"$'\ncodex:\n  enabled: false\n  bot_login: [unclosed' "${f%%:*}" "${f#*:}" "$REFUSE" 1
+done
+
+# The real checker refuses before its first API read beyond the PR: a present
+# value of the wrong kind exits 3 with the reason instead of defaulting.
+cp "$BEHAVIOR_TMP/policy.yml" "$BEHAVIOR_TMP/policy.good.yml"
+for spec in 'enabled: [false]|codex.enabled must be true|false' \
+            'allow_phase_4b_substitute: ~|codex.allow_phase_4b_substitute must be true|false' \
+            'bot_login: [x]|codex.bot_login must be a non-empty string'; do
+  printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" \
+    "  - nathanpayne-codex" "codex:" "  require_ci_green: false" "  ${spec%%|*}" > "$BEHAVIOR_TMP/policy.yml"
+  fixture_result="$(run_body_fixture external-contributor '')"
+  fixture_rc="${fixture_result%%$'\n'*}"
+  fixture_output="${fixture_result#*$'\n'}"
+  if [ "$fixture_rc" = "3" ] && grep -qF "${spec#*|}" <<<"$fixture_output" \
+     && ! grep -q 'fixture commit stop\|failed to fetch commit date' <<<"$fixture_output"; then
+    pass "#2901: the checker refuses '${spec%%|*}' (exit 3) instead of defaulting"
+  else
+    fail "#2901: the checker did not refuse '${spec%%|*}' (rc=$fixture_rc output=$fixture_output)"
+  fi
+done
+# A flow-style policy runs past the policy reads exactly as block style does.
+printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" "  - nathanpayne-codex" \
+  'codex: {"enabled": true, require_ci_green: false, "allow_phase_4b_substitute": false}' > "$BEHAVIOR_TMP/policy.yml"
+fixture_result="$(run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] && grep -q 'failed to fetch commit date' <<<"$fixture_output"; then
+  pass "#2901: a flow-style, quoted-key codex block reaches gate evaluation"
+else
+  fail "#2901: flow-style policy did not reach gate evaluation (rc=$fixture_rc output=$fixture_output)"
+fi
+
+# ── #2913: phase_4b_default comes from the parsed policy too ---------------
+# The old top-level policy_field awk reader matched only an unquoted
+# `phase_4b_default:` key at column 0, so a quoted key read as unset and fell
+# back to fallback-only. LEGACY_POLICY_FIELD_AWK is that reader (mutation
+# baseline): each refusal below would have run past it under the default.
+LEGACY_POLICY_FIELD_AWK='
+  /^[^[:space:]]/ && $1 == field":" {
+    sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "", $0)
+    gsub(/^["\047]/, "", $0)
+    gsub(/["\047][[:space:]]*(#.*)?$/, "", $0)
+    gsub(/[[:space:]]*#.*$/, "", $0)
+    sub(/[[:space:]]+$/, "", $0)
+    print
+    exit
+  }
+'
+if grep -Fq 'PHASE_4B_DEFAULT=$(policy_json_field "$AUTHOR_POLICY_JSON" phase_4b_default string) || exit 3' "$SCRIPT" \
+   && ! grep -q '^policy_field()' "$SCRIPT"; then
+  pass "#2913: phase_4b_default is read from the parsed policy; the awk policy_field is gone"
+else
+  fail "#2913: codex-review-check.sh still reads phase_4b_default through a line-oriented reader"
+fi
+for spec in '"phase_4b_default": bogus-mode|phase_4b_default must be one of' \
+            "'phase_4b_default': [always]|phase_4b_default must be a non-empty string"; do
+  printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" \
+    "  - nathanpayne-codex" "codex:" "  require_ci_green: false" "${spec%%|*}" > "$BEHAVIOR_TMP/policy.yml"
+  fixture_result="$(run_body_fixture external-contributor '')"
+  fixture_rc="${fixture_result%%$'\n'*}"
+  fixture_output="${fixture_result#*$'\n'}"
+  if [ "$fixture_rc" = "3" ] && grep -qF "${spec#*|}" <<<"$fixture_output" \
+     && ! grep -q 'failed to fetch commit date' <<<"$fixture_output"; then
+    pass "#2913: the checker refuses ${spec%%|*} (exit 3) instead of defaulting to fallback-only"
+  else
+    fail "#2913: the checker did not refuse ${spec%%|*} (rc=$fixture_rc output=$fixture_output)"
+  fi
+  legacy=$(awk -v field=phase_4b_default "$LEGACY_POLICY_FIELD_AWK" "$BEHAVIOR_TMP/policy.yml")
+  if [ -z "$legacy" ]; then
+    pass "#2913 mutation: the legacy policy_field reads ${spec%%|*} as unset, so the case detects a regression"
+  else
+    fail "#2913 mutation: the legacy policy_field already reads ${spec%%|*} ('$legacy'); the case proves nothing"
+  fi
+done
+# A valid quoted key runs past the policy reads exactly as an unquoted one.
+printf '%s\n' "author_identity: nathanjohnpayne" "available_reviewers:" "  - nathanpayne-claude" \
+  "  - nathanpayne-codex" "codex:" "  require_ci_green: false" '"phase_4b_default": always' > "$BEHAVIOR_TMP/policy.yml"
+fixture_result="$(run_body_fixture external-contributor '')"
+fixture_rc="${fixture_result%%$'\n'*}"
+fixture_output="${fixture_result#*$'\n'}"
+if [ "$fixture_rc" = "3" ] && grep -q 'failed to fetch commit date' <<<"$fixture_output"; then
+  pass "#2913: a quoted phase_4b_default key reaches gate evaluation"
+else
+  fail "#2913: quoted phase_4b_default did not reach gate evaluation (rc=$fixture_rc output=$fixture_output)"
+fi
+cp "$BEHAVIOR_TMP/policy.good.yml" "$BEHAVIOR_TMP/policy.yml"
+
+# Positional rather than a text scan — the header documents gate (c) long
+# before it is evaluated, so a "starts matching at the first mention" filter
+# reports a false leak (it did, on the first version of this assertion).
+knob_last=$(grep -n 'SKIP_REVIEWER_APPROVAL\|REQUIRE_HEAD_SIGNAL' "$SCRIPT" | tail -1 | cut -d: -f1)
+gatec_at=$(grep -n 'log "gate (c): checking external clearance' "$SCRIPT" | head -1 | cut -d: -f1)
+if [ -n "$knob_last" ] && [ -n "$gatec_at" ] && [ "$knob_last" -lt "$gatec_at" ]; then
+  pass "#814: every bypass reference precedes the gate (c) evaluation — it cannot influence external clearance"
+else
+  fail "#814: bypass reference at line ${knob_last:-?} is not before gate (c) at ${gatec_at:-?}"
+fi
+
+# #842/#2139: only diagnostic and strict substitution modes may distinguish
+# cannot-report from pending. Ordinary merge-gate callers retain 0/1/3.
+# Native refusal and recovery controls live in the substitution suite.
+exit2_at=$(grep -n '^      exit 2$' "$SCRIPT" | head -1 | cut -d: -f1)
+guard_ok=0
+if [ -n "$exit2_at" ]; then
+  # The guard must be within the few lines immediately above the exit, so a
+  # later edit cannot leave the exit reachable from the gate path.
+  guard_at=$(sed -n "$((exit2_at - 4)),$((exit2_at - 1))p" "$SCRIPT" \
+    | grep -Fc 'if [ "$DIAGNOSTIC_SIGNAL_ONLY" = 1 ] || [ "$REQUIRE_CODEX_ON_HEAD" = 1 ]; then' || true)
+  # Proximity alone is not containment (CodeRabbit on #842): moving `fi` above
+  # the exit would leave the guard text nearby while the exit sits outside the
+  # block. Require that no `fi` closes between the guard and the exit.
+  fi_between=$(sed -n "$((exit2_at - 4)),$((exit2_at - 1))p" "$SCRIPT" \
+    | grep -cE '^[[:space:]]*fi[[:space:]]*$' || true)
+  [ "$guard_at" -ge 1 ] && [ "$fi_between" -eq 0 ] && guard_ok=1
+fi
+# It remains the only literal exit 2; the earlier strict no-response route
+# is also exercised through the real checker by the substitution suite.
+n_exit2=$(grep -c '^[[:space:]]*exit 2$' "$SCRIPT" || true)
+if [ "$guard_ok" = 1 ] && [ "$n_exit2" = "1" ]; then
+  pass "#842/#2139: CANNOT-REPORT is scoped to diagnostic/strict modes; the ordinary merge gate retains 0/1/3"
+else
+  fail "#842: exit 2 is unguarded or duplicated (guard_ok=$guard_ok count=$n_exit2)"
+fi
+
+echo ""
+echo "test_codex_review_check_verdict: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

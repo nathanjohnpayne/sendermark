@@ -1,0 +1,31 @@
+# scripts/sweep-unresolved-feedback/target-repos.txt
+#
+# One owner/repo per line. Lines starting with `#` and blank lines
+# are ignored. Read by enumerate.sh and render.sh.
+#
+# Seed list is the 9 repos surveyed by the 2026-05-13 manual sweep
+# that produced the 209-item rollup in #234. gaycruisebingo was added
+# in #740 after #137 showed unresolved bot threads + unrecorded
+# dispositions on an under-threshold PR there going untracked because
+# the repo was absent from this list.
+#
+# device-platform-reporting was removed 2026-08-26 when that repo was
+# archived and made private; it is no longer a sync consumer and can
+# accrue no new review feedback.
+#
+# device-source-of-truth was removed 2026-09-05 when that repo went
+# dormant: GitHub Actions was disabled on it and it was dropped as a
+# sync consumer, so it accrues no new review feedback either. The repo
+# was archived on 2026-10-22. That is
+# why this list holds 8, not 10.
+#
+# To onboard a new repo: add a line. No code changes required.
+
+nathanjohnpayne/friends-and-family-billing
+nathanjohnpayne/swipewatch
+nathanjohnpayne/nathanpaynedotcom
+nathanjohnpayne/overridebroadway
+nathanjohnpayne/matchline
+nathanjohnpayne/tadlockpsychiatry
+nathanjohnpayne/mergepath
+nathanjohnpayne/fiveacross

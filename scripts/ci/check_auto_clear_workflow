@@ -1,0 +1,2031 @@
+#!/usr/bin/env bash
+# check_auto_clear_workflow — smoke tests for auto-clear-blocking-labels.yml
+#
+# The workflow itself runs in GitHub Actions; what we test here is the
+# YAML structure (parses, has the right triggers, has the self-fire
+# guard) and the PR-number resolution dispatch logic (which is bash
+# inside the workflow). Mirrors the integration-test gap that #195's
+# implementation plan flagged.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# Overridable so tests/test_merge_clearance_gate.sh (Test 26, #2167) can aim
+# the structural assertions at a mutated copy without touching the canonical
+# workflow on disk — the same contract as MERGE_CLEARANCE_WORKFLOW and
+# REQUIRED_CHECK_PUBLISHER_WORKFLOW in the sibling checks.
+WORKFLOW="${AUTO_CLEAR_WORKFLOW:-$ROOT/.github/workflows/auto-clear-blocking-labels.yml}"
+CONTINUATION_TEST="$ROOT/tests/test_approval_merge_continuation.sh"
+CONTINUATION="$ROOT/scripts/workflow/approval-merge-continuation.sh"
+CONTINUATION_REPORTER="$ROOT/scripts/workflow/report-approval-continuation-failures.sh"
+COMMAND_CLASSIFIER="$ROOT/scripts/lib/gh-command-classifier.sh"
+MODE_HELPER="$ROOT/scripts/lib/ci-check-modes.sh"
+
+[ -r "$MODE_HELPER" ] || {
+  echo "check_auto_clear_workflow: missing $MODE_HELPER" >&2
+  exit 1
+}
+# shellcheck source=../lib/ci-check-modes.sh
+. "$MODE_HELPER"
+if ! ci_check_select_mode "$@"; then
+  echo "usage: check_auto_clear_workflow [--check | --self-test]" >&2
+  exit 2
+fi
+
+[ -r "$COMMAND_CLASSIFIER" ] || {
+  echo "check_auto_clear_workflow: missing $COMMAND_CLASSIFIER" >&2
+  exit 1
+}
+# shellcheck source=../lib/gh-command-classifier.sh
+. "$COMMAND_CLASSIFIER"
+
+pass=0
+fail=0
+skip_reason=""
+
+# ── Test 1: workflow file exists and is valid YAML
+echo "auto-clear-blocking-labels.yml structural tests"
+
+if [ ! -f "$WORKFLOW" ]; then
+  echo "  FAIL: $WORKFLOW does not exist" >&2
+  exit 1
+fi
+
+if [ -f "$CONTINUATION" ] \
+   && ! grep -Fq -- '--disable-auto' "$CONTINUATION" \
+   && gh_source_lacks_direct_literal_pr_mutation < "$CONTINUATION"; then
+  pass=$((pass + 1))
+  echo "  PASS: approval cleanup exposes no direct native or API merge/disable syntax"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: approval cleanup must expose no direct native or API merge/disable syntax" >&2
+fi
+
+workflow_source_has_trigger_fallback() {
+  local trigger="$1" ambiguity_scope="${2:-all}"
+  awk -v wanted="$trigger" -v ambiguity_scope="$ambiguity_scope" -v sq="'" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    function key_is(token, expected) {
+      return token == expected || token == "\"" expected "\"" \
+        || token == sq expected sq
+    }
+    function key_is_ambiguous(token) {
+      return token == "<<" || token ~ /^[*?!&]/ \
+        || (token ~ /^\"/ && token ~ /\\/)
+    }
+    function strip_yaml_comments(value, i, char, quote, escaped, previous, output, in_comment) {
+      quote = ""
+      escaped = 0
+      output = ""
+      in_comment = 0
+      for (i = 1; i <= length(value); i++) {
+        char = substr(value, i, 1)
+        if (in_comment) {
+          if (char == "\n") {
+            in_comment = 0
+            output = output " "
+          }
+          continue
+        }
+        if (quote != "") {
+          output = output char
+          if (escaped) { escaped = 0; continue }
+          if (char == "\\" && quote == "\"") { escaped = 1; continue }
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == "\"" || char == sq) {
+          quote = char
+          output = output char
+          continue
+        }
+        previous = i > 1 ? substr(value, i - 1, 1) : " "
+        if (char == "#" && previous ~ /[[:space:]]/) {
+          in_comment = 1
+          continue
+        }
+        output = output char
+      }
+      return output
+    }
+    function flow_mapping_has(value, expected, i, char, depth, quote, escaped, token, key) {
+      depth = 0
+      quote = ""
+      escaped = 0
+      token = ""
+      expecting_key = 0
+      for (i = 1; i <= length(value); i++) {
+        char = substr(value, i, 1)
+        if (quote != "") {
+          if (expecting_key) token = token char
+          if (escaped) { escaped = 0; continue }
+          if (char == "\\" && quote == "\"") { escaped = 1; continue }
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == "\"" || char == sq) {
+          quote = char
+          if (expecting_key) token = token char
+          continue
+        }
+        if (char == "{") {
+          depth++
+          if (depth == 1) { expecting_key = 1; token = "" }
+          continue
+        }
+        if (char == "}") {
+          depth--
+          continue
+        }
+        if (depth != 1) continue
+        if (expecting_key && char == ":") {
+          key = trim(token)
+          if (ambiguity_scope == "all" && key_is_ambiguous(key)) ambiguous = 1
+          if (key_is(key, expected)) return 1
+          expecting_key = 0
+          token = ""
+          continue
+        }
+        if (char == ",") {
+          expecting_key = 1
+          token = ""
+          continue
+        }
+        if (expecting_key) token = token char
+      }
+      return 0
+    }
+    function flow_depth_change(value, i, char, quote, escaped, change) {
+      quote = ""
+      escaped = 0
+      change = 0
+      for (i = 1; i <= length(value); i++) {
+        char = substr(value, i, 1)
+        if (quote != "") {
+          if (escaped) { escaped = 0; continue }
+          if (char == "\\" && quote == "\"") { escaped = 1; continue }
+          if (char == quote) quote = ""
+          continue
+        }
+        if (char == "\"" || char == sq) { quote = char; continue }
+        if (char == "{") change++
+        if (char == "}") change--
+      }
+      return change
+    }
+    BEGIN {
+      in_on = 0
+      in_flow = 0
+      on_indent = -1
+      child_indent = -1
+      flow_depth = 0
+      flow_value = ""
+      found = 0
+      ambiguous = 0
+      seen_on = 0
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (line ~ /^[[:space:]]*$/ || line ~ /^[[:space:]]*#/) next
+      match(line, /^ */)
+      indent = RLENGTH
+      raw_content = substr(line, indent + 1)
+      content = strip_yaml_comments(raw_content)
+      if (trim(content) == "") next
+      # A root-level flow mapping can carry duplicate `on` keys that ordinary
+      # YAML parsers silently collapse. The fallback intentionally supports
+      # flow mappings as the VALUE of one block-root `on:` key, but a flow-map
+      # document root is outside its proof surface and therefore ambiguous,
+      # including when an inline YAML document marker precedes the map.
+      if (!in_on && !in_flow && indent == 0 \
+          && content ~ /^(---[[:space:]]+)?\{/) {
+        ambiguous = 1
+        next
+      }
+      if (ambiguity_scope == "all" \
+          && (content ~ /^\?[[:space:]]/ || content ~ /^:[[:space:]]/)) ambiguous = 1
+
+      if (in_flow) {
+        flow_value = flow_value "\n" raw_content
+        flow_clean = strip_yaml_comments(flow_value)
+        flow_depth = flow_depth_change(flow_clean)
+        if (flow_depth <= 0) {
+          if (flow_mapping_has(flow_clean, wanted)) found = 1
+          in_flow = 0
+          flow_value = ""
+        }
+        next
+      }
+
+      if (!in_on) {
+        if (indent != 0) next
+        colon = index(content, ":")
+        if (colon == 0) next
+        top_key = trim(substr(content, 1, colon - 1))
+        if (ambiguity_scope == "all" && key_is_ambiguous(top_key)) ambiguous = 1
+        if (!key_is(top_key, "on")) next
+        if (seen_on) ambiguous = 1
+        seen_on = 1
+        rest = trim(substr(content, colon + 1))
+        raw_rest = trim(substr(raw_content, colon + 1))
+        if (rest == "" || rest ~ /^#/) {
+          in_on = 1
+          on_indent = indent
+          child_indent = -1
+        } else if (ambiguity_scope == "all" && (rest ~ /^[&!?]/ \
+                   || rest ~ /^\*[^[:space:]\[\]{},]+$/)) {
+          ambiguous = 1
+        } else if (rest ~ /^\{/) {
+          flow_value = raw_rest
+          flow_clean = strip_yaml_comments(flow_value)
+          flow_depth = flow_depth_change(flow_clean)
+          if (flow_depth <= 0) {
+            if (flow_mapping_has(flow_clean, wanted)) found = 1
+          } else {
+            in_flow = 1
+          }
+        } else if (key_is(rest, wanted)) {
+          found = 1
+        }
+        next
+      }
+
+      if (indent <= on_indent) {
+        in_on = 0
+      } else {
+        if (child_indent == -1) child_indent = indent
+        if (indent != child_indent) next
+        colon = index(content, ":")
+        if (colon > 0) {
+          child_key = trim(substr(content, 1, colon - 1))
+          if (ambiguity_scope == "all" && key_is_ambiguous(child_key)) ambiguous = 1
+          if (key_is(child_key, wanted)) found = 1
+        }
+        next
+      }
+
+      # Reprocess the boundary record after leaving a block `on:` mapping.
+      # It may itself be a duplicate top-level `on` key; skipping that record
+      # would let the first mapping decide forbidden-trigger absence.
+      if (indent != 0) next
+      colon = index(content, ":")
+      if (colon == 0) next
+      top_key = trim(substr(content, 1, colon - 1))
+      if (ambiguity_scope == "all" && key_is_ambiguous(top_key)) ambiguous = 1
+      if (!key_is(top_key, "on")) next
+      ambiguous = 1
+      seen_on = 1
+    }
+    END {
+      if (ambiguous) exit 2
+      if (found) exit 0
+      exit 1
+    }
+  '
+}
+
+workflow_source_has_trigger() {
+  local trigger="$1" document result rc ambiguity_rc
+  document=$(cat) || return 2
+  if command -v yq >/dev/null 2>&1; then
+    # yq resolves anchors and tags, but like most YAML parsers it accepts
+    # duplicate mapping keys and retains only one value. Probe that ambiguity
+    # before parsing; this pass never decides trigger presence.
+    ambiguity_rc=0
+    printf '%s\n' "$document" \
+      | workflow_source_has_trigger_fallback \
+        __mergepath_trigger_ambiguity_probe_1058__ duplicates-only \
+      || ambiguity_rc=$?
+    [ "$ambiguity_rc" -ne 2 ] || return 2
+    rc=0
+    result=$(printf '%s\n' "$document" \
+      | MERGEPATH_TRIGGER_KEY="$trigger" yq -r \
+        'explode(.) | ((.on | type) == "!!map" and (.on | has(strenv(MERGEPATH_TRIGGER_KEY))))' \
+        - 2>/dev/null) || rc=$?
+    [ "$rc" -eq 0 ] || return 2
+    case "$result" in
+      true) return 0 ;;
+      false) return 1 ;;
+      *) return 2 ;;
+    esac
+  elif python3 -c 'import yaml' >/dev/null 2>&1; then
+    # The BaseLoader path does not provide yq's explode semantics, so retain
+    # the broader fail-closed ambiguity probe used by the parserless path.
+    ambiguity_rc=0
+    printf '%s\n' "$document" \
+      | workflow_source_has_trigger_fallback \
+        __mergepath_trigger_ambiguity_probe_1058__ \
+      || ambiguity_rc=$?
+    [ "$ambiguity_rc" -ne 2 ] || return 2
+    rc=0
+    result=$(printf '%s\n' "$document" \
+      | MERGEPATH_TRIGGER_KEY="$trigger" python3 -c '
+import os, sys, yaml
+document = yaml.load(sys.stdin, Loader=yaml.BaseLoader)
+triggers = document.get("on", {}) if isinstance(document, dict) else {}
+print("found" if isinstance(triggers, dict) and os.environ["MERGEPATH_TRIGGER_KEY"] in triggers else "absent")
+' 2>/dev/null) || rc=$?
+    [ "$rc" -eq 0 ] || return 2
+    case "$result" in
+      found) return 0 ;;
+      absent) return 1 ;;
+      *) return 2 ;;
+    esac
+  else
+    printf '%s\n' "$document" | workflow_source_has_trigger_fallback "$trigger"
+  fi
+}
+
+workflow_source_lacks_trigger() {
+  local rc=0
+  workflow_source_has_trigger "$@" || rc=$?
+  [ "$rc" -eq 1 ]
+}
+
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+trigger_parser_ok=1
+for trigger_fixture in \
+  $'on:\n  pull_request_review:\n    types: [submitted]' \
+  $'on:\n    pull_request_review:\n      types: [submitted]' \
+  $'on:\n  "pull_request_review"  :\n    types: [submitted]' \
+  $'on:\n  \'pull_request_review\':\n    types: [submitted]'; do
+  printf '%s\n' "$trigger_fixture" \
+    | workflow_source_has_trigger pull_request_review \
+    || trigger_parser_ok=0
+  printf '%s\n' "$trigger_fixture" \
+    | workflow_source_has_trigger_fallback pull_request_review \
+    || trigger_parser_ok=0
+done
+flow_trigger_fixture='on: {"pull_request_review": {types: [submitted]}}'
+multiline_flow_trigger_fixture=$'on: {\n  push: {},\n  "pull_request_review": {types: [submitted]}\n}'
+comment_brace_flow_trigger_fixture=$'on: {\n  pull_request_target: {},\n  workflow_run: {}, # }\n  pull_request_review: {}\n}'
+multiline_quoted_flow_trigger_fixture=$'on: {\n  pull_request_target: {},\n  workflow_run: {types: ["completed\n  }}"]},\n  pull_request_review: {}\n}'
+alias_trigger_fixture=$'name: &event pull_request_review\non:\n  pull_request_target: {}\n  workflow_run: {}\n  *event: {}'
+flow_alias_trigger_fixture=$'name: &event pull_request_review\non: {pull_request_target: {}, workflow_run: {}, *event: {}}'
+merge_alias_trigger_fixture=$'triggers: &triggers\n  pull_request_review: {}\non:\n  <<: *triggers\n  pull_request_target: {}\n  workflow_run: {}'
+whole_on_alias_trigger_fixture=$'triggers: &triggers\n  pull_request_review: {}\non: *triggers'
+dotted_alias_trigger_fixture=$'name: &event.name pull_request_review\non:\n  pull_request_target: {}\n  workflow_run: {}\n  *event.name: {}'
+escaped_trigger_fixture=$'on:\n  pull_request_target: {}\n  workflow_run: {}\n  "pull_request_\\x72eview": {}'
+explicit_trigger_fixture=$'on:\n  pull_request_target: {}\n  workflow_run: {}\n  ? pull_request_review\n  : {}'
+anchored_on_block_trigger_fixture=$'on: &events\n  pull_request_target: {}\n  workflow_run: {}\n  pull_request_review: {}'
+anchored_on_flow_trigger_fixture=$'on: &events {pull_request_target: {}, workflow_run: {}, pull_request_review: {}}'
+tagged_on_block_trigger_fixture=$'on: !!map\n  pull_request_target: {}\n  workflow_run: {}\n  pull_request_review: {}'
+tagged_on_flow_trigger_fixture=$'on: !!map {pull_request_target: {}, workflow_run: {}, pull_request_review: {}}'
+duplicate_on_trigger_fixture=$'on:\n  pull_request_target: {}\n  workflow_run: {}\non:\n  pull_request_review: {}'
+duplicate_on_reverse_trigger_fixture=$'on:\n  pull_request_review: {}\non:\n  pull_request_target: {}\n  workflow_run: {}'
+duplicate_root_flow_on_trigger_fixture='{on: {pull_request_review: {}}, on: {pull_request_target: {}, workflow_run: {}}}'
+duplicate_marked_root_flow_on_trigger_fixture='--- {on: {pull_request_review: {}}, on: {pull_request_target: {}, workflow_run: {}}}'
+if command -v yq >/dev/null 2>&1 \
+   || python3 -c 'import yaml' >/dev/null 2>&1; then
+  printf '%s\n' "$flow_trigger_fixture" \
+    | workflow_source_has_trigger pull_request_review \
+    || trigger_parser_ok=0
+  printf '%s\n' "$multiline_flow_trigger_fixture" \
+    | workflow_source_has_trigger pull_request_review \
+    || trigger_parser_ok=0
+  for parsed_complex_flow_trigger in \
+    pull_request_target workflow_run pull_request_review; do
+    printf '%s\n' "$comment_brace_flow_trigger_fixture" \
+      | workflow_source_has_trigger "$parsed_complex_flow_trigger" \
+      || trigger_parser_ok=0
+    printf '%s\n' "$multiline_quoted_flow_trigger_fixture" \
+      | workflow_source_has_trigger "$parsed_complex_flow_trigger" \
+      || trigger_parser_ok=0
+  done
+fi
+for alias_fixture in \
+  "$alias_trigger_fixture" \
+  "$flow_alias_trigger_fixture" \
+  "$merge_alias_trigger_fixture" \
+  "$whole_on_alias_trigger_fixture" \
+  "$dotted_alias_trigger_fixture" \
+  "$escaped_trigger_fixture" \
+  "$explicit_trigger_fixture" \
+  "$anchored_on_block_trigger_fixture" \
+  "$anchored_on_flow_trigger_fixture" \
+  "$tagged_on_block_trigger_fixture" \
+  "$tagged_on_flow_trigger_fixture"; do
+  if command -v yq >/dev/null 2>&1; then
+    printf '%s\n' "$alias_fixture" \
+      | workflow_source_has_trigger pull_request_review \
+      || trigger_parser_ok=0
+  fi
+  alias_fallback_rc=0
+  printf '%s\n' "$alias_fixture" \
+    | workflow_source_has_trigger_fallback pull_request_review \
+    || alias_fallback_rc=$?
+  [ "$alias_fallback_rc" -eq 2 ] || trigger_parser_ok=0
+  if printf '%s\n' "$alias_fixture" \
+      | workflow_source_lacks_trigger pull_request_review; then
+    trigger_parser_ok=0
+  fi
+done
+for duplicate_fixture in \
+  "$duplicate_on_trigger_fixture" \
+  "$duplicate_on_reverse_trigger_fixture" \
+  "$duplicate_root_flow_on_trigger_fixture" \
+  "$duplicate_marked_root_flow_on_trigger_fixture"; do
+  for duplicate_trigger in \
+    pull_request_target workflow_run pull_request_review; do
+    duplicate_parser_rc=0
+    printf '%s\n' "$duplicate_fixture" \
+      | workflow_source_has_trigger "$duplicate_trigger" \
+      || duplicate_parser_rc=$?
+    [ "$duplicate_parser_rc" -eq 2 ] || trigger_parser_ok=0
+    duplicate_fallback_rc=0
+    printf '%s\n' "$duplicate_fixture" \
+      | workflow_source_has_trigger_fallback "$duplicate_trigger" \
+      || duplicate_fallback_rc=$?
+    [ "$duplicate_fallback_rc" -eq 2 ] || trigger_parser_ok=0
+  done
+done
+printf '%s\n' "$flow_trigger_fixture" \
+  | workflow_source_has_trigger_fallback pull_request_review \
+  || trigger_parser_ok=0
+printf '%s\n' "$multiline_flow_trigger_fixture" \
+  | workflow_source_has_trigger_fallback pull_request_review \
+  || trigger_parser_ok=0
+for complex_flow_trigger in \
+  pull_request_target workflow_run pull_request_review; do
+  printf '%s\n' "$comment_brace_flow_trigger_fixture" \
+    | workflow_source_has_trigger_fallback "$complex_flow_trigger" \
+    || trigger_parser_ok=0
+  printf '%s\n' "$multiline_quoted_flow_trigger_fixture" \
+    | workflow_source_has_trigger_fallback "$complex_flow_trigger" \
+    || trigger_parser_ok=0
+done
+for non_trigger_fixture in \
+  $'on:\n  pull_request_review_thread:\n    types: [submitted]' \
+  $'on:\n  workflow_call:\n    inputs:\n      pull_request_review:\n        required: false' \
+  $'on: {workflow_call: {inputs: {other: {}, pull_request_review: {required: false}}}}' \
+  $'on:\n  # pull_request_review:\njobs:\n  pull_request_review:\n    steps:\n      - run: |\n          pull_request_review:'; do
+  if ! printf '%s\n' "$non_trigger_fixture" \
+      | workflow_source_lacks_trigger pull_request_review; then
+    trigger_parser_ok=0
+  fi
+  if printf '%s\n' "$non_trigger_fixture" \
+      | workflow_source_has_trigger_fallback pull_request_review; then
+    trigger_parser_ok=0
+  fi
+done
+if [ "$trigger_parser_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: trigger parser handles quoted, spaced, and flow keys without matching comments, steps, or similarly named keys"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: trigger parser must recognize every valid pull_request_review key spelling and reject inert lookalikes" >&2
+fi
+fi
+
+# Parse via yq (preferred — no extra deps needed in GitHub-hosted
+# runner) → python3+PyYAML → grep fallback. Graceful skip when no
+# YAML parser is available rather than treating absence as failure.
+if command -v yq >/dev/null 2>&1; then
+  if yq eval '.' "$WORKFLOW" >/dev/null 2>&1; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow YAML parses (via yq)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow YAML invalid (per yq)" >&2
+  fi
+elif python3 -c "import yaml" >/dev/null 2>&1; then
+  # Pass the path via argv (sys.argv[1]) instead of string-interpolating
+  # `$WORKFLOW` into the Python source literal. Interpolation was brittle:
+  # a path containing a quote or backslash would break the literal (or
+  # worse). argv keeps the path out of the parsed Python text entirely.
+  if python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$WORKFLOW" 2>/dev/null; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow YAML parses (via python+PyYAML)"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow YAML invalid (per python+PyYAML)" >&2
+  fi
+else
+  skip_reason="no YAML parser available; install yq or PyYAML for the parse assertion"
+  echo "  INFO: $skip_reason"
+fi
+
+# ── Test 2: required triggers present
+# Codex P1 on PR #202 r1: workflow_run replaces check_suite (which
+# doesn't fire for Actions-created suites).
+for trig in 'pull_request_target' 'workflow_run'; do
+  if workflow_source_has_trigger "$trig" < "$WORKFLOW"; then
+    pass=$((pass + 1))
+    echo "  PASS: trigger '$trig' configured"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: missing required trigger '$trig'" >&2
+  fi
+done
+
+# #2239: the publisher's nominate-auto-clear job dispatches exactly this
+# type. repository_dispatch runs only the default branch's copy of the file,
+# so it is safe beside the queue credentials; workflow_dispatch would run the
+# dispatcher's chosen ref and must stay absent.
+if workflow_source_has_trigger repository_dispatch < "$WORKFLOW" \
+   && [ "$(awk '/^  repository_dispatch:$/ { f=1; next } f && /^    types:/ { print; exit } f && /^  [^ ]/ { exit }' "$WORKFLOW")" = '    types: [auto-clear-evaluate]' ] \
+   && workflow_source_lacks_trigger workflow_dispatch < "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: repository_dispatch auto-clear-evaluate is the only dispatch trigger (#2239)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the workflow must listen to repository_dispatch types [auto-clear-evaluate] and carry no workflow_dispatch (#2239)" >&2
+fi
+
+# pull_request_review runs on the PR merge ref. Keeping that trigger in a
+# workflow that names the queue-policy environment would let a same-repo PR
+# rewrite the workflow definition and request administrator credentials.
+if ! workflow_source_lacks_trigger pull_request_review < "$WORKFLOW"; then
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_review trigger must be provably absent from the queue-credential workflow" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_review is routed through trusted workflow_run before queue credentials are available"
+fi
+
+if [ "$(grep -cE '^[[:space:]]+environment: merge-queue-policy$' "$WORKFLOW")" -eq 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both trusted jobs bind queue credentials through the main-only merge-queue-policy environment"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: both trusted queue-credential jobs must name the merge-queue-policy environment" >&2
+fi
+
+# Negative: workflow_run is the canonical post-CI signal. check_suite
+# would silently fail to fire for GitHub-Actions-created suites.
+if grep -qE "^[[:space:]]+check_suite:" "$WORKFLOW"; then
+  fail=$((fail + 1))
+  echo "  FAIL: check_suite trigger should NOT be present (codex P1 on #202 — doesn't fire for Actions suites)" >&2
+else
+  pass=$((pass + 1))
+  echo "  PASS: check_suite trigger absent (regression closed for codex P1 on #202)"
+fi
+
+# Schedule trigger present (#197 sub-C of #191) — catches the
+# 👍-after-last-push case where no event-driven trigger fires.
+# CR Minor on PR #213: anchor to the actual cron entry (not just
+# any `schedule:` / `cron:` text anywhere) so a comment couldn't
+# satisfy the assertion.
+if grep -qE "^[[:space:]]+schedule:" "$WORKFLOW" && \
+   grep -qF -- "- cron: '*/5 * * * *'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: schedule trigger configured with 5-min cron (#197/#324)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: missing schedule trigger or expected cron entry (5-min cron per #324)" >&2
+fi
+
+# scheduled-sweep job exists and is gated to schedule-only events.
+# Anchor to the executable `if:` line so a string in a comment
+# couldn't satisfy the assertion. CR Minor on PR #213.
+if grep -qE "^[[:space:]]+scheduled-sweep:" "$WORKFLOW" && \
+   grep -qE "^[[:space:]]+if:[[:space:]]+github\.event_name == 'schedule'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: scheduled-sweep job gated by executable 'if: ... schedule' line"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: scheduled-sweep job missing or not gated to schedule events (executable line)" >&2
+fi
+
+# CR Major on PR #213: gh pr list defaults to --limit 30. The scheduled
+# sweep must use a higher limit so repos with many open
+# needs-external-review PRs get them ALL processed, not just the first 30.
+#
+# #730/#731 (Codex P3): anchor this to the sweep's LABEL-FILTERED query
+# specifically, not "the first gh pr list". The #730 head_sha fallback added
+# a SECOND, intentionally-unlabeled `gh pr list` that appears EARLIER in the
+# file — a bare first-match assertion (the old `awk '/gh pr list/,/…/'`
+# range) could pass against that fallback's --limit and keep printing the
+# "handles >30-PR repos" pass even if the sweep later lost its own --limit.
+# The sweep query is the one carrying `--label needs-external-review`; require
+# --limit ≥100 on that same query line. (The #730 fallback is intentionally
+# unlabeled — it matches a single head SHA, not the label queue.)
+if grep -E -- '--label needs-external-review' "$WORKFLOW" | grep -qE -- '--limit [1-9][0-9]{2,}'; then
+  pass=$((pass + 1))
+  echo "  PASS: scheduled-sweep label-filtered query uses --limit ≥100 (handles >30-PR repos; #730-anchored)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: sweep 'gh pr list --label needs-external-review' must use --limit ≥100 (CR Major #213; anchored per #730 Codex P3)" >&2
+fi
+
+# CR Major on PR #213: opt-out parser must strip trailing YAML
+# comments. `scheduled_sweep_enabled: false  # opt out` was being
+# parsed as `false#optout`. The fix is `sub(/#.*/, "")` before the
+# value extraction.
+if grep -qE 'sub\(/#\.\*/, ""\)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: opt-out parser strips trailing YAML comments"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: opt-out parser must strip trailing YAML comments (CR Major on PR #213)" >&2
+fi
+
+# CR Major on PR #213 r2: evaluate-and-clear must skip on cron runs.
+# Without this guard, every 15-min sweep paid for a checkout-only
+# no-op job before the event resolver decided 'schedule' was
+# unsupported.
+if grep -qE -- "github\.event_name != 'schedule'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: evaluate-and-clear skips schedule events (cron runs only the sweep job)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: evaluate-and-clear must skip schedule events (CR Major on PR #213 r2)" >&2
+fi
+
+# CR Major on PR #213 r2: sweep must capture `gh pr list` exit
+# status separately, not via process substitution into mapfile (which
+# swallows the producer's exit code, silently turning a gh failure
+# into "0 PRs found"). #324 wrapped the gh call in
+# `with_gh_retry`; tolerate either form.
+if grep -qE -- 'if ! prs_raw=\$\((with_gh_retry )?gh pr list' "$WORKFLOW" && \
+   grep -qE -- 'echo "::error::Failed to list open PRs' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: sweep captures gh pr list exit status (no silent failure on gh error)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: sweep must capture gh pr list status separately, not via mapfile <(...) (CR Major on PR #213 r2)" >&2
+fi
+
+# workflow_run must listen to the EXACT upstream workflow names. A
+# rename or typo on either side would silently break the auto-clear
+# without this test catching it. CR Trivial on PR #202 r2.
+# "repo-lint-local" added for #655 — the consumer-local repo_lint_local.yml
+# annex (#601), verified against a live consumer's annex workflow name.
+# ".github/workflows/repo_lint_local.yml" added for #655 round 11 —
+# workflow_run matches by displayed name, which is the workflow FILE PATH
+# when the annex omits a top-level `name:` key (round 6's fallback case).
+# "Merge Clearance Gate" added for #730 — its SUCCESS is the direct clearance
+# signal, and unlike "PR Review Policy" it actually reaches conclusion=success
+# when the gate clears (PR Review Policy's Label Gate is red while the label is
+# present, so it never triggers auto-clear via workflow_run).
+for wf in 'PR Review Policy' 'Agent Review Pipeline' 'Merge Clearance Gate' 'repo-lint' 'repo-lint-local' '.github/workflows/repo_lint_local.yml'; do
+  if grep -qF -- "- \"$wf\"" "$WORKFLOW"; then
+    pass=$((pass + 1))
+    echo "  PASS: workflow_run listens to '$wf'"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: workflow_run missing '$wf'" >&2
+  fi
+done
+
+# #2167: no runner-held waiting. This workflow is re-entered by workflow_run
+# (repo-lint, the gate, the policy workflow) and by its sweep; every job
+# evaluates once and exits. A `while`/`until` loop that is not a `read` loop
+# over enumerated PRs, or a `--watch`, is the shape that held a runner for a
+# whole CI run (#1062 finding 5). Text-level and disclosed: comments are
+# stripped (full-line and inline), the loop keyword must sit at a statement
+# position, and a wait respelled as a bounded `for` with a long `sleep` is a
+# stated residual (#977's parsed-shell substrate). Same assertion shape as
+# scripts/ci/check_merge_clearance_gate and check_required_check_publisher.
+# Comment stripping is SHELL-QUOTE AWARE for this scan (Codex P2 on #2171,
+# round 2): a plain "strip from whitespace-#" treats the hash inside
+# `echo "state #"; while true; ...` as a comment and hides the loop. Quote
+# state resets per line — a quoted string spanning lines is the stated
+# residual (#977). Same stripper as scripts/ci/check_merge_clearance_gate.
+ac_nowait_text=$(awk -v sqc="'" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0; out = ""; sq = 0; dq = 0; esc = 0; prev = " "; n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        if (esc) { out = out c; esc = 0; prev = c; continue }
+        if (c == "\\" && !sq) { out = out c; esc = 1; prev = c; continue }
+        if (c == sqc && !dq) { sq = !sq }
+        else if (c == "\"" && !sq) { dq = !dq }
+        else if (c == "#" && !sq && !dq && prev ~ /[[:space:]]/) { break }
+        out = out c; prev = c
+      }
+      # A loop keyword ending a line continues on the next (Codex P2 on
+      # #2171, round 3): `while` / newline / `true; do ...` is one statement
+      # to the shell, so the two lines are joined before the scan.
+      if (pending != "") { out = pending " " out; pending = "" }
+      if (out ~ /(^|[[:space:]])(while|until)[[:space:]]*$/) { pending = out; next }
+      print out
+    }
+    END { if (pending != "") print pending }' "$WORKFLOW")
+# Classified per OCCURRENCE, not per line (Codex P2 on #2171): a line that
+# carries `while true; do sleep 15; done; while read -r x; ...` must still
+# trip on its first loop. Each statement-position loop keyword is extracted
+# with its optional `IFS=` prefix and first command word; only an occurrence
+# whose command word is `read` is exempt.
+ac_poll_loops() {  # <comment-stripped text> -> "<line>: <occurrence>" per non-read loop
+  grep -nE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]' <<<"$1" \
+    | while IFS= read -r hit; do
+        n=${hit%%:*}; body=${hit#*:}
+        grep -oE '(^[[:space:]]*|;[[:space:]]*|&&[[:space:]]*|\|\|[[:space:]]*|(^|[[:space:]])do[[:space:]]+|(^|[[:space:]])then[[:space:]]+)(while|until)[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?[^[:space:];]+' <<<"$body" \
+          | grep -vE '(^|[^[:alnum:]_])while[[:space:]]+(IFS=[^[:space:];]*[[:space:]]+)?read$' \
+          | sed "s/^[[:space:]]*/$n: /" || true
+      done || true
+}
+ac_loop_hits=$(ac_poll_loops "$ac_nowait_text")
+if [ -z "$ac_loop_hits" ] && ! grep -qE -- '--watch([[:space:]=]|$)' <<<"$ac_nowait_text"; then
+  pass=$((pass + 1))
+  echo "  PASS: [#2167 no runner-held wait] no while/until poll loop and no --watch in any run block"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: [#2167 no runner-held wait] a while/until loop that is not a read loop, or a --watch, holds a runner while CI executes:" >&2
+  printf '%s\n' "$ac_loop_hits" | sed 's/^/        /' | head -5 >&2
+fi
+
+# A consumer annex may use any top-level workflow name, which cannot be
+# enumerated in workflow_run.workflows. The existing five-minute sweep must
+# therefore re-enter the exact-head approval continuation for open approved
+# PRs as a bounded general backstop (#1062).
+if grep -qF -- "--search 'review:approved'" "$WORKFLOW" \
+   && grep -qF -- 'Continue approved PRs after custom-workflow completions' "$WORKFLOW" \
+   && grep -qF -- 'scripts/workflow/approval-merge-continuation.sh "$PR" "$REPO"' "$WORKFLOW" \
+   && grep -qF -- 'echo "enabled=$enabled" >> "$GITHUB_OUTPUT"' "$WORKFLOW" \
+   && [ "$(grep -cF "steps.find.outputs.enabled != 'false'" "$WORKFLOW")" -eq 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: enabled scheduled sweep backstops custom annex workflow names and preserves the opt-out (#1062)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: scheduled sweep must continue approved PRs whose custom annex name cannot appear in workflow_run.workflows, while honoring scheduled_sweep_enabled:false (#1062)" >&2
+fi
+
+# Both approval-continuation loops have their own failure-surfacing step. An
+# infrastructure/config failure must therefore export both the sentinel and
+# the affected PR list before exiting nonzero; shell-local variables disappear
+# at the step boundary and cannot drive the following check-run publisher.
+event_continuation_block=$(awk '
+  /- name: Continue approved PRs after completed checks/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Continue approved PRs after completed checks/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+clear_block=$(awk '
+  /- name: Re-evaluate gate per PR \+ remove label on pass/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Re-evaluate gate per PR \+ remove label on pass/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+scheduled_clear_block=$(awk '
+  /- name: Re-evaluate gate per PR$/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Re-evaluate gate per PR$/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+scheduled_continuation_block=$(awk '
+  /- name: Continue approved PRs after custom-workflow completions/ {in_block=1}
+  in_block && /- name:/ && $0 !~ /- name: Continue approved PRs after custom-workflow completions/ {exit}
+  in_block {print}
+' "$WORKFLOW")
+clear_block_protects_before_delete() {
+  local block="$1" protect_line failure_line delete_line
+  protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$block" | head -1 | cut -d: -f1 || true)
+  failure_line=$(grep -nF 'if [ "$protective_rc" -ne 0 ]; then' <<<"$block" | head -1 | cut -d: -f1 || true)
+  delete_line=$(grep -nF 'del_out=$(gh api "repos/$REPO/issues/$PR/labels/needs-external-review" -X DELETE' <<<"$block" | head -1 | cut -d: -f1 || true)
+  grep -Fq 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$block" \
+    && grep -Fq 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$block" \
+    && grep -Fq 'QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}' <<<"$block" \
+    && grep -Fq 'QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}' <<<"$block" \
+    && grep -Fq 'GH_TOKEN: ${{ secrets.CI_ACTOR_TOKEN || secrets.REVIEWER_ASSIGNMENT_TOKEN }}' <<<"$block" \
+    && grep -Fq 'GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$block" \
+    && grep -Fq 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$block" \
+    && grep -Fq 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$block" \
+    && ! grep -Fq -- '--disable-auto' <<<"$block" \
+    && gh_source_lacks_direct_literal_pr_mutation \
+      --allow-needs-external-review-delete <<<"$block" \
+    && [ -n "$protect_line" ] && [ -n "$failure_line" ] && [ -n "$delete_line" ] \
+    && [ "$protect_line" -lt "$failure_line" ] \
+    && [ "$failure_line" -lt "$delete_line" ] \
+    && grep -Fq 'had_infra_error=1' <<<"$block"
+}
+if clear_block_protects_before_delete "$clear_block" \
+   && clear_block_protects_before_delete "$scheduled_clear_block"; then
+  pass=$((pass + 1))
+  echo "  PASS: both label-clear paths pair runtime arm classification with a direct-mutation regression scan before PAT-backed blocker deletion"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: every label-clear path must classify arms, reject direct mutation syntax, and retain the PAT only for deleting needs-external-review" >&2
+fi
+
+# Execute both literal clear blocks against a token-aware stub. Structural
+# ordering alone cannot prove that a failed arm-classification call skips the
+# DELETE, or that the ambient PAT still owns the label write that re-triggers
+# downstream workflows.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+clear_harness_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-protection.XXXXXX")
+mkdir -p "$clear_harness_dir/bin" "$clear_harness_dir/scripts/lib" \
+  "$clear_harness_dir/scripts/workflow"
+
+extract_named_run_block() {
+  local name="$1" destination="$2"
+  awk -v target="$name" '
+    $0 == "      - name: " target { in_step=1; next }
+    in_step && $0 == "        run: |" { in_run=1; next }
+    in_run && /^          / { sub(/^          /, ""); print; next }
+    in_run && /^[[:space:]]*$/ { print; next }
+    in_run { exit }
+  ' "$WORKFLOW" >"$destination"
+}
+
+extract_named_run_block \
+  'Re-evaluate gate per PR + remove label on pass' \
+  "$clear_harness_dir/event-clear.sh"
+extract_named_run_block \
+  'Re-evaluate gate per PR' \
+  "$clear_harness_dir/scheduled-clear.sh"
+
+cat >"$clear_harness_dir/scripts/lib/gh-retry-helpers.sh" <<'STUB'
+with_gh_retry() { "$@"; }
+STUB
+cat >"$clear_harness_dir/scripts/codex-review-check.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+cat >"$clear_harness_dir/scripts/workflow/approval-merge-continuation.sh" <<'STUB'
+#!/usr/bin/env bash
+# APPROVAL_PROTECTIVE_RETRACTION_V2
+printf 'protect:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+exit "${CLEAR_PROTECT_RC:-0}"
+STUB
+cat >"$clear_harness_dir/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-} ${2:-}" in
+  'pr view')
+    if [ "$(cat "${CLEAR_LABEL_STATE:?}")" = present ]; then
+      printf 'true\n'
+    else
+      printf 'false\n'
+    fi
+    ;;
+  'pr comment')
+    printf 'comment:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+    ;;
+  'api repos/owner/repo/pulls/7')
+    # #2239: the live head/base pair. Read N answers line N of CLEAR_PAIRS
+    # (the last line once they run out); a line `fail` is a failed read.
+    n=$(( $(cat "${CLEAR_PAIR_READS:?}") + 1 ))
+    printf '%s\n' "$n" >"$CLEAR_PAIR_READS"
+    printf 'pair:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+    line=$(sed -n "${n}p" "${CLEAR_PAIRS:?}")
+    [ -n "$line" ] || line=$(tail -n 1 "$CLEAR_PAIRS")
+    if [ "$line" = fail ]; then
+      echo 'HTTP 502: Bad Gateway' >&2
+      exit 1
+    fi
+    printf '%s\n' "$line"
+    ;;
+  'api repos/owner/repo/issues/7/labels/needs-external-review')
+    printf 'delete:%s\n' "${GH_TOKEN:-unset}" >>"${CLEAR_STUB_LOG:?}"
+    printf 'absent\n' >"${CLEAR_LABEL_STATE:?}"
+    printf 'HTTP/2.0 204 No Content\n'
+    ;;
+  *)
+    printf 'unexpected gh call: %s\n' "$*" >&2
+    exit 90
+    ;;
+esac
+STUB
+chmod +x "$clear_harness_dir/bin/gh" \
+  "$clear_harness_dir/scripts/codex-review-check.sh" \
+  "$clear_harness_dir/scripts/workflow/approval-merge-continuation.sh"
+
+clear_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+clear_sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+clear_sha_c=cccccccccccccccccccccccccccccccccccccccc
+run_clear_harness() {
+  # Optional 4th-6th arguments (#2193): the initial label state and the
+  # triggering event name and action the event-driven block reads.
+  # CLEAR_PAIR_LINES (#2239): the live head/base answers, one per read;
+  # default a stable pair.
+  local script="$1" input_name="$2" protective_rc="$3"
+  local label_state="${4:-present}" event_name="${5:-}" event_action="${6:-}"
+  printf '%s\n' "$label_state" >"$clear_harness_dir/label-state"
+  printf '%s\n' "${CLEAR_PAIR_LINES:-$(printf '%s\t%s' "$clear_sha_a" "$clear_sha_b")}" >"$clear_harness_dir/pairs"
+  printf '0\n' >"$clear_harness_dir/pair-reads"
+  : >"$clear_harness_dir/calls.log"
+  : >"$clear_harness_dir/github-env"
+  : >"$clear_harness_dir/github-output"
+  (
+    cd "$clear_harness_dir"
+    env \
+      PATH="$clear_harness_dir/bin:$PATH" \
+      GH_TOKEN=pat-token \
+      WORKFLOW_TOKEN=workflow-token \
+      AUTHOR_TOKEN=author-token \
+      QUEUE_POLICY_TOKEN=queue-policy-token \
+      QUEUE_SOURCE_TOKEN=queue-source-token \
+      REPO=owner/repo \
+      PR_NUMBERS="$([ "$input_name" = PR_NUMBERS ] && printf 7)" \
+      PRS="$([ "$input_name" = PRS ] && printf 7)" \
+      CLEAR_PROTECT_RC="$protective_rc" \
+      EVENT_NAME="$event_name" \
+      EVENT_ACTION="$event_action" \
+      CLEAR_STUB_LOG="$clear_harness_dir/calls.log" \
+      CLEAR_LABEL_STATE="$clear_harness_dir/label-state" \
+      CLEAR_PAIRS="$clear_harness_dir/pairs" \
+      CLEAR_PAIR_READS="$clear_harness_dir/pair-reads" \
+      GITHUB_ENV="$clear_harness_dir/github-env" \
+      GITHUB_OUTPUT="$clear_harness_dir/github-output" \
+      bash "$script" >"$clear_harness_dir/run.out" 2>&1
+  )
+}
+
+clear_execution_ok=1
+heal_candidates_ok=1
+for clear_case in event scheduled; do
+  if [ "$clear_case" = event ]; then
+    clear_script="$clear_harness_dir/event-clear.sh"
+    clear_input=PR_NUMBERS
+  else
+    clear_script="$clear_harness_dir/scheduled-clear.sh"
+    clear_input=PRS
+  fi
+
+  set +e
+  run_clear_harness "$clear_script" "$clear_input" 0
+  clear_success_rc=$?
+  set -e
+  clear_success_calls=$(grep -E '^(protect|delete|comment):' \
+    "$clear_harness_dir/calls.log" | tr '\n' ' ' || true)
+  if [ "$clear_success_rc" -ne 0 ] \
+     || [ "$clear_success_calls" != \
+          'protect:workflow-token delete:pat-token comment:pat-token ' ]; then
+    echo "  INFO: $clear_case clear success fixture rc=$clear_success_rc calls='$clear_success_calls'" >&2
+    sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    clear_execution_ok=0
+  fi
+  # #2193: a clean removal makes the PR a heal candidate for the job's heal
+  # step, whichever job removed it.
+  if ! grep -Fxq 'heal_prs=7' "$clear_harness_dir/github-output"; then
+    echo "  INFO: $clear_case clean removal did not emit heal_prs=7" >&2
+    sed 's/^/        output: /' "$clear_harness_dir/github-output" >&2
+    heal_candidates_ok=0
+  fi
+
+  set +e
+  run_clear_harness "$clear_script" "$clear_input" 3
+  clear_failure_rc=$?
+  set -e
+  if [ "$clear_failure_rc" -ne 1 ] \
+     || ! grep -Fxq 'protect:workflow-token' "$clear_harness_dir/calls.log" \
+     || grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log" \
+     || ! grep -Fxq 'HAD_INFRA_ERROR=1' "$clear_harness_dir/github-env"; then
+    echo "  INFO: $clear_case clear failure fixture rc=$clear_failure_rc" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    clear_execution_ok=0
+  fi
+  # #2193: an infrastructure error never makes the PR a heal candidate; the
+  # surfacing step owns it.
+  if ! grep -Fxq 'heal_prs=' "$clear_harness_dir/github-output"; then
+    echo "  INFO: $clear_case infra-error pass emitted a heal candidate" >&2
+    sed 's/^/        output: /' "$clear_harness_dir/github-output" >&2
+    heal_candidates_ok=0
+  fi
+done
+
+if [ "$clear_execution_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both literal clear blocks classify arms before PAT deletion and skip all writes on classification failure"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: label-clear execution must use read-only arm classification, PAT deletion, and no writes after classification failure" >&2
+fi
+
+# #2193: label already absent. The event-driven block nominates the PR on a
+# pull_request_target action other than synchronize (the `edited` nudge is
+# the case that matters: the sweep may never list a PR whose label is gone),
+# and never on synchronize or workflow_run. The sweep nominates a stale
+# search-index hit. Neither touches the protective helper, the DELETE or the
+# comment when the label is absent.
+clear_absent_case() {
+  local script="$1" input_name="$2" event_name="$3" event_action="$4" expected="$5"
+  set +e
+  run_clear_harness "$script" "$input_name" 0 absent "$event_name" "$event_action"
+  local rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] \
+     || grep -Eq '^(protect|delete|comment):' "$clear_harness_dir/calls.log" \
+     || ! grep -Fxq "heal_prs=$expected" "$clear_harness_dir/github-output"; then
+    echo "  INFO: label-absent case ($input_name $event_name/$event_action) rc=$rc expected heal_prs=$expected" >&2
+    sed 's/^/        output: /' "$clear_harness_dir/github-output" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    heal_candidates_ok=0
+  fi
+}
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_target edited 7
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_target labeled 7
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS pull_request_target synchronize ''
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS workflow_run completed ''
+clear_absent_case "$clear_harness_dir/scheduled-clear.sh" PRS '' '' 7
+# #2205: a publisher nomination of a label-absent PR is the routine heal retry.
+clear_absent_case "$clear_harness_dir/event-clear.sh" PR_NUMBERS repository_dispatch auto-clear-evaluate 7
+
+# #2239: the publisher's repository_dispatch reaches the same evaluation. A
+# labeled PR whose gate passes on a head that stayed put loses the label; a
+# head (or base) that moves between the capture before the gate and the
+# pre-DELETE read removes nothing and is not an infrastructure error; an
+# unreadable pre-DELETE pair removes nothing and IS one. Both jobs carry the
+# fence, so both are exercised; the event block runs as a dispatch.
+fence_ok=1
+for clear_case in event scheduled; do
+  if [ "$clear_case" = event ]; then
+    clear_script="$clear_harness_dir/event-clear.sh"; clear_input=PR_NUMBERS
+    fence_event=repository_dispatch; fence_action=auto-clear-evaluate
+  else
+    clear_script="$clear_harness_dir/scheduled-clear.sh"; clear_input=PRS
+    fence_event=''; fence_action=''
+  fi
+  set +e
+  run_clear_harness "$clear_script" "$clear_input" 0 present "$fence_event" "$fence_action"
+  fence_rc=$?
+  set -e
+  if [ "$fence_rc" -ne 0 ] \
+     || [ "$(grep -E '^(protect|delete|comment):' "$clear_harness_dir/calls.log" | tr '\n' ' ')" != \
+          'protect:workflow-token delete:pat-token comment:pat-token ' ] \
+     || [ "$(grep -c '^pair:workflow-token$' "$clear_harness_dir/calls.log")" -ne 2 ]; then
+    echo "  INFO: $clear_case stable-head pass rc=$fence_rc (expected one removal and two workflow-token pair reads)" >&2
+    sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    fence_ok=0
+  fi
+  for moved_pair in "$clear_sha_c"$'\t'"$clear_sha_b" "$clear_sha_a"$'\t'"$clear_sha_c"; do
+    set +e
+    CLEAR_PAIR_LINES="$(printf '%s\t%s\n%s' "$clear_sha_a" "$clear_sha_b" "$moved_pair")" \
+      run_clear_harness "$clear_script" "$clear_input" 0 present "$fence_event" "$fence_action"
+    fence_rc=$?
+    set -e
+    if [ "$fence_rc" -ne 0 ] \
+       || grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log" \
+       || [ "$(cat "$clear_harness_dir/label-state")" != present ] \
+       || grep -Fxq 'HAD_INFRA_ERROR=1' "$clear_harness_dir/github-env" \
+       || ! grep -Fxq 'heal_prs=' "$clear_harness_dir/github-output" \
+       || ! grep -q 'moved while the merge gate was evaluated' "$clear_harness_dir/run.out"; then
+      echo "  INFO: $clear_case moved pair ($moved_pair) rc=$fence_rc removed the label or failed" >&2
+      sed 's/^/        call: /' "$clear_harness_dir/calls.log" >&2
+      sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+      fence_ok=0
+    fi
+  done
+  set +e
+  CLEAR_PAIR_LINES="$(printf '%s\t%s\nfail' "$clear_sha_a" "$clear_sha_b")" \
+    run_clear_harness "$clear_script" "$clear_input" 0 present "$fence_event" "$fence_action"
+  fence_rc=$?
+  set -e
+  if [ "$fence_rc" -ne 1 ] \
+     || grep -Eq '^(delete|comment):' "$clear_harness_dir/calls.log" \
+     || ! grep -Fxq 'HAD_INFRA_ERROR=1' "$clear_harness_dir/github-env"; then
+    echo "  INFO: $clear_case unreadable pre-delete pair rc=$fence_rc (expected 1, no removal, infra sentinel)" >&2
+    sed 's/^/        /' "$clear_harness_dir/run.out" >&2
+    fence_ok=0
+  fi
+done
+if [ "$fence_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both clear blocks (the event block run as a #2239 dispatch) remove the label only when the head/base captured before the gate is still live, and treat an unreadable pair as an infra error"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a merge-gate removal must be fenced on the live head/base captured before the gate; a moved pair removes nothing (#2239)" >&2
+fi
+
+if [ "$heal_candidates_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both clear blocks nominate a PR left label-absent by a clean pass for the stale-check heal, and never one that hit an infra error (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: clear blocks must emit heal_prs for clean label-absent passes (removal in both jobs, edited/labeled event path, stale sweep hit) and not for infra errors, synchronize or workflow_run (#2193)" >&2
+fi
+rm -rf "$clear_harness_dir"
+fi
+
+# ── #2193: heal a stale failed auto-clear-blocking-labels check-run
+# Executes both jobs' literal heal-step run blocks against the real helper and
+# a gh stub that applies the helper's own --jq filters to fixture JSON. The
+# stub serves a PR whose head and label can change between the helper's two
+# reads, and a check-run list whose ARRAY order disagrees with its time
+# order, so an implementation that trusts array order fails one direction.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+heal_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-heal.XXXXXX")
+mkdir -p "$heal_dir/bin" "$heal_dir/scripts/lib" "$heal_dir/scripts/workflow"
+cp "$ROOT/scripts/lib/gh-retry-helpers.sh" "$heal_dir/scripts/lib/"
+if [ -f "$ROOT/scripts/workflow/heal-auto-clear-infra-check.sh" ]; then
+  cp "$ROOT/scripts/workflow/heal-auto-clear-infra-check.sh" "$heal_dir/scripts/workflow/"
+fi
+extract_heal_block() {
+  local name="$1" destination="$2"
+  awk -v target="$name" '
+    $0 == "      - name: " target { in_step=1; next }
+    in_step && $0 == "        run: |" { in_run=1; next }
+    in_run && /^          / { sub(/^          /, ""); print; next }
+    in_run && /^[[:space:]]*$/ { print; next }
+    in_run { exit }
+  ' "$WORKFLOW" >"$destination"
+}
+extract_heal_block 'Heal stale auto-clear infra-failure check-runs' "$heal_dir/event-heal.sh"
+extract_heal_block 'Heal stale auto-clear infra-failure check-runs (sweep)' "$heal_dir/sweep-heal.sh"
+
+heal_sha_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+heal_sha_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cat >"$heal_dir/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${1:-}" = api ] || { printf 'unexpected gh call: %s\n' "$*" >&2; exit 90; }
+shift
+endpoint="" jq_filter="" method=GET
+args=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --jq) jq_filter="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    --paginate) shift ;;
+    -f|-F) shift 2 ;;
+    *) [ -z "$endpoint" ] && endpoint="$1"; shift ;;
+  esac
+done
+case "$method $endpoint" in
+  'GET repos/owner/repo/pulls/7')
+    reads=$(cat "$HEAL_STUB_DIR/pr-reads")
+    reads=$((reads + 1))
+    printf '%s\n' "$reads" >"$HEAL_STUB_DIR/pr-reads"
+    # move-after (#2205): reads beyond this many answer the moved PR.
+    if [ "$reads" -gt "$(cat "$HEAL_STUB_DIR/move-after" 2>/dev/null || echo 1)" ] \
+       && [ -f "$HEAL_STUB_DIR/pr-after-first-read.json" ]; then
+      jq -r "$jq_filter" "$HEAL_STUB_DIR/pr-after-first-read.json"
+    else
+      jq -r "$jq_filter" "$HEAL_STUB_DIR/pr.json"
+    fi
+    ;;
+  GET\ repos/owner/repo/commits/*/check-runs\?*)
+    printf 'runs-read:%s\n' "$endpoint" >>"$HEAL_STUB_DIR/calls.log"
+    jq -r "$jq_filter" "$HEAL_STUB_DIR/runs.json"
+    ;;
+  'POST repos/owner/repo/check-runs')
+    # post-fails (#2205): this many POSTs fail first, with post-fail-text.
+    fails=$(cat "$HEAL_STUB_DIR/post-fails" 2>/dev/null || echo 0)
+    if [ "$fails" -gt 0 ]; then
+      printf '%s\n' $((fails - 1)) >"$HEAL_STUB_DIR/post-fails"
+      printf 'post-fail:pr-reads=%s\n' "$(cat "$HEAL_STUB_DIR/pr-reads")" >>"$HEAL_STUB_DIR/calls.log"
+      cat "$HEAL_STUB_DIR/post-fail-text" >&2
+      exit 1
+    fi
+    printf 'post:%s:%s\n' "${GH_TOKEN:-unset}" "${args[*]}" >>"$HEAL_STUB_DIR/calls.log"
+    printf '{}\n'
+    ;;
+  *)
+    printf 'unexpected gh api call: %s %s\n' "$method" "$endpoint" >&2
+    exit 90
+    ;;
+esac
+STUB
+chmod +x "$heal_dir/bin/gh"
+
+heal_pr_json() {
+  local sha="$1" label="$2"
+  if [ "$label" = present ]; then
+    jq -nc --arg s "$sha" '{head:{sha:$s},labels:[{name:"needs-external-review"},{name:"other"}]}'
+  else
+    jq -nc --arg s "$sha" '{head:{sha:$s},labels:[{name:"other"}]}'
+  fi
+}
+heal_run() {
+  local block="$1"; shift
+  local pr_label="$1" runs_json="$2" moved_sha="${3:-}"
+  heal_pr_json "$heal_sha_a" "$pr_label" >"$heal_dir/pr.json"
+  rm -f "$heal_dir/pr-after-first-read.json"
+  if [ -n "$moved_sha" ]; then
+    heal_pr_json "$moved_sha" absent >"$heal_dir/pr-after-first-read.json"
+  fi
+  printf '%s\n' "$runs_json" >"$heal_dir/runs.json"
+  printf '0\n' >"$heal_dir/pr-reads"
+  printf '%s\n' "${HEAL_MOVE_AFTER:-1}" >"$heal_dir/move-after"
+  printf '%s\n' "${HEAL_POST_FAILS:-0}" >"$heal_dir/post-fails"
+  printf '%s\n' "${HEAL_POST_FAIL_TEXT:-HTTP 502: Bad Gateway}" >"$heal_dir/post-fail-text"
+  : >"$heal_dir/calls.log"
+  (
+    cd "$heal_dir"
+    env \
+      PATH="$heal_dir/bin:$PATH" \
+      GH_TOKEN=workflow-token \
+      GH_RETRY_ATTEMPTS="${HEAL_ATTEMPTS:-1}" \
+      GH_RETRY_BACKOFF_SECONDS=0 \
+      HEAL_STUB_DIR="$heal_dir" \
+      REPO=owner/repo \
+      RUN_URL=https://example.test/run/1 \
+      HEAL_PRS=7 \
+      bash "$block" >"$heal_dir/run.out" 2>&1
+  )
+}
+heal_runs() {
+  # heal_runs <conclusion@completed_at@id>... -> a check-runs page JSON
+  local spec items=()
+  for spec in "$@"; do
+    items+=("$(jq -nc --arg c "${spec%%@*}" --arg t "$(cut -d@ -f2 <<<"$spec")" \
+      --argjson i "${spec##*@}" \
+      '{name:"auto-clear-blocking-labels",status:"completed",conclusion:$c,completed_at:$t,started_at:$t,id:$i}')")
+  done
+  if [ "${#items[@]}" -eq 0 ]; then
+    printf '{"total_count":0,"check_runs":[]}'
+  else
+    printf '%s\n' "${items[@]}" | jq -sc '{total_count:length,check_runs:.}'
+  fi
+}
+heal_expect_post() {
+  local label="$1" block="$2" title="$3"
+  if ! grep -q '^post:' "$heal_dir/calls.log" \
+     || [ "$(grep -c '^post:' "$heal_dir/calls.log")" -ne 1 ] \
+     || ! grep -Fq "post:workflow-token:" "$heal_dir/calls.log" \
+     || ! grep -Fq "head_sha=$heal_sha_a" "$heal_dir/calls.log" \
+     || ! grep -Fq 'name=auto-clear-blocking-labels' "$heal_dir/calls.log" \
+     || ! grep -Fq 'conclusion=success' "$heal_dir/calls.log" \
+     || ! grep -Fq 'status=completed' "$heal_dir/calls.log" \
+     || ! grep -Fq "output[title]=$title" "$heal_dir/calls.log" \
+     || ! grep -Fq 'https://example.test/run/1' "$heal_dir/calls.log" \
+     || ! grep -Fq "runs-read:repos/owner/repo/commits/$heal_sha_a/check-runs?check_name=auto-clear-blocking-labels" "$heal_dir/calls.log"; then
+    echo "  INFO: $block $label: expected exactly one success POST on $heal_sha_a" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    sed 's/^/        /' "$heal_dir/run.out" >&2
+    return 1
+  fi
+}
+heal_expect_no_post() {
+  local label="$1" block="$2"
+  if grep -q '^post:' "$heal_dir/calls.log"; then
+    echo "  INFO: $block $label: expected no POST" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    sed 's/^/        /' "$heal_dir/run.out" >&2
+    return 1
+  fi
+}
+
+heal_stale_failure_ok=1
+heal_quiet_ok=1
+heal_fence_ok=1
+heal_retry_ok=1
+for heal_case in event sweep; do
+  block="$heal_dir/$heal_case-heal.sh"
+  title='Auto-clear confirmed needs-external-review absent'
+  [ "$heal_case" = sweep ] && title='Auto-clear confirmed needs-external-review absent (scheduled sweep)'
+  if [ ! -s "$block" ] || [ ! -f "$heal_dir/scripts/workflow/heal-auto-clear-infra-check.sh" ]; then
+    echo "  INFO: $heal_case heal step or helper missing" >&2
+    heal_stale_failure_ok=0; heal_quiet_ok=0; heal_fence_ok=0
+    continue
+  fi
+  # Stale failure newest, label absent: one success POST on the live head.
+  # Array order lists the newer failure FIRST, so array-last would skip.
+  heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20 success@2026-10-13T20:00:00Z@10)"
+  heal_expect_post 'stale failure' "$heal_case" "$title" || heal_stale_failure_ok=0
+  # A same-second tie resolves by id: the later (higher id) failure wins.
+  heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@21 success@2026-10-14T00:50:00Z@20)"
+  heal_expect_post 'same-second tie' "$heal_case" "$title" || heal_stale_failure_ok=0
+  # No prior run at all: nothing to supersede, no POST.
+  heal_run "$block" absent "$(heal_runs)"
+  heal_expect_no_post 'no prior run' "$heal_case" || heal_quiet_ok=0
+  # Newest already success (an older failure listed LAST): no POST.
+  heal_run "$block" absent "$(heal_runs success@2026-10-14T01:13:00Z@30 failure@2026-10-14T00:50:00Z@20)"
+  heal_expect_no_post 'newest already success' "$heal_case" || heal_quiet_ok=0
+  # Label present on the live head: never claim absence.
+  heal_run "$block" present "$(heal_runs failure@2026-10-14T00:50:00Z@20)"
+  heal_expect_no_post 'label present' "$heal_case" || heal_quiet_ok=0
+  # Head moved between the first read and the pre-POST fence: no POST.
+  heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)" "$heal_sha_b"
+  heal_expect_no_post 'head moved' "$heal_case" || heal_fence_ok=0
+  if ! grep -Fq 'head moved' "$heal_dir/run.out"; then
+    echo "  INFO: $heal_case head-moved case did not reach the fence" >&2
+    heal_fence_ok=0
+  fi
+  # #2205: a transient POST failure is retried, and the PR is re-read before
+  # EVERY attempt: the second attempt's POST follows the third PR read.
+  HEAL_ATTEMPTS=3 HEAL_POST_FAILS=1 \
+    heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)"
+  if ! heal_expect_post 'retried POST' "$heal_case" "$title" \
+     || [ "$(grep -c '^post-fail:pr-reads=2$' "$heal_dir/calls.log")" -ne 1 ] \
+     || [ "$(cat "$heal_dir/pr-reads")" -ne 3 ]; then
+    echo "  INFO: $heal_case retried POST: expected one failed attempt after read 2, then a re-fenced success" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    heal_retry_ok=0
+  fi
+  # The head moves between the failed attempt and the retry: the retry's own
+  # fence stops it, so nothing is posted.
+  HEAL_ATTEMPTS=3 HEAL_POST_FAILS=1 HEAL_MOVE_AFTER=2 \
+    heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)" "$heal_sha_b"
+  if ! heal_expect_no_post 'retry after a head move' "$heal_case" \
+     || ! grep -q '^post-fail:' "$heal_dir/calls.log" \
+     || ! grep -Fq 'head moved' "$heal_dir/run.out"; then
+    echo "  INFO: $heal_case: a retry after the head moved must be stopped by its own fence" >&2
+    heal_retry_ok=0
+  fi
+  # A permanent failure (a 4xx other than a rate limit) is not retried.
+  HEAL_ATTEMPTS=3 HEAL_POST_FAILS=3 HEAL_POST_FAIL_TEXT='HTTP 422: Unprocessable Entity' \
+    heal_run "$block" absent "$(heal_runs failure@2026-10-14T00:50:00Z@20)"
+  if [ "$(grep -c '^post-fail:' "$heal_dir/calls.log")" -ne 1 ] \
+     || grep -q '^post:' "$heal_dir/calls.log"; then
+    echo "  INFO: $heal_case: a permanent POST failure must not be retried" >&2
+    sed 's/^/        call: /' "$heal_dir/calls.log" >&2
+    heal_retry_ok=0
+  fi
+done
+
+if [ "$heal_stale_failure_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both heal steps post one GITHUB_TOKEN success check-run on the live head when the newest auto-clear run is a stale failure (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a clean label-absent pass must supersede a stale failed auto-clear-blocking-labels check-run in both jobs (#2193)" >&2
+fi
+if [ "$heal_quiet_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: heal steps post nothing when there is no prior run, the newest run is green, or the label is present (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: heal steps must add no check-run unless the newest auto-clear run on a label-absent head is a failure (#2193)" >&2
+fi
+if [ "$heal_fence_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: heal steps re-read the head immediately before the POST and skip when it moved (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: heal steps must fence the POST on a fresh head read (#2193)" >&2
+fi
+if [ "$heal_retry_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: heal steps retry a transiently failed POST, re-fencing before each attempt, and never retry a permanent failure (#2205)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: a failed heal POST must be retried under with_gh_retry with a fresh fence before every attempt (#2205)" >&2
+fi
+rm -rf "$heal_dir"
+fi
+
+# #2193 structural: both heal steps run last, survive another PR's infra
+# error (!cancelled), read the clear step's heal output, and post with the
+# workflow GITHUB_TOKEN (a PAT cannot create check-runs).
+heal_step_ok=1
+for heal_step in 'Heal stale auto-clear infra-failure check-runs|steps.clear.outputs.heal_prs|event' \
+                 'Heal stale auto-clear infra-failure check-runs (sweep)|steps.sweep.outputs.heal_prs|sweep'; do
+  heal_name=${heal_step%%|*}
+  heal_rest=${heal_step#*|}
+  heal_output=${heal_rest%%|*}
+  heal_ctx=${heal_rest#*|}
+  heal_block=$(awk -v target="$heal_name" '
+    $0 == "      - name: " target { in_step=1; print; next }
+    in_step && /^      - name: / { exit }
+    in_step && /^  [^ ]/ { exit }
+    in_step { print }
+  ' "$WORKFLOW")
+  if ! grep -Fq "if: \${{ !cancelled() && $heal_output != '' }}" <<<"$heal_block" \
+     || ! grep -Fq 'GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}' <<<"$heal_block" \
+     || ! grep -Fq "HEAL_PRS: \${{ $heal_output }}" <<<"$heal_block" \
+     || ! grep -Fq "bash scripts/workflow/heal-auto-clear-infra-check.sh \"\$REPO\" \"\$RUN_URL\" $heal_ctx \"\$HEAL_PRS\"" <<<"$heal_block"; then
+    echo "  INFO: heal step '$heal_name' is missing its guard, token, input or helper call" >&2
+    heal_step_ok=0
+  fi
+done
+# Last step of each job: the next non-comment line after each heal step's
+# run block is either the next job or EOF.
+if ! awk '
+  /^      - name: Heal stale auto-clear infra-failure check-runs$/ { seen=1; next }
+  seen && /^      - name: / { bad=1 }
+  seen && /^  scheduled-sweep:/ { seen=0 }
+  END { exit bad }
+' "$WORKFLOW" \
+   || [ "$(awk '/^      - name: Heal stale auto-clear infra-failure check-runs \(sweep\)$/ { s=1; next } s && /^      - name: / { print }' "$WORKFLOW")" != "" ] \
+   || ! grep -qE '^        id: sweep$' "$WORKFLOW"; then
+  echo "  INFO: a heal step is not the last step of its job, or the sweep step lacks id: sweep" >&2
+  heal_step_ok=0
+fi
+if [ "$heal_step_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both heal steps run last under !cancelled() with GITHUB_TOKEN on their job's heal output (#2193)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: heal steps must be last in their job, guarded by !cancelled() on the heal output, and post with GITHUB_TOKEN (#2193)" >&2
+fi
+
+event_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
+event_continue_line=$(grep -nF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
+event_no_author_line=$(grep -nF '[ -z "${AUTHOR_TOKEN:-}" ]' <<<"$event_continuation_block" | head -1 | cut -d: -f1 || true)
+scheduled_protect_line=$(grep -nF -- '--retract-unsafe-only "$PR" "$REPO"' <<<"$scheduled_continuation_block" | head -1 | cut -d: -f1 || true)
+scheduled_continue_line=$(grep -nF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$scheduled_continuation_block" | head -1 | cut -d: -f1 || true)
+scheduled_no_author_line=$(grep -nF '[ -z "${AUTHOR_TOKEN:-}" ]' <<<"$scheduled_continuation_block" | head -1 | cut -d: -f1 || true)
+if grep -qF 'echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"' <<<"$event_continuation_block" \
+   && grep -qF 'echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"' <<<"$event_continuation_block" \
+   && grep -qF 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$event_continuation_block" \
+   && grep -qF "APPROVAL_PROTECTIVE_RETRACTION_V2" <<<"$event_continuation_block" \
+   && grep -qF 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$event_continuation_block" \
+   && grep -qF 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$event_continuation_block" \
+   && grep -qF 'QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}' <<<"$event_continuation_block" \
+   && grep -qF 'QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}' <<<"$event_continuation_block" \
+   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'elif [ "$protective_rc" -eq 0 ]; then' <<<"$event_continuation_block" \
+   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$event_continuation_block" \
+   && ! grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$AUTHOR_TOKEN"' <<<"$event_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$event_continuation_block" \
+   && [ -n "$event_protect_line" ] && [ -n "$event_no_author_line" ] && [ -n "$event_continue_line" ] \
+   && [ "$event_protect_line" -lt "$event_no_author_line" ] \
+   && [ "$event_no_author_line" -lt "$event_continue_line" ] \
+   && grep -qF 'echo "CONTINUATION_INFRA_ERROR=$continuation_infra_error" >> "$GITHUB_ENV"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'echo "CONTINUATION_INFRA_ERROR_PRS=$(echo $continuation_failing_prs)" >> "$GITHUB_ENV"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'if [ ! -f scripts/workflow/approval-merge-continuation.sh ]; then' <<<"$scheduled_continuation_block" \
+   && grep -qF "APPROVAL_PROTECTIVE_RETRACTION_V2" <<<"$scheduled_continuation_block" \
+   && grep -qF 'AUTHOR_TOKEN: ${{ secrets.AUTHOR_MERGE_TOKEN }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'WORKFLOW_TOKEN: ${{ github.token }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'QUEUE_POLICY_TOKEN: ${{ secrets.MERGE_QUEUE_POLICY_TOKEN }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'QUEUE_SOURCE_TOKEN: ${{ secrets.MERGE_QUEUE_SOURCE_TOKEN }}' <<<"$scheduled_continuation_block" \
+   && grep -qF 'GH_TOKEN="$WORKFLOW_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'elif [ "$protective_rc" -eq 0 ]; then' <<<"$scheduled_continuation_block" \
+   && grep -qF 'GH_TOKEN="$AUTHOR_TOKEN" MERGEPATH_AUTHOR_TOKEN="$AUTHOR_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_TOKEN="$WORKFLOW_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$QUEUE_POLICY_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_QUEUE_SOURCE_TOKEN="$QUEUE_SOURCE_TOKEN"' <<<"$scheduled_continuation_block" \
+   && ! grep -qF 'MERGEPATH_QUEUE_POLICY_TOKEN="$AUTHOR_TOKEN"' <<<"$scheduled_continuation_block" \
+   && grep -qF 'MERGEPATH_PROTECTIVE_RETRACTION_DONE=1' <<<"$scheduled_continuation_block" \
+   && [ -n "$scheduled_protect_line" ] && [ -n "$scheduled_no_author_line" ] && [ -n "$scheduled_continue_line" ] \
+   && [ "$scheduled_protect_line" -lt "$scheduled_no_author_line" ] \
+   && [ "$scheduled_no_author_line" -lt "$scheduled_continue_line" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both approval-continuation loops protect with github.token before author-token continuation and export a dedicated failure channel"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: each approval-continuation loop must guard the helper, run ordered workflow-token protection before author-token continuation, and export dedicated failure state" >&2
+fi
+
+continuation_surface_count=$(grep -cF 'name: Surface approval continuation failures as per-PR check-runs' "$WORKFLOW" || true)
+if [ "$continuation_surface_count" -eq 2 ] \
+   && [ "$(grep -cF "env.CONTINUATION_INFRA_ERROR == '1'" "$WORKFLOW")" -eq 2 ] \
+   && [ "$(grep -cF 'report-approval-continuation-failures.sh' "$WORKFLOW")" -ge 4 ] \
+   && ! grep -Fq -- '--json labels' "$ROOT/scripts/workflow/report-approval-continuation-failures.sh"; then
+  pass=$((pass + 1))
+  echo "  PASS: continuation failures use a separate non-healing per-PR diagnostic path"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: continuation failures must not share the label-removal healing channel" >&2
+fi
+
+# The conclusion is the whole of #1188. `failure` on a NON-REQUIRED check
+# blocked no merge but drove mergeStateStatus to UNSTABLE, which made
+# gh-pr-guard demand a break-glass on a PR with every required context green --
+# and nothing ever posted a success for this name, so it never healed.
+# `neutral` keeps the diagnostic equally visible and strands nothing, which is
+# why no clearing path is needed. Asserted in both directions: neutral present
+# AND failure absent, so a revert to `failure` cannot pass by adding a
+# conclusion rather than changing one.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+reporter_tmp=$(mktemp -d "${TMPDIR:-/tmp}/continuation-reporter.XXXXXX")
+mkdir -p "$reporter_tmp/bin"
+cat > "$reporter_tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_STUB_LOG"
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s' abc123
+  exit 0
+fi
+if [ "$1" = "api" ]; then
+  exit 0
+fi
+exit 90
+STUB
+chmod +x "$reporter_tmp/bin/gh"
+: > "$reporter_tmp/gh.log"
+if PATH="$reporter_tmp/bin:$PATH" GH_STUB_LOG="$reporter_tmp/gh.log" GH_RETRY_ATTEMPTS=1 \
+     bash "$CONTINUATION_REPORTER" owner/repo https://example.test/run/1 "7" >/dev/null \
+   && grep -Fq 'api repos/owner/repo/check-runs' "$reporter_tmp/gh.log" \
+   && grep -Fq 'head_sha=abc123' "$reporter_tmp/gh.log" \
+   && grep -Fq 'conclusion=neutral' "$reporter_tmp/gh.log" \
+   && ! grep -Fq 'conclusion=failure' "$reporter_tmp/gh.log" \
+   && ! grep -Fq -- '--json labels' "$reporter_tmp/gh.log"; then
+  pass=$((pass + 1))
+  echo "  PASS: continuation reporter posts a NEUTRAL diagnostic without label-absence healing (#1188)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: continuation reporter must publish an unconditional head-pinned NEUTRAL diagnostic (#1188)" >&2
+fi
+rm -rf "$reporter_tmp"
+fi
+
+# #730: the pull_request_target trigger must include `edited` so a body-edit
+# nudge (the reliable re-fire for a claude-authored Phase-4 PR after a late
+# Codex clearance) re-evaluates auto-clear on the PR head. Anchor to the
+# pull_request_target types line specifically.
+if awk '/^[[:space:]]+pull_request_target:/{f=1} f&&/types:/{print; exit}' "$WORKFLOW" | grep -qE '\bedited\b'; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_target listens to 'edited' (#730 body-edit nudge)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_target missing 'edited' trigger (#730)" >&2
+fi
+
+# #730: the workflow_run resolver must fall back to head_sha when
+# pull_requests[] is empty, else a Merge Clearance Gate success on the PR head
+# resolves no PR and the label stays stuck.
+if grep -qE 'workflow_run\.pull_requests empty; resolving open PRs by head_sha' "$WORKFLOW" && \
+   grep -qE 'select\(\.headRefOid == \$sha\)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run resolver falls back to head_sha when pull_requests[] is empty (#730)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run resolver missing the head_sha fallback (#730)" >&2
+fi
+
+# SECURITY: checkout MUST pin to the default branch ref. The workflow routes
+# review events through workflow_run and receives queue credentials only from a
+# main-only environment; the checkout must preserve that trusted-code boundary.
+if grep -qF "ref: \${{ github.event.repository.default_branch }}" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: checkout pinned to default_branch (security: blocks PR-controlled gate-script execution)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: checkout MUST pin ref to default_branch (CR Critical on #202 r2)" >&2
+fi
+
+# Least-privilege permissions: parse the permissions block and
+# compare against the EXACT expected set, not a denylist. Codifies
+# the expected permission shape so any drift (added scope, changed
+# read↔write) is surfaced as a CI failure. CR Major on PR #202 r4
+# (denylist approach was incomplete — missed artifact-metadata,
+# repository-projects, vulnerability-alerts).
+perm_block=$(
+  awk '
+    /^permissions:/ {in_block=1; next}
+    in_block && /^[^[:space:]]/ {exit}
+    # Skip blank lines AND comment-only lines so inline rationale
+    # comments inside the permissions block don'"'"'t leak into the
+    # allowlist comparison (CodeRabbit Major on PR #311 / #310).
+    in_block && /^[[:space:]]*#/ {next}
+    in_block && NF { sub(/^[[:space:]]+/, "", $0); print }
+  ' "$WORKFLOW" | sort
+)
+# `actions: read` added in #310 — codex-review-check.sh's GraphQL
+# drill into statusCheckRollup.checkSuite.workflowRun requires it
+# in addition to the `checks` scope. See the inline rationale comment
+# next to the permission in auto-clear-blocking-labels.yml.
+# `checks: write` added in #324 — the "Surface infra failure as
+# check-run" step posts a failed check-run when this workflow hits
+# an infrastructure error, so flake recurrences are visible on the
+# PR's checks tab without grepping workflow logs. It is the SINGLE
+# `checks` entry: `write` supersets `read`, so a separate
+# `checks: read` must NOT coexist with it. #324 shipped exactly that
+# duplicate `checks:` map key; this text-based assertion happily
+# matched both lines and stayed green, while GitHub's workflow parser
+# rejected the duplicate-key file and every trigger produced a
+# zero-job startup failure (the label never auto-cleared). The
+# expected set below now codifies the single-key shape so re-adding
+# `checks: read` fails this check instead of silently breaking the
+# workflow at runtime.
+# `issues: read` added in #431 — codex-review-check.sh reads
+# /issues/{pr}/timeline for the force-push anchor; that is the issues-scoped
+# read the auto-clear jobs depend on. PR reactions are not a Codex-clearance
+# input, and /issues/comments/{id}/reactions is read only by the opt-in
+# request diagnostics (CODEX_REVIEW_CHECK_REPORT_REQUEST_EVIDENCE=1), which
+# these jobs do not enable. On restricted-default
+# GITHUB_TOKEN repos an omitted scope is `none`, the timeline read 403s,
+# and the gate aborts rc=3 with `needs-external-review` stuck. Same
+# class as the merge-clearance-gate.yml `issues: read` fix (#429).
+# `security-events: read` added in #1101 (CodeRabbit on PR #1106) —
+# scripts/workflow/approval-merge-continuation.sh's review-feedback-
+# accounting.sh call (both evaluate-and-clear's and scheduled-sweep's
+# "Continue approved PRs..." steps reach it) reads code-scanning/alerts
+# to grade a github-advanced-security[bot] finding's severity. That
+# call runs under ACCOUNTING_GH_TOKEN (this workflow's GITHUB_TOKEN),
+# not the ambient AUTHOR_MERGE_TOKEN the continuation steps otherwise
+# use, specifically so this permissions block can reach it.
+expected_perms=$'actions: read\nchecks: write\ncontents: read\nissues: read\npull-requests: write\nsecurity-events: read'
+if [ "$perm_block" = "$expected_perms" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow permissions exactly match the least-privilege set"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow permissions drifted from expected least-privilege set" >&2
+  echo "      expected:" >&2; echo "$expected_perms" | sed 's/^/        /' >&2
+  echo "      got:" >&2; echo "$perm_block" | sed 's/^/        /' >&2
+fi
+
+# Issue #499: a successful label removal followed by an unreadable
+# verification read must not leave a permanent failed synthetic
+# `auto-clear-blocking-labels` check-run. The failure-surfacing step
+# gets one last read before posting a check-run; if that read proves
+# the label is already absent, it posts a success check-run with the
+# same name to heal any prior synthetic failure. Both event-driven and
+# scheduled-sweep surfaces need the same behavior.
+heal_title_count=$(grep -c 'Auto-clear confirmed needs-external-review absent' "$WORKFLOW" || true)
+heal_success_count=$(grep -c -- "-f conclusion='success'" "$WORKFLOW" || true)
+heal_read_count=$(grep -c 'current_has_label=$(with_gh_retry gh pr view "$PR" --repo "$REPO" --json labels' "$WORKFLOW" || true)
+valid_label_predicate_count=$(grep -Fc -- "--jq 'any(.labels[]?; .name == \"needs-external-review\")'" "$WORKFLOW" || true)
+if [ "$heal_title_count" -ge 2 ] && [ "$heal_success_count" -ge 2 ] && [ "$heal_read_count" -ge 2 ] && [ "$valid_label_predicate_count" -ge 4 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: infra-failure surfacing heals stale auto-clear check-runs when the label is already absent (#499)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: infra-failure surfacing must re-read label state with a valid jq predicate and post success check-runs when the label is already absent (#499)" >&2
+fi
+
+# Sentinel: rc=3 from codex-review-check.sh sets had_infra_error and
+# the job exits non-zero at the end. Without this, gate-evaluation
+# infrastructure failures would silently leave the workflow green.
+# CR Major on PR #202 r2.
+# CR Major on PR #202 r5: anchored to start-of-line + word boundary
+# so commented-out occurrences don't satisfy the assertion.
+if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' "$WORKFLOW" && \
+   grep -qE '^[[:space:]]*exit[[:space:]]+"?\$had_infra_error"?([[:space:]]|$)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: rc=3 sets infra-error sentinel + job exits non-zero on it (executable lines)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: rc=3 from codex-review-check.sh must surface as job failure (sentinel + final exit)" >&2
+fi
+
+# #1159: the protective retraction helper has a THIRD exit code. 4 is its
+# benign not-ready verdict -- a standing auto-merge request the #1058 boundary
+# reports as outside it, with nothing mutated and no dependency broken. Both
+# label-clear paths used to fold it into the generic `-ne 0` infrastructure
+# branch, which set the sentinel and reddened the whole run for a PR where
+# nothing was wrong. The label must still NOT be removed (an arm GitHub could
+# consume the moment the last blocker goes), so this asserts all four halves of
+# that contract, per call site: the branch exists, it is evaluated BEFORE the
+# generic failure branch (after it, it would be dead code), it records no
+# failure, and it still skips the removal.
+# `|| true` on both: a missing branch is the very thing this asserts, and under
+# `set -e` an empty grep would abort the whole checker instead of reporting it
+# -- taking the remaining assertions down with it. (Caught by mutation MW1.)
+eq4_lines=$(grep -n '\[ "\$protective_rc" -eq 4 \]' "$WORKFLOW" | cut -d: -f1 || true)
+ne0_lines=$(grep -n '\[ "\$protective_rc" -ne 0 \]' "$WORKFLOW" | cut -d: -f1 || true)
+# shellcheck disable=SC2206  # deliberate word-splitting of newline-separated line numbers
+eq4_arr=($eq4_lines)
+# shellcheck disable=SC2206
+ne0_arr=($ne0_lines)
+protective_rc4_ok=1
+if [ "${#eq4_arr[@]}" -ne 2 ] || [ "${#ne0_arr[@]}" -ne 2 ]; then
+  protective_rc4_ok=0
+else
+  for idx in 0 1; do
+    eq4_line=${eq4_arr[$idx]}
+    ne0_line=${ne0_arr[$idx]}
+    if [ "$eq4_line" -ge "$ne0_line" ]; then
+      protective_rc4_ok=0
+      continue
+    fi
+    branch_body=$(sed -n "${eq4_line},$((ne0_line - 1))p" "$WORKFLOW")
+    if grep -qE '^[[:space:]]*had_infra_error=1([[:space:]]|$)' <<<"$branch_body" \
+       || grep -qE '^[[:space:]]*failing_prs=' <<<"$branch_body" \
+       || ! grep -qE '^[[:space:]]*continue([[:space:]]|$)' <<<"$branch_body"; then
+      protective_rc4_ok=0
+    fi
+  done
+fi
+if [ "$protective_rc4_ok" -eq 1 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both label-clear paths treat protective rc=4 as benign before the failure branch, without clearing the label (#1159)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: each label-clear path must handle protective rc=4 ahead of the generic failure branch, set no infra sentinel, and still skip the label removal (#1159)" >&2
+fi
+
+# ── Test 3: self-fire loop guard present
+if grep -qE "github\.event\.action == 'unlabeled'" "$WORKFLOW" && \
+   grep -qE "github\.event\.label\.name == 'needs-external-review'" "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: self-fire loop guard for unlabeled+needs-external-review present"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: self-fire loop guard missing or malformed" >&2
+fi
+
+# ── Test 4: scope discipline — only needs-external-review is removed
+# CR Major on PR #202 r3: tighten the positive grep to the actual
+# executable removal line, not anywhere in the file (header comments/
+# attribution-message would otherwise satisfy the match even if the
+# executable line regressed).
+# #536 hardening: anchor with `^[^#]*` so a `#` appearing before the
+# command disqualifies the line — a COMMENT that merely mentions the
+# removal can no longer satisfy the positive check (nor can a
+# commented-out forbidden-label removal trip the negatives, which would
+# have caused a spurious FAIL). Indented executable lines inside `run:`
+# blocks still match (no `#` precedes the command).
+#
+# #827: the removal moved from `gh pr edit --remove-label` to a REST
+# DELETE on the issue-labels endpoint, so the positive assertion follows
+# it. `gh pr edit --remove-label` is backed by the idempotent GraphQL
+# removeLabelsFromLabelable mutation and exits 0 even when the label was
+# never present — it cannot tell "this run removed the label" from "the
+# label was already gone", which is the signal the attribution comment is
+# gated on (see the duplicate-comment guard below). Both spellings stay
+# refuted for the three forbidden labels, so a regression to either
+# mechanism on a human-action label still fails this check.
+if grep -qE '^[^#]*issues/\$PR/labels/needs-external-review' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/needs-human-review' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/policy-violation' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*issues/\$PR/labels/human-hold' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label needs-human-review([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label policy-violation([[:space:]]|$)' "$WORKFLOW" && \
+   ! grep -qE '^[^#]*gh pr edit[^#]*--remove-label human-hold([[:space:]]|$)' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: scope discipline — only needs-external-review is auto-removed (executable line)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow either misses the target label or auto-removes a forbidden one" >&2
+fi
+
+# ── Test 4b: duplicate-comment guard (#827)
+# The attribution comment must be gated on THIS run having performed the
+# removal — the DELETE's HTTP status — never on a bare "the label is
+# absent" read. Absence is not attributable: this workflow carries no
+# concurrency group (a per-PR one is not expressible for workflow_run,
+# whose PR is resolved inside a step), so several runs pass the
+# label-presence check, one write wins, and every one of them then reads
+# "absent". On #797 that produced 15 attribution comments for 5 real
+# removals. Both jobs must capture the status and branch on it.
+del_capture_count=$(grep -cE '^[^#]*del_status=\$\(printf' "$WORKFLOW" || true)
+del_branch_count=$(grep -cE '^[^#]*case "\$del_status" in' "$WORKFLOW" || true)
+del_delete_count=$(grep -cE '^[^#]*-X DELETE -i --silent' "$WORKFLOW" || true)
+if [ "$del_capture_count" -ge 2 ] && [ "$del_branch_count" -ge 2 ] && [ "$del_delete_count" -ge 2 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: both jobs gate the attribution comment on the DELETE's HTTP status, not on label absence (#827)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: attribution comment must be gated on the removal's HTTP status in BOTH jobs (#827): capture=$del_capture_count branch=$del_branch_count delete=$del_delete_count (expected >=2 each)" >&2
+fi
+
+# ── Test 4c: sweep re-verifies the label authoritatively (#827)
+# The sweep's PR list comes from `gh pr list --label`, which resolves
+# through the GraphQL search() API — an eventually-consistent index, not
+# live label state. A cleared PR keeps appearing there (observed on #797:
+# ~3.5h across 9 consecutive sweeps). Without an authoritative precheck
+# the sweep burns a full codex-review-check.sh evaluation per stale hit
+# and then comments on a label it never removed. Both jobs must carry the
+# HAS_LABEL precheck.
+haslabel_count=$(grep -cE '^[^#]*HAS_LABEL=\$\(with_gh_retry gh pr view' "$WORKFLOW" || true)
+if [ "$haslabel_count" -ge 2 ] && grep -qF 'stale search-index hit' "$WORKFLOW"; then
+  pass=$((pass + 1))
+  echo "  PASS: both jobs re-verify needs-external-review authoritatively before acting (#827)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: the scheduled sweep must re-verify the label against the authoritative endpoint before acting (#827; found $haslabel_count HAS_LABEL prechecks, expected >=2)" >&2
+fi
+
+# ── Test 4c: bash syntax check on every `run:` block
+# Extract each `run: |` block to a temp file and feed to `bash -n`.
+# Catches heredoc/subshell errors that only surface at runtime.
+# Real bug from PR #202 r5: `gh pr comment ... --body "$(cat <<'COMMENT'
+# ... COMMENT )"` had the closing `COMMENT` indented, which is
+# invalid heredoc syntax — this test would have caught it pre-merge.
+echo
+echo "auto-clear-blocking-labels.yml bash syntax test"
+
+block_dir=$(mktemp -d)
+# awk extracts each `run: |` block to a separate file in $block_dir.
+# Exit a run block when ANY non-empty line drops to indent <= base
+# (the `run:` line's own indent), not just column-0. This catches
+# job/step transitions like `  scheduled-sweep:` (under `jobs:`) and
+# `      - name: Foo` (under steps:) which would otherwise be
+# treated as continuations of the prior bash block.
+awk -v outdir="$block_dir" '
+  /^[[:space:]]+run:[[:space:]]+\|[[:space:]]*$/ {
+    if (in_run) { close(outfile) }
+    n++; outfile = outdir "/block-" n ".sh"
+    match($0, /^[[:space:]]+/); base_indent = RLENGTH
+    in_run = 1; next
+  }
+  in_run && NF == 0 { print > outfile; next }
+  in_run {
+    match($0, /^[[:space:]]*/); cur_indent = RLENGTH
+    if (cur_indent <= base_indent) {
+      close(outfile); in_run = 0; next
+    }
+    # Strip the YAML run-block indentation (base_indent + 2 spaces).
+    sub("^[[:space:]]{" (base_indent + 2) "}", "")
+    print > outfile
+  }
+  END { if (in_run) close(outfile) }
+' "$WORKFLOW"
+
+extracted_count=$(ls -1 "$block_dir" 2>/dev/null | wc -l | tr -d ' ')
+syntax_errors=0
+for f in "$block_dir"/block-*.sh; do
+  [ -f "$f" ] || continue
+  if ! err=$(bash -n "$f" 2>&1); then
+    fail=$((fail + 1))
+    syntax_errors=$((syntax_errors + 1))
+    echo "  FAIL: bash syntax error in $(basename "$f")" >&2
+    echo "$err" | sed 's/^/    /' >&2
+  fi
+done
+rm -rf "$block_dir"
+
+if [ "$syntax_errors" -eq 0 ] && [ "$extracted_count" -gt 0 ]; then
+  pass=$((pass + 1))
+  echo "  PASS: all $extracted_count run blocks have valid bash syntax"
+elif [ "$extracted_count" = "0" ]; then
+  fail=$((fail + 1))
+  echo "  FAIL: extracted 0 run blocks (extraction logic broken?)" >&2
+fi
+
+# ── Test 5: PR-number resolution dispatch (extracted bash logic)
+# The workflow embeds this dispatch as inline bash. Extract the logic
+# pattern and exercise the three event shapes against canned
+# github.event payloads.
+if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+echo
+echo "auto-clear-blocking-labels.yml PR-number resolution tests"
+
+# Stub `gh` for the #730 head_sha fallback below. GH_STUB_PRS is a JSON array
+# of {number, headRefOid}; the stub returns it for `gh pr list --json ...`.
+# Empty/unset ⇒ `[]` (models "no open PR matches", e.g. a main-branch sha).
+gh() {
+  if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
+    printf '%s' "${GH_STUB_PRS:-[]}"
+    return 0
+  fi
+  echo "unexpected gh call in test: $*" >&2
+  return 1
+}
+
+dispatch() {
+  # Mirrors the workflow's case statement. Args: event_name,
+  # event_json. Unsupported events return 0 (matching the workflow's
+  # `exit 0  # don't fail; just skip` semantics — CR Minor on PR #202).
+  local event_name="$1"
+  local event_json="$2"
+  case "$event_name" in
+    pull_request_target)
+      jq -r '.pull_request.number' <<<"$event_json"
+      ;;
+    workflow_run)
+      local conclusion prs
+      conclusion=$(jq -r '.workflow_run.conclusion' <<<"$event_json")
+      if [ "$conclusion" != "success" ]; then
+        return 0  # workflow's "skip on non-success" path
+      fi
+      prs=$(jq -r '.workflow_run.pull_requests[].number' <<<"$event_json")
+      # #730 head_sha fallback — mirrors the workflow's resolve step.
+      if [ -z "$prs" ]; then
+        local head_sha
+        head_sha=$(jq -r '.workflow_run.head_sha // empty' <<<"$event_json")
+        if [ -n "$head_sha" ]; then
+          prs=$(gh pr list --repo x --state open --limit 500 --json number,headRefOid 2>/dev/null \
+            | jq -r --arg sha "$head_sha" '.[] | select(.headRefOid == $sha) | .number' 2>/dev/null || true)
+        fi
+      fi
+      printf '%s' "$prs"
+      ;;
+    *)
+      echo "Unsupported event: $event_name" >&2
+      return 0  # workflow exit 0 on unsupported (don't fail; just skip)
+      ;;
+  esac
+}
+
+# pull_request_target → 1 PR
+out=$(dispatch pull_request_target '{"pull_request":{"number":42}}')
+if [ "$out" = "42" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_target resolves to PR number"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_target dispatch (got: $out)" >&2
+fi
+
+# pull_request_review is intentionally unsupported here; Agent Review
+# Pipeline completion supplies the trusted workflow_run event instead.
+out=$(dispatch pull_request_review '{"pull_request":{"number":99}}' 2>/dev/null)
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: pull_request_review cannot enter the credentialed resolver directly"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: pull_request_review entered the credentialed resolver (got: $out)" >&2
+fi
+
+# workflow_run success → multiple PRs
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[{"number":7},{"number":8}]}}')
+expected=$'7\n8'
+if [ "$out" = "$expected" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run (success) enumerates multiple PRs"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run (success) dispatch (got: $out)" >&2
+fi
+
+# workflow_run failure → empty (don't bother re-evaluating gate when
+# the upstream workflow itself failed)
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"failure","pull_requests":[{"number":7}]}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run (failure conclusion) skips re-evaluation"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run failure should produce empty (got: $out)" >&2
+fi
+
+# workflow_run with empty pull_requests AND no head_sha → empty (fallback
+# skipped for lack of a SHA to match on)
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[]}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: workflow_run with no PRs and no head_sha produces empty output"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: workflow_run empty PRs (no head_sha) should yield empty (got: $out)" >&2
+fi
+
+# #730: empty pull_requests but head_sha matches an OPEN PR → resolves it via
+# the fallback (the Merge-Clearance-Gate-success-on-PR-head case).
+GH_STUB_PRS='[{"number":11,"headRefOid":"df809ae"},{"number":22,"headRefOid":"cafe00"}]'
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[],"head_sha":"df809ae"}}')
+if [ "$out" = "11" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: #730 — empty pull_requests + matching head_sha resolves the PR via the fallback"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: #730 head_sha fallback should resolve PR 11 (got: $out)" >&2
+fi
+
+# #730: empty pull_requests + head_sha that matches NO open PR (a default-branch
+# commit — the concurrent-main-merge case) → empty → correct no-op.
+out=$(dispatch workflow_run '{"workflow_run":{"conclusion":"success","pull_requests":[],"head_sha":"4852bc74main"}}')
+if [ -z "$out" ]; then
+  pass=$((pass + 1))
+  echo "  PASS: #730 — empty pull_requests + non-PR head_sha (main) yields empty (no-op)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: #730 non-matching head_sha should yield empty (got: $out)" >&2
+fi
+unset GH_STUB_PRS
+
+# #2239: the LIVE resolve step (not the mirror above), run as the publisher's
+# repository_dispatch. Only a positive-integer client_payload.pr is resolved,
+# every other payload field is ignored, another dispatch action is skipped,
+# and a malformed selector fails the run without resolving anything.
+resolve_dir=$(mktemp -d "${TMPDIR:-/tmp}/auto-clear-resolve.XXXXXX")
+awk '
+  $0 == "      - name: Resolve PR number from event" { in_step=1; next }
+  in_step && $0 == "        run: |" { in_run=1; next }
+  in_run && /^          / { sub(/^          /, ""); print; next }
+  in_run && /^[[:space:]]*$/ { print; next }
+  in_run { exit }
+' "$WORKFLOW" >"$resolve_dir/resolve.sh"
+resolve_case() {  # <label> <event-json> <expected numbers> <expected rc>
+  local label="$1" json="$2" want="$3" want_rc="$4" rc=0 got
+  : >"$resolve_dir/out"
+  env EVENT_NAME=repository_dispatch EVENT_JSON="$json" REPO=owner/repo GH_TOKEN=x \
+    GITHUB_OUTPUT="$resolve_dir/out" bash "$resolve_dir/resolve.sh" >"$resolve_dir/log" 2>&1 || rc=$?
+  got=$(awk '/^numbers=/ { sub(/^numbers=/, ""); print; next }
+             /^numbers<<EOF$/ { f=1; next } f && /^EOF$/ { f=0; next } f { print }' "$resolve_dir/out")
+  if [ -s "$resolve_dir/resolve.sh" ] && [ "$rc" -eq "$want_rc" ] && [ "$got" = "$want" ]; then
+    pass=$((pass + 1))
+    echo "  PASS: #2239 resolve step: $label"
+  else
+    fail=$((fail + 1))
+    echo "  FAIL: #2239 resolve step: $label (rc=$rc want $want_rc, numbers='$got' want '$want')" >&2
+    sed 's/^/        /' "$resolve_dir/log" >&2
+  fi
+}
+resolve_case 'a dispatch resolves exactly its PR number' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":42,"head_sha":"ffff","labels":["x"]}}' 42 0
+resolve_case 'a string PR number resolves the same' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":"42"}}' 42 0
+resolve_case 'another dispatch action resolves nothing' \
+  '{"action":"merge-clearance-recheck","client_payload":{"pr":42}}' '' 0
+resolve_case 'a non-integer selector fails and resolves nothing' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":"42; rm -rf /"}}' '' 1
+resolve_case 'a zero or zero-padded selector fails' \
+  '{"action":"auto-clear-evaluate","client_payload":{"pr":"042"}}' '' 1
+resolve_case 'a missing selector fails' \
+  '{"action":"auto-clear-evaluate","client_payload":{}}' '' 1
+rm -rf "$resolve_dir"
+
+# Unsupported event → exit 0 with stderr message (matches workflow
+# behavior; CR Minor on PR #202 r1 fixed the prior return-1 mismatch)
+set +e
+out=$(dispatch wat '{}' 2>&1)
+rc=$?
+set -e
+if [ "$rc" = "0" ] && echo "$out" | grep -q "Unsupported event"; then
+  pass=$((pass + 1))
+  echo "  PASS: unsupported event returns 0 with clear stderr (matches workflow)"
+else
+  fail=$((fail + 1))
+  echo "  FAIL: unsupported event handling (rc=$rc, out=$out)" >&2
+fi
+fi
+
+echo
+if [ "$fail" -eq 0 ]; then
+  if [ "$CI_CHECK_RUN_SELF_TEST" -eq 1 ]; then
+    if [ ! -f "$CONTINUATION_TEST" ]; then
+      skip_reason="approval continuation test not present in this consumer checkout"
+    elif ! bash "$CONTINUATION_TEST"; then
+      echo "check_auto_clear_workflow: FAIL (approval continuation contract)" >&2
+      exit 1
+    fi
+  fi
+  if [ -n "$skip_reason" ]; then
+    echo "check_auto_clear_workflow: SKIP ($skip_reason)"
+  else
+    echo "check_auto_clear_workflow: PASS ($pass tests)"
+  fi
+  exit 0
+else
+  echo "check_auto_clear_workflow: FAIL ($fail of $((pass + fail)) tests)" >&2
+  exit 1
+fi

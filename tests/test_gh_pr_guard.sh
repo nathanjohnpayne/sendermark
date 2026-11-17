@@ -1,0 +1,2021 @@
+#!/usr/bin/env bash
+# Unit tests for scripts/hooks/gh-pr-guard.sh under the #411
+# wrapper-mandatory token contract.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOOK="$ROOT/scripts/hooks/gh-pr-guard.sh"
+
+[[ -x "$HOOK" ]] || { echo "missing or non-executable $HOOK" >&2; exit 1; }
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "SKIP: python3 not available" >&2
+  exit 0
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "SKIP: jq not available" >&2
+  exit 0
+fi
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gh-pr-guard-test.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+PASS=0
+FAIL=0
+pass() { echo "PASS: $*"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
+
+STUB_DIR="$WORKDIR/stub-bin"
+mkdir -p "$STUB_DIR"
+cat >"$STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "config get")
+    echo "${STUB_ACTIVE_USER:-nathanpayne-claude}"
+    exit 0
+    ;;
+  "pr view")
+    if [ -n "${STUB_INFERRED_HOST:-}" ]; then
+      printf 'pr view repository inferred host: %s\n' "$STUB_INFERRED_HOST" >>"${STUB_API_LOG:-/dev/null}"
+    fi
+    # STUB_REQUIRE_TOKEN: a session with no gh keyring, where gh needs GH_TOKEN.
+    if [ "${STUB_REQUIRE_TOKEN:-0}" = 1 ]; then
+      [ -n "${GH_TOKEN:-}" ] || { echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4; }
+      [ "${GH_TOKEN:-}" = "${STUB_EXPECT_TOKEN:-}" ] && echo "pr view authenticated with the expected token" >>"${STUB_API_LOG:-/dev/null}"
+    fi
+    # The Claude cloud proxy's refusal of every GraphQL call (#1057).
+    if [ "${STUB_GRAPHQL_CEILING:-0}" = 1 ]; then
+      echo "GitHub GraphQL is not available from Claude Code sessions; use the REST API instead (HTTP 403)" >&2
+      exit 1
+    fi
+    [ "${STUB_PR_VIEW_FAIL:-0}" = 0 ] || { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+    if [ -n "${STUB_EXPECT_REPO:-}" ]; then
+      case " $* " in *" --repo $STUB_EXPECT_REPO "*) ;; *) exit 9 ;; esac
+    fi
+    json_fields=""
+    for ((i=1; i<=$#; i++)); do
+      if [ "${!i}" = "--json" ]; then
+        next=$((i+1))
+        json_fields="${!next}"
+        break
+      fi
+    done
+    case "$json_fields" in
+      *body*)
+        jq -n \
+          --arg body "${STUB_PR_BODY:-}" \
+          --argjson additions "${STUB_PR_ADDITIONS:-0}" \
+          --argjson deletions "${STUB_PR_DELETIONS:-0}" \
+          --arg head "${STUB_PR_HEAD:-feature/some-branch}" \
+          --arg author "${STUB_PR_AUTHOR-nathanjohnpayne}" \
+          '{body: $body, additions: $additions, deletions: $deletions, head: $head, author: $author}'
+        exit 0
+        ;;
+      *)
+        echo "${STUB_MERGE_STATE:-CLEAN}"
+        echo "${STUB_MERGEABLE:-MERGEABLE}"
+        echo "${STUB_ROLLUP_NONGREEN:-0}"
+        echo "${STUB_PR_URL-https://github.com/example/repo/pull/123}"
+        echo "${STUB_HEAD_SHA-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+        echo "${STUB_PR_AUTHOR-nathanjohnpayne}"
+        if [ -n "${STUB_LABELS:-}" ]; then
+          echo "$STUB_LABELS" | tr ';' '\n'
+        fi
+        exit 0
+        ;;
+    esac
+    ;;
+  "api --hostname")
+    if [ "${4:-}" = graphql ]; then
+      [ "${STUB_QUEUE_FAILURE:-0}" = 0 ] || exit 1
+      if [ -n "${STUB_QUEUE_JSON:-}" ]; then printf '%s\n' "$STUB_QUEUE_JSON"; exit 0; fi
+      jq -nc --arg url "${STUB_PR_URL:-https://github.com/example/repo/pull/123}" \
+        --arg head "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+        --argjson required "${STUB_QUEUE_REQUIRED:-false}" --argjson queued "${STUB_QUEUE_ENTERED:-false}" \
+        '{data:{repository:{pullRequest:{url:$url,headRefOid:$head,isMergeQueueEnabled:$required,isInMergeQueue:$queued}}}}'
+      exit 0
+    fi
+    [ "${STUB_REVIEW_FAILURE:-0}" = 0 ] || exit 1
+    if [ -n "${STUB_EXPECT_REPO:-}" ]; then
+      case "$*" in *"repos/$STUB_EXPECT_REPO/pulls/"*) ;; *) exit 9 ;; esac
+    fi
+    case "$*" in *"--paginate --slurp"*) ;; *) exit 1 ;; esac
+    if [ -n "${STUB_REVIEW_PAGES:-}" ]; then printf '%s\n' "$STUB_REVIEW_PAGES"; else echo '[[]]'; fi
+    ;;
+  "api repos/"*)
+    # The guard's REST read of the PR for the self-approve check (#1057).
+    [ -z "${STUB_API_LOG:-}" ] || printf '%s\n' "$*" >>"$STUB_API_LOG"
+    [ "${STUB_REST_FAIL:-0}" = 0 ] || { echo "HTTP 404: Not Found" >&2; exit 1; }
+    jq -n \
+      --arg body "${STUB_PR_BODY:-}" \
+      --argjson additions "${STUB_PR_ADDITIONS:-0}" \
+      --argjson deletions "${STUB_PR_DELETIONS:-0}" \
+      --arg head "${STUB_PR_HEAD:-feature/some-branch}" \
+      --arg author "${STUB_PR_AUTHOR-nathanjohnpayne}" \
+      '{number: 123, body: $body, additions: $additions, deletions: $deletions, head: {ref: $head}, user: {login: $author}}'
+    ;;
+  "api --paginate")
+    [ -z "${STUB_API_LOG:-}" ] || printf '%s\n' "$*" >>"$STUB_API_LOG"
+    if [ -n "${STUB_FILES_PAGES_FILE:-}" ]; then cat "$STUB_FILES_PAGES_FILE"; exit 0; fi
+    echo '[[{"filename":"scripts/x.sh"}],[{"filename":"docs/y.md"}]]'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+STUB
+chmod +x "$STUB_DIR/gh"
+
+REAL_PYTHON="$(command -v python3)"
+cat >"$STUB_DIR/python3" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == */gh-comment-trigger-guard.py && "${STUB_COMMENT_GUARD_STUB:-0}" = 1 ]]; then
+  printf '%s' "${STUB_COMMENT_GUARD_OUTPUT:-}"
+  exit "${STUB_COMMENT_GUARD_EXIT:-0}"
+fi
+exec "$REAL_PYTHON" "$@"
+STUB
+chmod +x "$STUB_DIR/python3"
+export REAL_PYTHON
+
+run_hook() {
+  local cmd="$1"
+  # Existing merge-state fixtures supply the ordinary exact-head precondition.
+  # Explicit missing/mismatched tests below opt out or provide their own flag.
+  if [[ "$cmd" == *'gh pr merge '* && "$cmd" != *'--match-head-commit'* && "${TEST_UNPINNED_MERGE:-0}" = 0 ]]; then
+    cmd="${cmd/gh pr merge /gh pr merge --match-head-commit ${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa} }"
+  fi
+  local merge_state="${2:-CLEAN}"
+  local labels="${3:-}"
+  local expected_reviewer="${4:-nathanpayne-claude}"
+  local pr_body="${5:-}"
+  local additions="${6:-0}"
+  local deletions="${7:-0}"
+  local pr_head="${8:-feature/some-branch}"
+  local pr_author="${9-nathanjohnpayne}"
+  local payload
+  payload=$(jq -n --arg c "$cmd" '{tool_input: {command: $c}}')
+  PATH="$STUB_DIR:$PATH" \
+  STUB_MERGE_STATE="$merge_state" \
+  STUB_MERGEABLE="${STUB_MERGEABLE:-MERGEABLE}" \
+  STUB_ROLLUP_NONGREEN="${STUB_ROLLUP_NONGREEN:-0}" \
+  STUB_LABELS="$labels" \
+  STUB_PR_BODY="$pr_body" \
+  STUB_PR_ADDITIONS="$additions" \
+  STUB_PR_DELETIONS="$deletions" \
+  STUB_PR_HEAD="$pr_head" \
+  STUB_PR_AUTHOR="$pr_author" \
+  STUB_REVIEW_PAGES="${STUB_REVIEW_PAGES:-}" \
+  STUB_REVIEW_FAILURE="${STUB_REVIEW_FAILURE:-0}" \
+  STUB_HEAD_SHA="${STUB_HEAD_SHA-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+  OP_PREFLIGHT_AGENT="${TEST_OP_PREFLIGHT_AGENT:-}" \
+  GH_PR_GUARD_EXPECTED_REVIEWER="$expected_reviewer" \
+    bash "$HOOK" <<<"$payload"
+}
+
+assert_rc_contains() {
+  local label="$1" expected_rc="$2" needle="$3"; shift 3
+  local out rc
+  set +e
+  out=$(run_hook "$@" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -ne "$expected_rc" ]; then
+    fail "$label: rc=$rc expected $expected_rc; output: $out"
+  elif [ -n "$needle" ] && ! echo "$out" | grep -i "$needle" >/dev/null; then
+    fail "$label: missing '$needle'; output: $out"
+  else
+    pass "$label"
+  fi
+}
+
+# #2990: every section below is one case-pool case. Each builds its own
+# fixtures under its own WORKDIR (case-pool.sh gives each case one) and reads
+# only the stubs and helpers above, so the pool runs them side by side and
+# replays their output in this order.
+# shellcheck source=tests/lib/case-pool.sh
+source "$ROOT/tests/lib/case-pool.sh"
+# The sections that cd into a fixture return here.
+ORIG_DIR="$(pwd)"
+
+
+# Summary-only change requests have no review thread. Read every review
+# page and keep each reviewer's latest opinion, even on an older head.
+pr_guard_case_01() {
+change_review='{"id":1,"user":{"login":"nathanpayne-codex"},"state":"CHANGES_REQUESTED","commit_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+review_pages="[[$change_review]]"
+merge_overrides='BREAK_GLASS_ADMIN=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+assert_rc_contains "boolean admin override no longer authorizes admin merge" 2 "requires explicit human authorization" \
+  'BREAK_GLASS_ADMIN=1 BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash' BLOCKED
+# The admin marker is bound to the metadata target, independently of the
+# matching server-side head precondition supplied by run_hook.
+admin_tuple='https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+admin_merge='scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash'
+assert_rc_contains "admin exact PR and head marker is allowed" 0 "BREAK-GLASS: --admin merge authorized" "BREAK_GLASS_ADMIN=$admin_tuple $admin_merge"
+for wrong_tuple in \
+  'https://github.com/example/repo/pull/124@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'https://github.com/other/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'https://github.com/example/repo/pull/123@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; do
+  assert_rc_contains "admin marker cannot authorize another PR/repository/head ($wrong_tuple)" 2 "Expected BREAK_GLASS_ADMIN=$admin_tuple" "BREAK_GLASS_ADMIN=$wrong_tuple $admin_merge"
+done
+for unresolved_url in '' invalid; do
+  STUB_PR_URL="$unresolved_url" assert_rc_contains "admin refuses unresolved PR URL ($unresolved_url)" 2 "could not read the PR identity/head" "BREAK_GLASS_ADMIN=$admin_tuple $admin_merge"
+done
+for unresolved_head in '' invalid; do
+  STUB_HEAD_SHA="$unresolved_head" assert_rc_contains "admin refuses unresolved PR head ($unresolved_head)" 2 "could not read the PR identity/head" "BREAK_GLASS_ADMIN=$admin_tuple $admin_merge"
+done
+assert_rc_contains "false admin flag retains ordinary merge without a marker" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --admin=false --squash'
+assert_rc_contains "true admin flag accepts exact PR and head marker" 0 "BREAK-GLASS: --admin merge authorized" "BREAK_GLASS_ADMIN=$admin_tuple scripts/gh-as-author.sh -- gh pr merge 123 --admin=true --squash"
+assert_rc_contains "true admin flag refuses a stale marker" 2 "Expected BREAK_GLASS_ADMIN=$admin_tuple" 'BREAK_GLASS_ADMIN=https://github.com/example/repo/pull/123@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb scripts/gh-as-author.sh -- gh pr merge 123 --admin=true --squash'
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "admin and merge-state overrides do not decide a reviewer disagreement" 2 "nathanpayne-codex" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "ordinary merge blocks an older-head change request" 2 "bbbbbbbb" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+for compact_merge in 'gh -Rother/repo pr merge 123' 'gh pr -Rother/repo merge 123' 'gh pr merge -Rother/repo 123' 'gh pr merge 123 -Rother/repo'; do
+  STUB_EXPECT_REPO=other/repo STUB_PR_URL=https://github.com/other/repo/pull/123 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "compact repository selector binds metadata and disagreement reads ($compact_merge)" 2 "CHANGES_REQUESTED" "scripts/gh-as-author.sh -- $compact_merge --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+done
+for new_state in APPROVED; do
+  newer_review="${change_review/\"id\":1/\"id\":2}"
+  newer_review="${newer_review/CHANGES_REQUESTED/$new_state}"
+  STUB_REVIEW_PAGES="[[$change_review],[$newer_review]]" assert_rc_contains "later $new_state releases the review disagreement" 0 "" "$merge_overrides" BLOCKED
+done
+dismissed_review="${change_review/CHANGES_REQUESTED/DISMISSED}"
+STUB_REVIEW_PAGES="[[$dismissed_review]]" assert_rc_contains "dismissed change request no longer blocks" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$change_review],[$dismissed_review]]" assert_rc_contains "dismissing a different review does not erase an active change request" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+TEST_UNPINNED_MERGE=1 assert_rc_contains "ordinary immediate merge requires a head precondition" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "ordinary immediate merge refuses a different head precondition" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+for prefix in 'GH_REPO=other/repo' 'env GH_REPO=other/repo' 'GH_REPO=other/repo ;' 'export GH_REPO=other/repo ;' 'unset GH_REPO ;' 'env -u GH_REPO' 'env --unset=GH_REPO' 'env -uGH_REPO'; do
+  assert_rc_contains "command-local repository selector refuses ($prefix)" 2 "command-local GH_REPO" "$prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
+done
+for discovery_prefix in 'GIT_DIR=/other/.git' 'env GIT_WORK_TREE=/other' 'GIT_CONFIG_COUNT=1 ;' 'export GIT_COMMON_DIR=/other ;' 'unset GIT_DIR ;' 'env -u GIT_DIR' 'env --unset=GIT_DIR' 'env -uGIT_DIR' 'env -i'; do
+  assert_rc_contains "command-local Git discovery refuses ($discovery_prefix)" 2 "repository-discovery" "$discovery_prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
+done
+for eval_repo in 'eval GH_REPO=other/repo ;' 'eval export GH_REPO=other/repo ;' 'eval GIT_DIR=/other ;'; do
+  assert_rc_contains "eval repository changes persist before merge ($eval_repo)" 2 "repository-discovery" "$eval_repo scripts/gh-as-author.sh -- gh pr merge 123 --squash"
+done
+for directory_prefix in 'cd /other &&' 'builtin cd /other ;' 'command cd /other &&' 'pushd /other ;' 'popd ;' 'source /tmp/change-directory.sh ;' '. /tmp/change-directory.sh ;' 'builtin source /tmp/change-directory.sh ;' 'command . /tmp/change-directory.sh ;' 'env -C /other' 'env -C/other' 'env --chdir=/other' 'env --chdir /other'; do
+  assert_rc_contains "command-local directory changes refuse ($directory_prefix)" 2 "command-local directory changes" "$directory_prefix scripts/gh-as-author.sh -- gh pr merge 123 --squash"
+done
+assert_rc_contains "env directory change scoped to an earlier command is discarded" 0 "" 'env -C /other echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "cleared env scoped to an earlier command is discarded" 0 "" 'env -i echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "Git discovery scoped to an earlier command is discarded" 0 "" 'GIT_DIR=/other/.git echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "unrelated echoed repository selector is not an assignment" 0 "" 'echo GH_REPO=other/repo ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "repository assignment scoped to an earlier command is discarded" 0 "" 'GH_REPO=other/repo echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash'
+assert_rc_contains "quoted separator subject does not conceal later auto flag" 2 "deferred" "scripts/gh-as-author.sh -- gh pr merge --subject ';' 456 --auto"
+comment_review="${change_review/\"id\":1/\"id\":2}"
+comment_review="${comment_review/CHANGES_REQUESTED/COMMENTED}"
+STUB_REVIEW_PAGES="[[$comment_review]]" assert_rc_contains "COMMENTED-only reviewer does not block" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$change_review],[$comment_review]]" assert_rc_contains "later COMMENTED does not erase a change request" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[],[$change_review]]" assert_rc_contains "change request on a later page blocks" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact PR and head disagreement override releases the separate gate" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "wrong PR disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/124@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "abbreviated head disagreement override refuses" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaa $merge_overrides" BLOCKED
+BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported exact disagreement override releases the gate" 0 "owner tiebreak" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "override on an earlier command cannot release a disagreement" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa echo ok ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exact disagreement override never releases human-hold" 2 "human-hold" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED human-hold
+STUB_REVIEW_FAILURE=1 assert_rc_contains "unreadable reviews refuse despite merge overrides" 2 "complete PR review state" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES='null' assert_rc_contains "malformed reviews refuse despite merge overrides" 2 "complete PR review state" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[${change_review/nathanpayne-codex/nathanjohnpayne}]]" assert_rc_contains "PR author's own review does not create a disagreement" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[${change_review/nathanpayne-codex/coderabbitai[bot]}]]" assert_rc_contains "bot change requests also require an explicit disposition" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+
+
+# REST returns reviews in chronological response order; IDs need not order it.
+later_approval="${change_review/CHANGES_REQUESTED/APPROVED}"
+earlier_request="${change_review/\"id\":1/\"id\":999}"
+STUB_REVIEW_PAGES="[[$earlier_request],[$later_approval]]" assert_rc_contains "chronologically later lower-ID approval releases the gate" 0 "" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$later_approval],[$earlier_request]]" assert_rc_contains "chronologically later change request blocks regardless of ID" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED
+for deleted_state in COMMENTED DISMISSED APPROVED; do
+  deleted_review="$(printf '%s' "$change_review" | jq -c --arg state "$deleted_state" '.user=null | .state=$state')"
+  STUB_REVIEW_PAGES="[[$deleted_review]]" assert_rc_contains "deleted account $deleted_state does not block" 0 "" "$merge_overrides" BLOCKED
+done
+deleted_change="$(printf '%s' "$change_review" | jq -c '.user=null')"
+STUB_REVIEW_PAGES="[[$deleted_change]]" assert_rc_contains "deleted-account change request blocks with a diagnostic" 2 "deleted account" "$merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="[[$deleted_change]]" assert_rc_contains "deleted-account change request permits an exact owner tiebreak" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides" BLOCKED
+without_match="${merge_overrides/ --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/}"
+TEST_UNPINNED_MERGE=1 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses without the server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override refuses a different server head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "head-scoped override accepts the attached exact precondition" 0 "owner tiebreak" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "duplicate head preconditions do not authorize a tiebreak" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $merge_overrides --match-head-commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" BLOCKED
+
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "review blockers never prevent cancelling auto-merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED needs-external-review
+assert_rc_contains "human-hold freezes attributed retraction too" 2 "human-hold" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED human-hold
+for auto_true in true True TRUE t T 1; do
+  assert_rc_contains "deferred --auto=$auto_true refuses" 2 "deferred --auto" "scripts/gh-as-author.sh -- gh pr merge 123 --auto=$auto_true --squash" CLEAN
+done
+assert_rc_contains "an explicit false auto flag remains an immediate merge" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=false --squash' CLEAN
+for auto_false in false False FALSE f F 0; do
+  STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "last false retraction value restores disagreement checks ($auto_false)" 2 "CHANGES_REQUESTED" "scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=$auto_false --squash" CLEAN
+  TEST_UNPINNED_MERGE=1 assert_rc_contains "last false retraction value restores head pinning ($auto_false)" 2 "exactly one --match-head-commit" "scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=$auto_false --squash" CLEAN
+  assert_rc_contains "last false auto value selects immediate merge ($auto_false)" 0 "" "scripts/gh-as-author.sh -- gh pr merge 123 --auto --auto=$auto_false --squash" CLEAN
+done
+for auto_true in true True TRUE t T 1; do
+  STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "last true retraction value selects cancellation ($auto_true)" 0 "" "scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto=false --disable-auto=$auto_true" BLOCKED needs-external-review
+done
+assert_rc_contains "invalid retraction boolean refuses" 2 "invalid --disable-auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto --disable-auto=invalid' CLEAN
+assert_rc_contains "invalid auto boolean refuses" 2 "invalid --auto boolean" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto=invalid' CLEAN
+for cluster in -sb -db -dt -sF -sA -sR; do
+  TEST_UNPINNED_MERGE=1 assert_rc_contains "short cluster cannot grant retraction exception ($cluster)" 2 "unrecognized merge option or short cluster" "scripts/gh-as-author.sh -- gh pr merge 123 $cluster --disable-auto" CLEAN
+done
+for cluster in -sb -dt -sF -sA -sR; do
+  assert_rc_contains "short cluster cannot consume the writer's head precondition ($cluster)" 2 "unrecognized merge option or short cluster" "scripts/gh-as-author.sh -- gh pr merge 123 $cluster --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" CLEAN
+done
+assert_rc_contains "attached body value cannot request retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 -b--disable-auto --squash' CLEAN
+for dynamic_merge in 'cluster=-sb; scripts/gh-as-author.sh -- gh pr merge 123 $cluster --disable-auto' 'cluster=-sb; scripts/gh-as-author.sh -- gh pr merge $cluster --disable-auto' 'value_flag=-b; scripts/gh-as-author.sh -- gh pr merge 123 $value_flag --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; do
+  assert_rc_contains "dynamic argument cannot consume authority-bearing options ($dynamic_merge)" 2 "dynamic merge arguments" "$dynamic_merge" CLEAN
+done
+assert_rc_contains "multiple selectors cannot grant retraction exception" 2 "retraction permits only" 'scripts/gh-as-author.sh -- gh pr merge 123 extra --disable-auto' CLEAN
+assert_rc_contains "other merge options cannot grant retraction exception" 2 "retraction permits only" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash --disable-auto' CLEAN
+TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot request retraction" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge -- --disable-auto' CLEAN
+TEST_UNPINNED_MERGE=1 assert_rc_contains "option-looking branch after separator cannot supply head pinning" 2 "exactly one --match-head-commit" 'scripts/gh-as-author.sh -- gh pr merge 123 -- --match-head-commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' CLEAN
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "false-looking branch after separator cannot cancel retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge --disable-auto -- --disable-auto=false' BLOCKED needs-external-review
+assert_rc_contains "deferred auto-merge refuses even before a review blocker arrives" 2 "deferred --auto" 'scripts/gh-as-author.sh -- gh pr merge 123 --auto --squash' CLEAN
+for trailing in "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa echo ok" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; do
+  STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "trailing assignment cannot authorize an earlier merge ($trailing)" 2 "CHANGES_REQUESTED" "scripts/gh-as-author.sh -- gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; $trailing" CLEAN
+done
+assert_rc_contains "trailing command cannot clear merge-local repository environment" 2 "repository-discovery" 'GH_REPO=other/repo scripts/gh-as-author.sh -- gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; true' CLEAN
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a later command cannot supply the head precondition" 2 "requires exactly one" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $without_match ; echo --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unexported standalone tiebreak grants no authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && $merge_overrides" BLOCKED
+BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "standalone assignment cannot reuse ambient tiebreak" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=invalid ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "literal export form preserves a scoped owner tiebreak" 0 "owner tiebreak" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "exported dynamic tiebreak is not treated as literal authority" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\$(echo x) ; $merge_overrides" BLOCKED
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "unset removes the captured export tiebreak" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ; unset BREAK_GLASS_REVIEW_DISAGREEMENT ; $merge_overrides" BLOCKED
+assert_rc_contains "a deleted PR author with no reviews remains mergeable" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN '' MERGEABLE 0 '' 0 0 '' ''
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "a deleted PR author excludes no named reviewer" 2 "CHANGES_REQUESTED" "$merge_overrides" BLOCKED '' MERGEABLE 0 '' 0 0 '' ''
+
+for historical_state in COMMENTED DISMISSED APPROVED; do
+  collected_review="$(printf '%s' "$change_review" | jq -c --arg state "$historical_state" '.commit_id=null | .state=$state')"
+  STUB_REVIEW_PAGES="[[$collected_review]]" assert_rc_contains "garbage-collected commit $historical_state remains readable" 0 "" "$merge_overrides" BLOCKED
+done
+collected_review="$(printf '%s' "$change_review" | jq -c '.commit_id=null')"
+STUB_REVIEW_PAGES="[[$collected_review]]" assert_rc_contains "garbage-collected change request still blocks" 2 "unknown commit" "$merge_overrides" BLOCKED
+valid_override='https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "invalid inline override supersedes a valid earlier export" 2 "CHANGES_REQUESTED" "export BREAK_GLASS_REVIEW_DISAGREEMENT=$valid_override ; BREAK_GLASS_REVIEW_DISAGREEMENT=invalid $merge_overrides" BLOCKED
+BREAK_GLASS_REVIEW_DISAGREEMENT="$valid_override" STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "empty inline override supersedes ambient authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT= $merge_overrides" BLOCKED
+STUB_PR_URL=https://github.com/other/repo/pull/123 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "same PR number and commit in another repository cannot reuse authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=$valid_override $merge_overrides" BLOCKED
+STUB_PR_URL=https://enterprise.example/example/repo/pull/123 STUB_REVIEW_PAGES="$review_pages" assert_rc_contains "another host cannot reuse authority" 2 "CHANGES_REQUESTED" "BREAK_GLASS_REVIEW_DISAGREEMENT=$valid_override $merge_overrides" BLOCKED
+STUB_QUEUE_REQUIRED=true assert_rc_contains "required merge queue refuses implicit deferral" 2 "native merge-queue deferral" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_ENTERED=true assert_rc_contains "already queued PR cannot bypass snapshot enforcement" 2 "native merge-queue deferral" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_FAILURE=1 assert_rc_contains "unreadable queue state fails closed" 2 "verify native merge-queue state" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_JSON='{}' assert_rc_contains "malformed queue state fails closed" 2 "verify native merge-queue state" 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' CLEAN
+STUB_QUEUE_REQUIRED=true assert_rc_contains "required queue does not prevent attributed retraction" 0 "" 'scripts/gh-as-author.sh -- gh pr merge 123 --disable-auto' BLOCKED
+
+assert_rc_contains "direct pr create blocked" 2 "token-verifying wrapper" \
+  'gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "direct pr new alias blocked" 2 "token-verifying wrapper" \
+  'gh pr new --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "inline-token pr create blocked" 2 "not hook-verifiable" \
+  'GH_TOKEN=author-token gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "wrapper substring spoof still blocked" 2 "token-verifying wrapper" \
+  'echo scripts/gh-as-author.sh && gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+}
+case_pool_add pr_guard_case_01
+
+# --- `gh pr new` is a working alias for `gh pr create` -----------------------
+# gh 2.97: `gh pr new --help` prints the create help and lists `new` under
+# ALIASES. Before the alias was canonicalized, PR_SUBCOMMAND="new" matched no
+# guarded branch, so the "Not a covered command? Allow." path exited 0 and the
+# create guard never ran -- no Authoring-Agent check, no ## Self-Review check,
+# no byline verification. A complete bypass reachable by typing a documented
+# alias, so these cases are the regression fence around it.
+pr_guard_case_02() {
+assert_rc_contains "gh pr new is guarded like gh pr create" 2 "guarded GitHub write" \
+  'gh pr new --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+# The diagnostic must name the CANONICAL command, or an operator reading it
+# goes looking for a `gh pr new` rule that does not exist.
+assert_rc_contains "blocked gh pr new reports itself as gh pr create" 2 "gh pr create" \
+  'gh pr new --title "t" --body "b"'
+
+# Global flags may precede the subcommand; the alias must still resolve.
+assert_rc_contains "gh --repo o/r pr new is guarded" 2 "guarded GitHub write" \
+  'gh --repo owner/repo pr new --title "t" --body "b"'
+
+# Non-write pr subcommands must stay allowed: canonicalizing `new` must not
+# widen the guard onto reads.
+assert_rc_contains "gh pr view stays allowed" 0 "" 'gh pr view 123'
+
+# The compound-command scan runs BEFORE the main token walk and dispatches on
+# `parent:tok`. Canonicalizing the alias in the walk alone left `pr:new`
+# unlabelled there, so a compound counted two gh commands and zero guarded
+# writes: the scan passed, the walk classified only the leading read, and the
+# whole tool call was allowed. Found independently by CodeRabbit and Codex.
+assert_rc_contains "gh pr new in a compound is guarded" 2 "compound gh command contains a guarded write" \
+  'gh pr view 1 && gh pr new --title "t" --body "b"'
+
+assert_rc_contains "gh pr new after an issue write is guarded" 2 "compound gh command contains a guarded write" \
+  'gh issue close 1 && gh pr new --title "t" --body "b"'
+
+# Control: a compound of pure reads must still be allowed, or the fix above
+# would be over-blocking rather than closing a hole.
+assert_rc_contains "compound of reads stays allowed" 0 "" 'gh pr view 1 && gh pr view 2'
+
+# #466: a path-qualified gh (e.g. /usr/bin/gh) must NOT bypass the guard.
+# Before the fix the quick-exit grep only matched bare `gh`, so a
+# path-qualified write skipped the hook entirely (exit 0).
+assert_rc_contains "path-qualified gh pr create blocked (#466)" 2 "token-verifying wrapper" \
+  '/usr/bin/gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "path-qualified gh pr merge blocked (#466)" 2 "" \
+  '/usr/bin/gh pr merge 123 --squash --delete-branch'
+
+# #466 r2: a QUOTED path-qualified (or bare) gh must not bypass either.
+# The closing quote glued to `gh` previously slipped past the quick-exit
+# grep boundary (verified live by the nathanpayne-codex review).
+assert_rc_contains "quoted path-qualified gh pr merge blocked (#466 r2)" 2 "" \
+  "'/usr/bin/gh' pr merge 123 --squash --delete-branch"
+
+assert_rc_contains "quoted bare gh pr merge blocked (#466 r2)" 2 "" \
+  "'gh' pr merge 5 --squash"
+
+assert_rc_contains "wrapper state does not cross separator" 2 "token-verifying wrapper" \
+  'scripts/gh-as-author.sh -- echo ok ; gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "non-canonical author wrapper path blocked" 2 "non-canonical" \
+  '/tmp/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "bare reviewer wrapper command blocked" 2 "non-canonical" \
+  'gh-as-reviewer.sh -- gh pr review 123 --comment --body "review"'
+
+assert_rc_contains "wrapper non-guarded then bare guarded compound blocked" 2 "#348" \
+  'scripts/gh-as-author.sh -- gh pr view 123 && gh pr merge 123 --squash'
+
+assert_rc_contains "author wrapper pr create valid body allowed" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "author wrapper pr new alias allowed" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr new --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "author wrapper shell-wrapped pr create blocked" 2 "direct gh pr create" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr create --title t --body INVALID"'
+
+assert_rc_contains "author wrapper defers inline body validation to runtime wrapper" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude"'
+
+assert_rc_contains "author wrapper body-file creation allowed for runtime validation" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr create --title "t" --body-file /tmp/pr-body.md'
+
+assert_rc_contains "reviewer wrapper pr create blocked" 2 "author token" \
+  'scripts/gh-as-reviewer.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "author wrapper pr merge clean allowed" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "direct pr merge blocked" 2 "token-verifying wrapper" \
+  'gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "author wrapper pr merge blocked state" 2 "mergeStateStatus is BLOCKED" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
+# #547: UNSTABLE is a non-passing commit status. It is allowed ONLY when
+# the check ROLLUP confirms every check name's LATEST run is green
+# (ROLLUP_NONGREEN=0 — a stale failure superseded by a later pass) AND
+# mergeable=MERGEABLE. A genuinely-red check (rollup non-green > 0) is NOT
+# trusted as benign just because mergeable is MERGEABLE: mergeable is
+# conflict-only, so trusting it would reopen the #170/#171 red-CI bypass.
+assert_rc_contains "UNSTABLE + green rollup + MERGEABLE allowed (#547)" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_ROLLUP_NONGREEN=1 \
+  assert_rc_contains "UNSTABLE + a red latest check fails closed (#547)" 2 "latest run is not green" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_MERGEABLE=UNKNOWN \
+  assert_rc_contains "UNSTABLE + green rollup but mergeable=UNKNOWN fails closed (#547)" 2 "fail-closed" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+STUB_ROLLUP_NONGREEN=1 \
+  assert_rc_contains "UNSTABLE + red rollup + break-glass allowed (#547)" 0 "BREAK-GLASS" \
+  'BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --squash' "UNSTABLE" ""
+# DIRTY (merge conflict) stays blocked regardless — the UNSTABLE allowance
+# must not leak to the other non-CLEAN states.
+assert_rc_contains "DIRTY stays blocked (#547 split)" 2 "mergeStateStatus is DIRTY" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "DIRTY" ""
+
+assert_rc_contains "author wrapper pr merge human-hold blocks" 2 "human-hold" \
+  'CODEX_CLEARED=1 BREAK_GLASS_ADMIN=https://github.com/example/repo/pull/123@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa BREAK_GLASS_MERGE_STATE=1 scripts/gh-as-author.sh -- gh pr merge 123 --admin --squash' "DIRTY" "human-hold"
+
+assert_rc_contains "direct pr comment blocked" 2 "token-verifying wrapper" \
+  'gh pr comment 123 --body "ping"'
+
+assert_rc_contains "reviewer wrapper pr comment allowed" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"'
+
+assert_rc_contains "reviewer wrapper identity mismatch blocked" 2 "not expected reviewer" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"'
+
+assert_rc_contains "author wrapper normal pr comment blocked" 2 "reviewer token" \
+  'scripts/gh-as-author.sh -- gh pr comment 123 --body "ping"'
+
+assert_rc_contains "reserved trigger requires canonical requester" 2 "reserved review command" \
+  'scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"'
+
+TRIGGER_BODY_FILE="$WORKDIR/accidental-trigger.md"
+printf '%s\n' 'The guard missed `@codex review` in this comment.' > "$TRIGGER_BODY_FILE"
+assert_rc_contains "body-file trigger containment blocks reviewer write" 2 "Reword the comment" \
+  "scripts/gh-as-reviewer.sh -- gh pr comment 123 --body-file '$TRIGGER_BODY_FILE'"
+assert_rc_contains "review body trigger containment blocks" 2 "Reword the comment" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --comment --body "Do not quote @CoDeX review here."'
+assert_rc_contains "raw REST trigger containment blocks" 2 "Reword the comment" \
+  'scripts/gh-as-reviewer.sh -- gh api repos/o/r/issues/123/comments -f "body=Do not quote @codex review here."'
+assert_rc_contains "REST trigger after an earlier read is inspected" 2 "Reword the comment" \
+  'gh repo view && gh api repos/o/r/issues/123/comments -f "body=Do not quote @codex review here."'
+assert_rc_contains "ordinary REST write after an earlier read requires splitting" 2 "compound gh command contains a guarded write" \
+  'gh pr view 123 ; gh api repos/o/r/issues/123/comments -f body=Done'
+assert_rc_contains "wrapped REST write after a read requires splitting" 2 "compound gh command contains a guarded write" \
+  'gh repo view && scripts/gh-as-reviewer.sh -- gh api repos/o/r/issues/123/comments -f body=Done'
+assert_rc_contains "later closing comment is inspected" 2 "Reword the comment" \
+  'gh repo view || gh issue close 123 --comment "Do not quote @codex review here."'
+assert_rc_contains "compound native API reads remain allowed" 0 "" \
+  'gh api repos/o/r && gh api repos/o/r/issues/123/comments --method GET'
+for metadata in '' 'invalid' '{}' 'null' '[]' '{"guarded":"false"}' '{"guarded":null}' '{"guarded":false}{"guarded":false}'; do
+  STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT="$metadata" \
+    assert_rc_contains "invalid guard metadata refuses: $metadata" 2 "invalid guarded metadata" 'gh repo view'
+done
+STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":false}' STUB_COMMENT_GUARD_EXIT=1 \
+  assert_rc_contains "guard process read failure refuses" 2 "" 'gh repo view'
+STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":false}' \
+  assert_rc_contains "typed false guard metadata permits a read" 0 "" 'gh repo view'
+STUB_COMMENT_GUARD_STUB=1 STUB_COMMENT_GUARD_OUTPUT='{"guarded":true}' \
+  assert_rc_contains "typed true guard metadata requires the wrapper" 2 "token-verifying wrapper" 'gh api repos/o/r/issues/123/comments -f body=Done'
+
+# A controlled missing-entry copy preserves actual classification and runtime
+# helpers but removes the index assignment. Relocate only its helper root;
+# production receives no fault-injection switch.
+missing_index_hook="$WORKDIR/missing-index.sh"
+python3 - "$HOOK" "$missing_index_hook" "$ROOT/scripts/hooks" <<'PYTHON'
+from pathlib import Path
+import shlex, sys
+source, target, helper_root = sys.argv[1:]
+text = Path(source).read_text()
+root_line = next(line for line in text.splitlines() if line.startswith('HOOK_DIR='))
+text = text.replace(root_line, 'HOOK_DIR=' + shlex.quote(helper_root), 1)
+assignment = '      COMMENT_GUARDED_BY_INDEX[$i]="$comment_guard_boolean"'
+assert text.count(assignment) == 1, 'missing-entry control lost its injection point'
+Path(target).write_text(text.replace(assignment, '      : # controlled missing classification', 1))
+PYTHON
+original_hook="$HOOK"
+for guarded_command in \
+  'gh repo view' \
+  'env FIXTURE=value command gh repo view' \
+  'time -p gh repo view' \
+  'echo ready; gh repo view' \
+  'gh repo view && gh api repos/o/r --method GET' \
+  'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done' \
+  'env FIXTURE=value command scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done' \
+  'echo ready; scripts/gh-as-reviewer.sh -- gh pr comment 123 --body Done'; do
+  HOOK="$original_hook"
+  assert_rc_contains "matching command-position scans permit: $guarded_command" 0 "" "$guarded_command"
+  HOOK="$missing_index_hook"
+  assert_rc_contains "missing classification refuses: $guarded_command" 2 "missing comment-write classification" "$guarded_command"
+done
+for inspected_hook in "$original_hook" "$missing_index_hook"; do
+  HOOK="$inspected_hook"
+  assert_rc_contains 'non-command gh arguments need no classification' 0 "" 'echo gh repo view'
+  assert_rc_contains 'missing-index control cannot authorize reserved trigger prose' 2 'Reword the comment' \
+    'scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "Do not quote @codex review here."'
+done
+HOOK="$original_hook"
+
+assert_rc_contains "canonical requester invocation remains allowed" 0 "" \
+  'scripts/codex-review-request.sh 123 o/r'
+assert_rc_contains "comment-free issue close retains existing hook scope" 0 "" \
+  'gh issue close 123'
+assert_rc_contains "comment-free PR close retains existing hook scope" 0 "" \
+  'gh pr close 123 --delete-branch'
+assert_rc_contains "comment-free prefix reason close retains existing hook scope" 0 "" \
+  'gh -r completed issue close 123'
+assert_rc_contains "comment-free pre-verb reason close retains existing hook scope" 0 "" \
+  'gh issue -rcompleted close 123'
+assert_rc_contains "comment-free clustered delete flags retain existing hook scope" 0 "" \
+  'gh pr close 123 -dd'
+assert_rc_contains "empty closing comment retains existing hook scope" 0 "" \
+  'gh pr close 123 --comment ""'
+assert_rc_contains "issue closing comment requires the verified wrapper" 2 "token-verifying wrapper" \
+  'gh issue close 123 --comment "Done"'
+assert_rc_contains "PR closing comment requires the verified wrapper" 2 "token-verifying wrapper" \
+  'gh pr close 123 --comment "Done"'
+
+assert_rc_contains "author wrapper codex trigger echo spoof blocked" 2 "reviewer token" \
+  'echo "@codex review" && scripts/gh-as-author.sh -- gh pr comment 123 --body "ping"'
+
+assert_rc_contains "reviewer wrapper pr review comment allowed" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --comment --body "review"'
+
+assert_rc_contains "direct issue comment blocked" 2 "token-verifying wrapper" \
+  'gh issue comment 7 --body "thanks"'
+
+assert_rc_contains "reviewer wrapper issue comment allowed" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh issue comment 7 --body "thanks"'
+
+assert_rc_contains "author wrapper issue comment blocked" 2 "reviewer token" \
+  'scripts/gh-as-author.sh -- gh issue comment 7 --body "thanks"'
+
+assert_rc_contains "direct pr edit blocked" 2 "token-verifying wrapper" \
+  'gh pr edit 123 --title "new"'
+
+assert_rc_contains "pre-verb label value cannot hide direct pr merge" 2 "token-verifying wrapper" \
+  'gh pr -l merge merge 123 --squash'
+
+assert_rc_contains "pre-verb label value cannot hide direct pr edit" 2 "token-verifying wrapper" \
+  'gh pr --label merge edit 123 --title "new"'
+
+assert_rc_contains "author wrapper pr edit allowed" 0 "" \
+  'scripts/gh-as-author.sh -- gh pr edit 123 --title "new"'
+
+assert_rc_contains "reviewer wrapper pr edit blocked" 2 "author token" \
+  'scripts/gh-as-reviewer.sh -- gh pr edit 123 --title "new"'
+
+assert_rc_contains "self-approve over-threshold blocked from wrapper identity" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+assert_rc_contains "cross-agent approve allowed" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
+
+assert_rc_contains "commented author decoy cannot bypass same-agent approval" 2 "self-approve detected" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" $'<!-- Authoring-Agent: claude -->\nAuthoring-Agent: codex' "5000" "0"
+
+# The strict Authoring-Agent body contract belongs to the shared author lane.
+# Dependabot and external contributors do not use that template; a registered
+# reviewer must still be able to approve their PRs.
+assert_rc_contains "markerless Dependabot PR can receive reviewer approval" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "dependabot/npm_and_yarn/pkg" "dependabot[bot]"
+
+assert_rc_contains "markerless external-contributor PR can receive reviewer approval" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "contributor/fix" "outside-contributor"
+
+assert_rc_contains "markerless shared-author PR still fails closed" 2 "exactly one visible Authoring-Agent" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "" "5000" "0" "feature/fix" "nathanjohnpayne"
+
+assert_rc_contains "prose author mention is not a declaration (#927)" 2 "exactly one visible Authoring-Agent" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Explains the Authoring-Agent: claude convention." "5000" "0"
+
+assert_rc_contains "real declaration wins over a later prose mention (#927)" 2 "self-approve detected" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" $'Authoring-Agent: codex\nExplains Authoring-Agent: claude.' "5000" "0"
+
+assert_rc_contains "indented author line is not a declaration (#927)" 2 "exactly one visible Authoring-Agent" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "  Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_02
+
+# --- #1057 item A: in a Claude cloud session `gh pr view` is GraphQL and the
+# proxy refuses it, so the self-approve read falls back to REST, only for the
+# canonical `<number> --repo OWNER/REPO` form. Any other read failure still
+# blocks.
+pr_guard_case_03() {
+API_LOG="$WORKDIR/guard-api.log"
+: >"$API_LOG"
+STUB_GRAPHQL_CEILING=1 STUB_API_LOG="$API_LOG" assert_rc_contains "GraphQL ceiling: same-agent over-threshold approve still blocked from the REST read" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+if grep -qx 'api repos/example/repo/pulls/123' "$API_LOG" \
+   && grep -qx 'api --paginate --slurp repos/example/repo/pulls/123/files?per_page=100' "$API_LOG"; then
+  pass "GraphQL ceiling: the REST read targets the PR and repository the review names"
+else
+  fail "GraphQL ceiling REST read targets: $(cat "$API_LOG")"
+fi
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: under-threshold approve allowed from the REST read" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo=example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: cross-agent approve allowed from the REST read" 0 "" \
+  'GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: propagation-lane bypass works from the REST read" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc" "nathanjohnpayne"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: approve without --repo is refused with the canonical form" 2 "gh pr review <number> --repo OWNER/REPO" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+STUB_GRAPHQL_CEILING=1 assert_rc_contains "GraphQL ceiling: approve by URL is refused with the canonical form" 2 "gh pr review <number> --repo OWNER/REPO" \
+  'scripts/gh-as-reviewer.sh -- gh pr review https://github.com/example/repo/pull/123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+STUB_GRAPHQL_CEILING=1 STUB_REST_FAIL=1 assert_rc_contains "GraphQL ceiling: a failed REST read blocks" 2 "could not read example/repo#123 over REST" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+BIG_FILES="$WORKDIR/big-files.json"
+# Streamed into the file: as one argument it would hit the very limit tested.
+{ printf '[[{"filename":"scripts/x.sh","patch":"'; head -c 1200000 /dev/zero | tr '\0' 'x'; printf '"}]]\n'; } >"$BIG_FILES"
+STUB_GRAPHQL_CEILING=1 STUB_FILES_PAGES_FILE="$BIG_FILES" assert_rc_contains "GraphQL ceiling: a 1.2 MB files response is read (never passed as one argument)" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+# Codex cloud: no keyring and no ambient GH_TOKEN, only the provisioned
+# reviewer PAT. The self-approve read must authenticate with it, or every
+# approval is blocked before the wrapper runs (Codex on #2178).
+: >"$API_LOG"
+set +e
+out=$(unset GH_TOKEN GITHUB_TOKEN; OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'pr view authenticated with the expected token' "$API_LOG"; then
+  pass "self-approve read with no ambient token authenticates with the provisioned reviewer PAT"
+else
+  fail "self-approve read reviewer PAT: rc=$rc out=$out"
+fi
+set +e
+out=$(unset GH_TOKEN GITHUB_TOKEN OP_PREFLIGHT_REVIEWER_PAT; STUB_REQUIRE_TOKEN=1 \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep 'could not fetch PR metadata' >/dev/null; then
+  pass "self-approve read with no token at all still blocks"
+else
+  fail "self-approve read no token: rc=$rc out=$out"
+fi
+# The PAT is lent only to a read that goes to github.com: a host-qualified
+# --repo, a GH_HOST elsewhere, or a URL selector on another host keeps gh's
+# own (absent) credentials, so the read fails closed without sending the PAT
+# (Phase 4b on #2178).
+for selector in 123 https://github.com/example/repo/pull/123; do
+  : >"$API_LOG"
+  inferred_host=""
+  [ "$selector" != 123 ] || inferred_host=tenant.ghe.com
+  set +e
+  out=$(unset GH_TOKEN GITHUB_TOKEN GH_REPO GH_HOST; \
+    OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat \
+    STUB_REQUIRE_TOKEN=1 STUB_INFERRED_HOST="$inferred_host" STUB_API_LOG="$API_LOG" \
+    run_hook "scripts/gh-as-reviewer.sh -- gh pr review $selector --approve --body lgtm" \
+      "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ] \
+      && { [ -z "$inferred_host" ] || grep -q 'repository inferred host: tenant.ghe.com' "$API_LOG"; } \
+      && ! grep -q 'authenticated with the expected token' "$API_LOG"; then
+    pass "self-approve read without explicit canonical repository withholds reviewer PAT ($selector)"
+  else
+    fail "self-approve inferred repository PAT boundary ($selector): rc=$rc out=$out"
+  fi
+done
+: >"$API_LOG"
+set +e
+out=$(unset GH_TOKEN GITHUB_TOKEN GH_HOST; \
+  GH_REPO=example/repo OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat \
+  STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body lgtm' \
+    "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'authenticated with the expected token' "$API_LOG"; then
+  pass "inherited canonical GH_REPO permits reviewer PAT fallback"
+else
+  fail "inherited canonical GH_REPO PAT boundary: rc=$rc out=$out"
+fi
+: >"$API_LOG"
+set +e
+out=$(unset GITHUB_TOKEN GH_REPO GH_HOST; \
+  GH_TOKEN=fixture-ambient-pat OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat \
+  STUB_EXPECT_TOKEN=fixture-ambient-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+  run_hook 'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body lgtm' \
+    "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ] && grep -q 'authenticated with the expected token' "$API_LOG"; then
+  pass "an ambient CLI credential remains available without reviewer PAT fallback"
+else
+  fail "ambient CLI credential changed: rc=$rc out=$out"
+fi
+for variant in "--repo github.localhost/o/r" "GH_HOST=tenant.ghe.com" "https://github.localhost/o/r/pull/123" \
+    "--repo git@tenant.ghe.com:o/r" "--repo=git@tenant.ghe.com:o/r" "--repo=https://tenant.ghe.com/o/r" "GH_REPO=git@tenant.ghe.com:o/r"; do
+  : >"$API_LOG"
+  ghrepo=""
+  case "$variant" in
+    GH_HOST=*) cmd='scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"'; host="${variant#GH_HOST=}" ;;
+    GH_REPO=*) cmd='scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"'; host=""; ghrepo="${variant#GH_REPO=}" ;;
+    https://*) cmd="scripts/gh-as-reviewer.sh -- gh pr review $variant --approve --body lgtm"; host="" ;;
+    *) cmd="scripts/gh-as-reviewer.sh -- gh pr review 123 $variant --approve --body lgtm"; host="" ;;
+  esac
+  set +e
+  out=$(unset GH_TOKEN GITHUB_TOKEN; if [ -n "$host" ]; then export GH_HOST="$host"; fi; if [ -n "$ghrepo" ]; then export GH_REPO="$ghrepo"; fi; \
+    OP_PREFLIGHT_REVIEWER_PAT=fixture-reviewer-pat STUB_EXPECT_TOKEN=fixture-reviewer-pat STUB_REQUIRE_TOKEN=1 STUB_API_LOG="$API_LOG" \
+    run_hook "$cmd" "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 2 ] && ! grep -q 'authenticated with the expected token' "$API_LOG"; then
+    pass "self-approve read toward another host ($variant): the reviewer PAT is not lent, and the read fails closed"
+  else
+    fail "self-approve PAT withheld ($variant): rc=$rc out=$out"
+  fi
+done
+STUB_PR_VIEW_FAIL=1 assert_rc_contains "a read failure that is not the GraphQL ceiling still blocks, with no REST fallback" 2 "could not fetch PR metadata" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --repo example/repo --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "0"
+}
+case_pool_add pr_guard_case_03
+
+# --- #671: the self-approve sub-guard resolves the reviewer the same way
+# the wrapper will (GH_AS_REVIEWER_IDENTITY, then MERGEPATH_AGENT, then
+# the default), honoring an inline same-segment MERGEPATH_AGENT prefix.
+# Session default (expected reviewer arg) stays nathanpayne-claude in all
+# of these — exactly the PR #663 incident shape.
+pr_guard_case_04() {
+assert_rc_contains "cross-agent approve via inline MERGEPATH_AGENT allowed (#671)" 0 "" \
+  'MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...the same inline form naming the AUTHORING agent is still self-approve.
+assert_rc_contains "same-agent approve via inline MERGEPATH_AGENT still blocked (#671)" 2 "self-approve detected" \
+  'MERGEPATH_AGENT=claude scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...an inline value the hook cannot resolve to a literal identity fails
+# closed: a command-substitution value and a non-slug value are both
+# blocked rather than guessed at. The flattened cmdsub form arrives as an
+# empty assignment plus an adjacent placeholder token, which the capture
+# records as the placeholder so this blocks explicitly (#679 review P2).
+assert_rc_contains "cmdsub inline MERGEPATH_AGENT approve blocked (#671)" 2 "unverifiable inline MERGEPATH_AGENT" \
+  'MERGEPATH_AGENT=$(cat /tmp/agent) scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...including on a NON-claude-authored PR, where an empty capture falling
+# back to the claude default would have compared cursor against claude and
+# FAILED OPEN — the substitution could resolve to the authoring agent and
+# post a same-agent approval (#679 review P2 regression).
+assert_rc_contains "cmdsub inline MERGEPATH_AGENT blocked on cursor-authored PR (#679 P2)" 2 "unverifiable inline MERGEPATH_AGENT" \
+  'MERGEPATH_AGENT=$(cat /tmp/agent) scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
+
+assert_rc_contains "non-slug inline MERGEPATH_AGENT approve blocked (#671)" 2 "not a plain agent slug" \
+  'MERGEPATH_AGENT="codex or claude" scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...but a malformed MERGEPATH_AGENT must NOT block when an explicit
+# GH_AS_REVIEWER_IDENTITY decides resolution first — the wrapper never
+# reads MERGEPATH_AGENT in that case (#679 review P3).
+assert_rc_contains "non-slug MERGEPATH_AGENT ignored when explicit reviewer identity wins (#679 P3)" 0 "" \
+  'MERGEPATH_AGENT="codex or claude" GH_AS_REVIEWER_IDENTITY=nathanpayne-codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-codex" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_04
+
+# --- #679 review P1: the wrapper chain's third link. A session warmed
+# with op-preflight --agent <agent> exports OP_PREFLIGHT_AGENT, and the
+# wrapper resolves nathanpayne-$OP_PREFLIGHT_AGENT when neither
+# GH_AS_REVIEWER_IDENTITY nor MERGEPATH_AGENT is set. Bottoming out at
+# the claude default instead would fail OPEN on a cursor-preflight
+# session approving a cursor-authored PR.
+pr_guard_case_05() {
+TEST_OP_PREFLIGHT_AGENT=cursor \
+  assert_rc_contains "same-agent approve via OP_PREFLIGHT_AGENT session blocked (#679 P1)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
+
+TEST_OP_PREFLIGHT_AGENT=codex \
+  assert_rc_contains "cross-agent approve via OP_PREFLIGHT_AGENT session allowed (#679 P1)" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...and an inline MERGEPATH_AGENT prefix still outranks the preflight
+# link, matching the wrapper chain order.
+TEST_OP_PREFLIGHT_AGENT=claude \
+  assert_rc_contains "inline MERGEPATH_AGENT outranks OP_PREFLIGHT_AGENT (#679 P1)" 0 "" \
+  'MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_05
+
+# --- #679 round 2: env-unset OP_PREFLIGHT_AGENT must not be trusted from
+# the stale hook environment — the wrapper falls to its claude default, so
+# a codex-preflight session approving a claude-authored PR is same-agent.
+pr_guard_case_06() {
+TEST_OP_PREFLIGHT_AGENT=codex \
+  assert_rc_contains "env -u OP_PREFLIGHT_AGENT approve resolves to default and blocks (#679 r2)" 2 "self-approve detected" \
+  'env -u OP_PREFLIGHT_AGENT -u OP_PREFLIGHT_REVIEWER_PAT scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_06
+
+# --- #679 round 2: a command-substitution GH_AS_REVIEWER_IDENTITY is the
+# wrapper chain FIRST link — it must fail closed (the substitution could
+# emit the authoring identity), not fall through to MERGEPATH_AGENT.
+pr_guard_case_07() {
+assert_rc_contains "cmdsub GH_AS_REVIEWER_IDENTITY approve blocked (#679 r2)" 2 "not expected reviewer" \
+  'GH_AS_REVIEWER_IDENTITY=$(cat /tmp/id) MERGEPATH_AGENT=codex scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+}
+case_pool_add pr_guard_case_07
+
+# --- #679 round 2: an EMBEDDED substitution with a literal prefix
+# (MERGEPATH_AGENT=cla$(x)e) flattens into the prefix token plus an
+# adjacent placeholder; the guard must fail closed on the whole segment,
+# never trust the literal prefix as the agent slug.
+pr_guard_case_08() {
+assert_rc_contains "embedded-cmdsub MERGEPATH_AGENT approve blocked (#679 r2)" 2 "unverifiable command substitution" \
+  'MERGEPATH_AGENT=cla$(cat /tmp/a)e scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: cursor" "5000" "0"
+}
+case_pool_add pr_guard_case_08
+
+# --- same adjacency hole, bare-write form: an embedded substitution in
+# ANY prefix assignment used to derail the walk (the placeholder took
+# command position, the real gh write was classified as unrelated-command
+# args) and a BARE guarded write escaped the guard entirely.
+pr_guard_case_09() {
+assert_rc_contains "bare gh pr merge behind embedded-cmdsub prefix blocked (#679 r2)" 2 "unverifiable command substitution" \
+  'FOO=a$(cat /tmp/x)b gh pr merge 123 --squash'
+
+# ...while the same embedded-cmdsub prefix on a NON-gh segment stays
+# allowed — the fail-closed scope is gh/wrapper segments only.
+assert_rc_contains "embedded-cmdsub prefix on non-gh command allowed (#679 r2)" 0 "" \
+  'FOO=a$(cat /tmp/x)b make build'
+
+# ...an inline prefix scoped to an EARLIER command does not leak across
+# the separator: the wrapper never sees it, so the sub-guard must not
+# credit it as the cross-agent identity (falls back to the default →
+# still self-approve).
+assert_rc_contains "MERGEPATH_AGENT prefix on an earlier command does not unlock approve (#671)" 2 "self-approve detected" \
+  'MERGEPATH_AGENT=codex echo ok ; scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+# ...env -i strips MERGEPATH_AGENT from the wrapper environment, so an
+# earlier inline prefix must not survive it (wrapper bottoms out at its
+# hardcoded claude default → same-agent → blocked).
+assert_rc_contains "inline MERGEPATH_AGENT before env -i does not unlock approve (#671)" 2 "self-approve detected" \
+  'MERGEPATH_AGENT=codex env -i scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0"
+
+ORIG_DIR="$(pwd)"
+mkdir -p "$WORKDIR/repo-custom-shared-author/.github"
+cat >"$WORKDIR/repo-custom-shared-author/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+external_review_threshold: 300
+YML
+cd "$WORKDIR/repo-custom-shared-author"
+assert_rc_contains "policy-defined custom shared author is not treated as external" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "lgtm"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "feature/fix" "custom-owner"
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-with-policy/.github"
+cat >"$WORKDIR/repo-with-policy/.github/review-policy.yml" <<'YML'
+external_review_threshold: 500
+YML
+cd "$WORKDIR/repo-with-policy"
+assert_rc_contains "same-agent under-threshold approve allowed" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "small"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "10" "5"
+cd "$ORIG_DIR"
+}
+case_pool_add pr_guard_case_09
+
+# --- #533 item 2: propagation lane bypass honors propagation_prs.enabled
+# A mergepath-sync/* PR authored by the author identity skips the
+# same-agent self-approve guard even when over-threshold — but ONLY when
+# the lane is enabled. DEFAULT-ON: an absent propagation_prs block counts
+# as enabled; an explicit `enabled: false` must re-impose the guard, and
+# per #540 any other present non-`true` value (e.g. `yes`, a typo) also
+# re-imposes it (fail-closed exact-match).
+pr_guard_case_10() {
+mkdir -p "$WORKDIR/repo-lane-default/.github"
+cat >"$WORKDIR/repo-lane-default/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+YML
+cd "$WORKDIR/repo-lane-default"
+assert_rc_contains "lane bypass allowed (default-on absent block)" 0 "" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-lane-off/.github"
+cat >"$WORKDIR/repo-lane-off/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:
+  enabled: false
+YML
+cd "$WORKDIR/repo-lane-off"
+assert_rc_contains "lane bypass denied when propagation_prs.enabled false (#533)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-lane-typo/.github"
+cat >"$WORKDIR/repo-lane-typo/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:
+  enabled: yes
+YML
+cd "$WORKDIR/repo-lane-typo"
+assert_rc_contains "lane bypass denied when propagation_prs.enabled is a present non-true value (#540)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+# #540 P2 (4a review): a trailing comment on the propagation_prs header
+# (propagation_prs: # opt-out) must still be parsed, so enabled:false
+# disables the lane. The prior exact-EOL header match missed it and the
+# lane failed open.
+mkdir -p "$WORKDIR/repo-lane-comment/.github"
+cat >"$WORKDIR/repo-lane-comment/.github/review-policy.yml" <<'YML'
+external_review_threshold: 300
+propagation_prs:  # this repo opted out of the self-approve lane
+  enabled: false
+YML
+cd "$WORKDIR/repo-lane-comment"
+assert_rc_contains "lane bypass denied when propagation_prs header has a trailing comment (#540 P2)" 2 "self-approve detected" \
+  'scripts/gh-as-reviewer.sh -- gh pr review 123 --approve --body "sync"' "CLEAN" "" "nathanpayne-claude" "Authoring-Agent: claude" "5000" "0" "mergepath-sync/abc123" "nathanjohnpayne"
+cd "$ORIG_DIR"
+
+assert_rc_contains "compound direct guarded write blocked" 2 "#348" \
+  'gh issue close 7 && gh pr merge --admin 123'
+}
+case_pool_add pr_guard_case_10
+
+# --- #533 item 1: eval / sh -c / bash -c admin-merge bypass -----------
+# Each of these returned rc=0 (BYPASS) before the python tokenizer
+# re-tokenized eval/shell -c payloads: shlex kept the inner command as
+# one opaque token, so SAW_GH stayed 0 and the guard exited early. They
+# must now surface the inner guarded gh write and BLOCK (rc=2).
+pr_guard_case_11() {
+assert_rc_contains "eval-wrapped gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'eval "gh pr merge 123 --admin"'
+
+assert_rc_contains "eval split-arg gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'eval "gh pr" "merge 123 --admin"'
+
+assert_rc_contains "bash -lc gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'bash -lc "gh pr merge 123 --admin"'
+
+assert_rc_contains "bash -c gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'bash -c "gh pr merge 123 --admin"'
+
+assert_rc_contains "sh -c gh pr merge --admin blocked (#533)" 2 "token-verifying wrapper" \
+  'sh -c "gh pr merge 123 --admin"'
+
+# Recursion: a shell wrapper nesting eval (bash -c -> eval -> gh) must
+# expand all the way down.
+assert_rc_contains "bash -c eval gh pr merge blocked (#533 recursion)" 2 "token-verifying wrapper" \
+  'bash -c "eval gh pr merge 123 --admin"'
+
+# A guarded write hidden inside a shell -c compound must still trip #348.
+assert_rc_contains "shell -c compound guarded write blocked (#533/#348)" 2 "#348" \
+  'sh -c "gh issue close 1 && gh pr merge 123 --admin"'
+
+# No false positives: a wrapped command with no command-position gh
+# write stays allowed (the walk re-establishes command position on the
+# expanded stream, so a gh token that is mere data is not a write).
+assert_rc_contains "eval echo allowed (no gh)" 0 "" \
+  'eval "echo hello world"'
+
+assert_rc_contains "bash -c echo of gh text allowed (gh not in cmd position)" 0 "" \
+  'bash -c "echo gh pr merge --admin"'
+}
+case_pool_add pr_guard_case_11
+
+# --- #540 Phase-4b: nathanpayne-codex found two more guard bypasses ----
+# (1) bash --noprofile --norc -c "<payload>": the option scan matched any
+#     flag containing a 'c', so --norc consumed the real -c and dropped the
+#     command string. Long (--) options are now skipped so the real -c is
+#     found.
+pr_guard_case_12() {
+assert_rc_contains "bash --norc -c gh pr merge --admin blocked (#540)" 2 "" \
+  'bash --noprofile --norc -c "gh pr merge 1 --admin"'
+assert_rc_contains "bash --rcfile -c still finds the real -c (#540)" 2 "" \
+  'bash --rcfile /dev/null -c "gh pr merge 1 --admin"'
+
+# (3) <prefix> [opts] bash -c "<payload>": a prefix command with its OWN
+#     options (env -i, sudo -u USER, nice -n N) must consume those options
+#     so the wrapped bash -c is still found. Previously a prefix option
+#     fell through and flipped command-position off, hiding the bash -c
+#     gh-write (#540 P1, 4a review).
+assert_rc_contains "env -i bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'env -i bash -c "gh pr merge 1 --admin"'
+assert_rc_contains "sudo -u USER bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'sudo -u nobody bash -c "gh pr merge 1 --admin"'
+assert_rc_contains "nice -n N bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'nice -n 5 bash -c "gh pr merge 1 --admin"'
+# sudo -n is a no-value FLAG (unlike nice -n), so bash stays in command
+# position and is still expanded (per-prefix value-option table).
+assert_rc_contains "sudo -n bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'sudo -n bash -c "gh pr merge 1 --admin"'
+# An env NAME=VALUE assignment before the shell is skipped, not mistaken
+# for the wrapped command.
+assert_rc_contains "env VAR=x bash -c gh pr merge blocked (#540 P1)" 2 "" \
+  'env FOO=bar bash -c "gh pr merge 1 --admin"'
+# Control: a prefix wrapping a benign echo of gh text stays allowed (gh is
+# not in command position inside the echo).
+assert_rc_contains "sudo -u x bash -c echo gh text allowed (#540 P1)" 0 "" \
+  'sudo -u nobody bash -c "echo gh pr merge --admin"'
+
+# (2) a command substitution with a quoted ) desynced shlex quote tracking
+#     and glued a top-level "; gh ..." into a data token. The python
+#     preprocessor is now command-substitution aware: it pads unquoted
+#     separators and surfaces commands inside $(...) / backticks.
+assert_rc_contains "cmd-sub quoted-paren hides top-level gh merge blocked (#540)" 2 "" \
+  'echo "$(printf %s ")")"; gh pr merge 1 --admin'
+
+# Related command-substitution / subshell vectors the same fix closes: a
+# gh write that EXECUTES inside $(...), a backtick, a subshell, or an
+# assignment substitution is surfaced and blocked (also required the
+# fast-path pre-filter boundary to count ( / $ / ; / backtick, not only
+# whitespace, so the hook does not early-exit before tokenizing).
+assert_rc_contains "gh write inside command substitution blocked (#540)" 2 "" \
+  'echo "$(gh pr merge 1 --admin)"'
+assert_rc_contains "gh write in subshell blocked (#540)" 2 "" \
+  '(gh pr merge 1 --admin)'
+assert_rc_contains "gh write in assignment substitution blocked (#540)" 2 "" \
+  'X=$(gh pr merge 1 --admin)'
+assert_rc_contains "gh write in backtick substitution blocked (#540)" 2 "" \
+  'echo `gh pr merge 1 --admin`'
+
+# Control: a READ inside a substitution is not a guarded write -> allowed.
+assert_rc_contains "gh read inside command substitution allowed (#540)" 0 "" \
+  'echo "$(gh pr view 1)"'
+}
+case_pool_add pr_guard_case_12
+
+# --- author-wrapper identity pin (#438) -------------------------------
+
+pr_guard_case_13() {
+assert_rc_contains "author wrapper inline non-author identity blocked" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "author wrapper inline matching author identity allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "author wrapper inline non-author identity blocked on pr create" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-cursor scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"'
+
+assert_rc_contains "reserved trigger blocks before wrong author identity can write" 2 "reserved review command" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"'
+
+# A stale inline assignment scoped to an EARLIER command segment must
+# not leak into the author byline guard — the shell would not pass it
+# to the wrapper (Codex P2 on PR #442).
+assert_rc_contains "stale inline author identity from earlier segment does not block" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex echo ok ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# A standalone assignment (no command in its segment) persists as a
+# shell variable, and IF the name carries the export attribute in the
+# calling shell it ALSO reaches the wrapper (Codex P1 on PR #442 r4).
+# The hook cannot observe the export attribute, so a standalone
+# non-author value must fail closed even though it might be inert.
+assert_rc_contains "standalone non-author identity assignment fails closed" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# ...but a standalone assignment of the EXPECTED author is fine either
+# way (exported: wrapper gets the expected value; unexported: wrapper
+# default is the same value).
+assert_rc_contains "standalone matching author identity assignment allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# `export VAR=x ; wrapper` is DEFINITELY effective — the assignment is
+# an argument of the export command, not a bare prefix, and reaches
+# every later process (Codex P1 on PR #442 r11).
+assert_rc_contains "exported-via-export-command non-author identity blocked" 2 "author identity" \
+  'export GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "exported-via-export-command matching author identity allowed" 0 "" \
+  'export GH_AS_AUTHOR_IDENTITY=nathanjohnpayne && scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+assert_rc_contains "exported-via-export-command non-reviewer identity blocked" 2 "expected reviewer" \
+  'export GH_AS_REVIEWER_IDENTITY=nathanpayne-codex ; scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"' "CLEAN" ""
+
+# Prefix-assignment BEFORE the export command in the same segment
+# (`VAR=x export VAR`) persists AND exports (Codex P1 on PR #442 r12).
+assert_rc_contains "reserved trigger blocks after exported wrong author identity" 2 "reserved review command" \
+  'GH_AS_AUTHOR_IDENTITY=nathanpayne-codex export GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr comment 123 --body "@codex review"' "CLEAN" ""
+
+assert_rc_contains "prefix-then-export matching author identity allowed" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=nathanjohnpayne export GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# declare -x is export-equivalent (Codex P1 r12 family, preempted).
+assert_rc_contains "declare -x non-author identity blocked" 2 "author identity" \
+  'declare -x GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# env-prefix on the wrapper command is a definitive same-segment prefix.
+assert_rc_contains "env-prefixed non-author identity blocked" 2 "author identity" \
+  'env GH_AS_AUTHOR_IDENTITY=nathanpayne-codex scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# eval'd assignments persist like bare standalones (preempted, r14
+# family): possibly-effective, so a mismatch fails closed.
+assert_rc_contains "eval'd non-author identity assignment fails closed" 2 "author identity" \
+  'eval GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# readonly -x exports too (Codex P1 on PR #442 r14, hook-verified).
+assert_rc_contains "readonly -x non-author identity blocked" 2 "author identity" \
+  'readonly -x GH_AS_AUTHOR_IDENTITY=nathanpayne-codex ; scripts/gh-as-author.sh -- gh pr create --title "t" --body "Authoring-Agent: claude
+
+## Self-Review
+- ok"' "CLEAN" ""
+
+# The custom-author shape from the r3 finding: standalone assignment of
+# the CUSTOM identity must NOT satisfy the guard — the wrapper would
+# actually verify its stock default.
+mkdir -p "$WORKDIR/repo-custom-author-standalone/.github"
+cat >"$WORKDIR/repo-custom-author-standalone/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author-standalone"
+assert_rc_contains "standalone custom-identity assignment does not mask the wrapper default" 2 "author identity" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner && scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# Exported (non-inline) GH_AS_AUTHOR_IDENTITY must be caught too — the
+# wrapper reads its environment, so the hook must read the same.
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=nathanpayne-codex run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "author wrapper exported non-author identity blocked"
+else
+  fail "author wrapper exported non-author identity blocked: rc=$rc; output: $out"
+fi
+
+# The expected author defaults from review-policy.yml author_identity
+# when GH_PR_GUARD_EXPECTED_AUTHOR is unset (Codex P2 on PR #442 r2) —
+# custom-author repos need no hook-specific variable.
+mkdir -p "$WORKDIR/repo-custom-author/.github"
+cat >"$WORKDIR/repo-custom-author/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author"
+assert_rc_contains "author identity from review-policy.yml allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+assert_rc_contains "author identity from review-policy.yml blocks the stock default" 2 "author identity" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# An EMPTY inline override resets the wrapper to its hardcoded default
+# (Codex P1 on PR #442 r15): in a custom-author repo that is a
+# wrong-byline reset and must fail closed, even when the hook's own
+# environment carries the correct custom identity.
+mkdir -p "$WORKDIR/repo-custom-author-empty/.github"
+cat >"$WORKDIR/repo-custom-author-empty/.github/review-policy.yml" <<'YML'
+author_identity: custom-owner
+YML
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "empty inline author override fails closed in custom-author repo"
+else
+  fail "empty inline author override fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# env -u / --unset / -i remove the identity from the WRAPPER's
+# environment — the r15 empty-override semantics (Codex P2 r17).
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env -u GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "env -u identity unset fails closed in custom-author repo"
+else
+  fail "env -u identity unset fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env --unset=GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "env --unset= identity fails closed in custom-author repo"
+else
+  fail "env --unset= identity fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+assert_rc_contains "env -u identity unset allowed in default repo" 0 "" \
+  'env -u GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# Space-separated long form: `env --unset NAME` (Codex P1 r18) — the
+# value flag must be consumed or the walk loses the wrapper entirely
+# and skips ALL checks.
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "env --unset NAME (space form) fails closed in custom-author repo"
+else
+  fail "env --unset NAME (space form) fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# ...and in a default repo the walk must still SEE the wrapper and
+# evaluate the merge-state checks (BLOCKED state proves the walk
+# reached the merge guard rather than bailing at the unset arg).
+assert_rc_contains "env --unset NAME still reaches merge-state checks" 2 "mergeStateStatus is BLOCKED" \
+  'env --unset GH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
+# Compact `env -uNAME` form (#451) — flag and name attached, no `=`.
+# prefix_flag_takes_value matches only the bare `-u`, so this token would
+# fall through as a boolean flag unless the case block models it
+# explicitly. Same r15 empty-override semantics as `env -u NAME`.
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'env -uGH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "#451: env -uNAME (compact) author unset fails closed in custom-author repo"
+else
+  fail "#451: env -uNAME (compact) author unset fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+# ...and in a default repo the compact form must still reach the merge-state
+# checks (BLOCKED proves the walk didn't bail at the unset arg and skip checks).
+assert_rc_contains "#451: env -uNAME (compact) author unset reaches merge-state checks in default repo" 2 "mergeStateStatus is BLOCKED" \
+  'env -uGH_AS_AUTHOR_IDENTITY scripts/gh-as-author.sh -- gh pr merge 123 --squash' "BLOCKED" ""
+
+# Reviewer analog: the compact unset falls the wrapper back to its default
+# reviewer; with a different expected reviewer that must fail closed.
+assert_rc_contains "#451: env -uNAME (compact) reviewer unset fails closed vs different expected reviewer" 2 "not expected reviewer" \
+  'env -uGH_AS_REVIEWER_IDENTITY scripts/gh-as-reviewer.sh -- gh pr comment 123 --body "ping"' "CLEAN" "" "nathanpayne-codex"
+
+# The unset BUILTIN persists past separators (preempted, r17 family).
+cd "$WORKDIR/repo-custom-author-empty"
+set +e
+out=$(GH_AS_AUTHOR_IDENTITY=custom-owner run_hook 'unset GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "unset builtin identity removal fails closed in custom-author repo"
+else
+  fail "unset builtin identity removal fails closed in custom-author repo: rc=$rc; output: $out"
+fi
+cd "$ORIG_DIR"
+
+assert_rc_contains "unset builtin identity removal allowed in default repo" 0 "" \
+  'unset GH_AS_AUTHOR_IDENTITY ; scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# In a DEFAULT repo an empty override is a no-op (wrapper default ==
+# expected) and must not block.
+assert_rc_contains "empty inline author override allowed in default repo" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY= scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+
+# Subdirectory invocation: the policy is found by upward walk (r21).
+mkdir -p "$WORKDIR/repo-custom-author/subdir"
+cd "$WORKDIR/repo-custom-author/subdir"
+assert_rc_contains "author identity policy found from a subdirectory" 2 "author identity" \
+  'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# Quoted author_identity is valid YAML — double AND single quotes must
+# be stripped before comparison (Codex P2s on PR #442 r6/r7).
+mkdir -p "$WORKDIR/repo-quoted-author/.github"
+cat >"$WORKDIR/repo-quoted-author/.github/review-policy.yml" <<'YML'
+author_identity: "custom-owner"
+YML
+cd "$WORKDIR/repo-quoted-author"
+assert_rc_contains "double-quoted author_identity allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+mkdir -p "$WORKDIR/repo-squoted-author/.github"
+cat >"$WORKDIR/repo-squoted-author/.github/review-policy.yml" <<'YML'
+author_identity: 'custom-owner'
+YML
+cd "$WORKDIR/repo-squoted-author"
+assert_rc_contains "single-quoted author_identity allows matching wrapper identity" 0 "" \
+  'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" ""
+cd "$ORIG_DIR"
+
+# Custom expected author: identity must match the override...
+set +e
+out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'GH_AS_AUTHOR_IDENTITY=custom-owner scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+  pass "author wrapper custom expected author with matching identity allowed"
+else
+  fail "author wrapper custom expected author with matching identity allowed: rc=$rc; output: $out"
+fi
+
+# ...and an UNSET identity fails closed under a custom expected author,
+# because the wrapper would verify its stock default (nathanjohnpayne),
+# not the override.
+set +e
+out=$(GH_PR_GUARD_EXPECTED_AUTHOR=custom-owner run_hook 'scripts/gh-as-author.sh -- gh pr merge 123 --squash' "CLEAN" "" 2>&1)
+rc=$?
+set -e
+if [ "$rc" -eq 2 ] && echo "$out" | grep -i "author identity" >/dev/null; then
+  pass "author wrapper unset identity under custom expected author fails closed"
+else
+  fail "author wrapper unset identity under custom expected author fails closed: rc=$rc; output: $out"
+fi
+}
+case_pool_add pr_guard_case_13
+
+# --- #546: parser-completeness hardening (gap 1 + gap 2) --------------
+# Gap 1 — a blessed wrapper must not hide a shell-c payload. Before #546 the
+# wrappers were not prefix-like in expand_wrappers, so a "<wrapper> -- bash
+# -c <gh write>" left the inner write opaque and it ran under the verified
+# token WITHOUT the merge-state / admin / CODEX gate. The inner write must
+# now surface and face the same checks as a visible "<wrapper> -- gh ...".
+pr_guard_case_14() {
+assert_rc_contains "author wrapper hides bash -c merge: state still checked (#546 gap 1)" 2 "mergeStateStatus is BLOCKED" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "BLOCKED" ""
+assert_rc_contains "author wrapper bash -c clean merge still allowed (#546 gap 1, no false block)" 0 "" \
+  'scripts/gh-as-author.sh -- bash -c "gh pr merge 123 --squash --match-head-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "CLEAN" ""
+assert_rc_contains "author wrapper hides eval admin merge: surfaced + blocked (#546 gap 1)" 2 "" \
+  'scripts/gh-as-author.sh -- eval "gh pr merge 123 --admin"' "CLEAN" ""
+assert_rc_contains "reviewer wrapper hides bash -c admin merge: surfaced + blocked (#546 gap 1)" 2 "" \
+  'scripts/gh-as-reviewer.sh -- bash -c "gh pr merge 123 --admin"' "CLEAN" ""
+assert_rc_contains "wrapper bash -c echo of gh text is not a write (#546 gap 1, no false positive)" 0 "" \
+  'scripts/gh-as-author.sh -- bash -c "echo gh pr merge --admin"' "CLEAN" ""
+
+# Gap 2 — the python pre-pass and the bash walk read ONE shared
+# PREFIX_VALUE_OPTS_SPEC, so a long-form prefix value-option no longer
+# mis-skips. Before #546 python expanded "sudo --user X bash -c <gh write>"
+# but the bash compound scan (short-forms only) mis-read X as the command
+# and never saw the surfaced gh, so a guarded write passed rc=0.
+assert_rc_contains "sudo --user long form bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'sudo --user root bash -c "gh pr merge 123 --admin"'
+assert_rc_contains "nice --adjustment long form bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'nice --adjustment 10 bash -c "gh pr merge 123 --admin"'
+assert_rc_contains "time -f value option bash -c gh write surfaced (#546 gap 2)" 2 "token-verifying wrapper" \
+  'time -f FMT bash -c "gh pr merge 123 --admin"'
+# Bogus sudo:-s / sudo:-c removed from the shared spec: -s is a no-value
+# flag, so the FOLLOWING token is the command, not -s's value. Before #546
+# the bash table wrongly skipped it and lost the gh write.
+assert_rc_contains "sudo -s no-value flag does not swallow the gh write (#546 gap 2)" 2 "token-verifying wrapper" \
+  'sudo -s gh pr merge 123 --admin'
+}
+case_pool_add pr_guard_case_14
+
+# --- #546 follow-on (CodeRabbit #551): spec correctness for ionice/env ----
+# ionice -t/--ignore is a no-value FLAG, so it must not consume the next
+# token; before this it swallowed the bash that followed and hid the write.
+pr_guard_case_15() {
+assert_rc_contains "ionice -t flag does not swallow bash -c gh write (#551)" 2 "token-verifying wrapper" \
+  'ionice -t bash -c "gh pr merge 123 --admin"'
+# ionice -c is still a real value option (regression: must skip its value).
+assert_rc_contains "ionice -c value option still skips its value, then surfaces gh (#551)" 2 "token-verifying wrapper" \
+  'ionice -c 2 bash -c "gh pr merge 123 --admin"'
+# env -S / --split-string FAILS CLOSED (#551, Codex r1-r4). GNU env -S has
+# exotic dynamic semantics — whitespace splitting, $VAR expansion,
+# $(...)/backtick substitution, AND appending the remaining argv after the
+# split string — that the guard cannot safely + completely model (each partial
+# model surfaced a new bypass). env -S on a command line is an exotic shebang
+# feature no gh workflow needs, so ANY env -S is blocked rather than risk a
+# hidden write.
+assert_rc_contains "env -S gh write fails closed (#551)" 2 "tokenize" \
+  'env -S "gh pr merge 123 --admin"'
+assert_rc_contains "env --split-string gh write fails closed (#551)" 2 "tokenize" \
+  'env --split-string "gh pr merge 123 --admin"'
+assert_rc_contains "env --split-string=STR gh write fails closed (#551)" 2 "tokenize" \
+  'env --split-string="gh pr merge 123 --admin"'
+assert_rc_contains "env -S variable-expansion payload fails closed (#551 Codex)" 2 "tokenize" \
+  'G=gh env -S "${G} pr merge 123 --admin"'
+assert_rc_contains "env -S command-substitution payload fails closed (#551 Codex)" 2 "tokenize" \
+  'env -S "$(printf gh) pr merge 123 --admin"'
+assert_rc_contains "env -S following-argv payload fails closed (#551 Codex)" 2 "tokenize" \
+  'env -S "bash -c" "gh pr merge 123 --admin"'
+# No literal "gh" in the raw command (gh synthesized via octal printf), so the
+# no-gh fast-path would skip the tokenizer — but env -S forces tokenization and
+# then fails closed (Codex #551 r5: tokenize env -S even without a literal gh).
+assert_rc_contains "env -S without a literal gh still fails closed (#551 Codex)" 2 "tokenize" \
+  'G=$(printf "\147\150") env -S "${G} pr merge 123 --admin"'
+# Clustered env split-string flag (-vS), not just a leading -S (CodeRabbit #551).
+assert_rc_contains "env clustered -vS fails closed (#551)" 2 "tokenize" \
+  'env -vS "gh pr merge 123 --admin"'
+# Quoted `env` (the shell strips the quotes and runs env) with no literal gh:
+# the fast-path quote-strips before probing, then env -S fails closed (Codex #551).
+assert_rc_contains "quoted env -S without a literal gh fails closed (#551 Codex)" 2 "tokenize" \
+  'G=$(printf "\147\150") "env" -S "${G} pr merge 123 --admin"'
+# A plain env prefix (no -S) is unaffected — it still surfaces the wrapped write.
+assert_rc_contains "plain env prefix still surfaces the gh write (#551 regression)" 2 "token-verifying wrapper" \
+  'env FOO=bar gh pr merge 123 --admin'
+
+# #553 (CodeRabbit Critical): a command substitution in COMMAND position can
+# synthesize the executable name ($(printf "\147\150") is octal for gh), so the
+# raw command carries no literal gh. The fast-path now force-tokenizes a
+# command-position cmdsub, and the walk treats the flattened placeholder as a
+# potential gh, failing closed on any pr/issue WRITE that follows. A placeholder
+# NOT followed by a guarded write subcommand stays allowed.
+assert_rc_contains "cmdsub-synth pr merge fails closed (#553)" 2 "wrapper" \
+  '$(printf "\147\150") pr merge 123 --admin'
+assert_rc_contains "backtick-synth issue comment fails closed (#553)" 2 "wrapper" \
+  '`printf "\147\150"` issue comment 5 --body hi'
+assert_rc_contains "assignment-prefixed cmdsub-synth pr merge fails closed (#553)" 2 "wrapper" \
+  'FOO=1 $(printf "\147\150") pr merge 1'
+# #611 r2: the span is now statically expanded to a literal gh, so this
+# shape blocks via the compound-gh rule (#348: two command-position gh
+# invocations, one guarded) rather than the synth-placeholder rule. Either
+# rule is fail-closed; assert only the block.
+assert_rc_contains "separator-then cmdsub-synth pr merge fails closed (#553 empirical)" 2 "" \
+  'gh --version ; $(printf "\147\150") pr merge 123 --admin'
+assert_rc_contains "command-position cmdsub with NO gh write stays allowed (#553)" 0 "" \
+  '$(date -u) >/dev/null'
+# #553 regression: a benign command-position cmdsub (the ubiquitous
+# `eval "$(brew shellenv)"`) before a WRAPPED write must NOT false-trip the
+# compound #348 block. An interim fix counted the placeholder as a gh
+# invocation in the pre-scan; the synth bypass is caught by the main walk, not
+# the compound pre-scan, so the pre-scan must ignore the placeholder.
+assert_rc_contains "eval cmdsub before a wrapped write is allowed (#553)" 0 "" \
+  'eval "$(/opt/homebrew/bin/brew shellenv)" && scripts/gh-as-author.sh -- gh pr merge 1 --repo o/r --squash'
+
+# #573 item 1 (Codex P1): a command-position cmdsub can synthesize BOTH the
+# executable AND the noun (e.g. octal printf for "gh pr"), so the raw command
+# carries no literal gh/pr/issue — only a bare write verb follows. The fast-path
+# now triggers on any gh-write verb, and synth_cmdsub_write_label blocks a
+# command-position cmdsub followed by create|merge|comment|review|edit even
+# without a literal noun. Fail closed: the guard cannot see what the cmdsub
+# expands to, so any such shape is routed to the verifying wrapper.
+# \147\150\40\160\162 = "gh pr", \40\151\163\163\165\145 = " issue".
+assert_rc_contains "cmdsub-synth BOTH exe+noun (gh pr) then bare merge fails closed (#573)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") merge 123 --admin'
+assert_rc_contains "backtick-synth exe+noun (gh issue) then bare comment fails closed (#573)" 2 "wrapper" \
+  '`printf "\147\150\40\151\163\163\165\145"` comment 5 --body hi'
+# #611 r2: statically expanded to `gh --repo o/r create --title x`, which is
+# now DECIDABLE — gh has no top-level `create` (the guarded verbs live under
+# pr/issue), so this is no longer an unverifiable synth shape and is allowed,
+# matching the `gh status` control below.
+assert_rc_contains "cmdsub-synth exe then --repo before a bare create verb decides statically (#573/#611 r2)" 0 "" \
+  '$(printf "\147\150") --repo o/r create --title x'
+# No false positive: a command-position cmdsub followed by a NON-write
+# subcommand (a gh read) is tokenized (#611 r3: any substitution tokenizes)
+# but carries no guarded-write evidence, so it stays allowed.
+assert_rc_contains "command-position cmdsub then a non-write subcommand stays allowed (#573)" 0 "" \
+  '$(printf "\147\150") status'
+# CodeRabbit Major on #611: the fast-path verb probe must also fire when the
+# bare verb ends the COMMAND (no trailing whitespace) — `$(...) merge` with no
+# arguments previously skipped the tokenizer because the probe required
+# `[[:space:]]` after the verb.
+assert_rc_contains "cmdsub-synth exe+noun then END-OF-LINE bare verb fails closed (#611)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") merge'
+
+# #560 (residual of #553): a command-position cmdsub-synthesized gh must fail
+# closed even after a prefix command + options (command -p, env -i), a
+# value-taking flag (env -u NAME), or a quoted env assignment (FOO="a b"). The
+# command-position forward pass tracks position through prefix/flag/assignment
+# tokens (via prefix_flag_takes_value), not just the immediate previous token.
+assert_rc_contains "command -p cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'command -p $(printf "\147\150") pr merge 1'
+assert_rc_contains "env -i cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'env -i $(printf "\147\150") pr merge 1'
+assert_rc_contains "quoted-assignment cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'FOO="bar baz" $(printf "\147\150") pr merge 1'
+assert_rc_contains "value-flag arg then cmdsub-synth pr merge fails closed (#560)" 2 "wrapper" \
+  'env -u FOO $(printf "\147\150") pr merge 1'
+assert_rc_contains "sudo -n cmdsub-synth issue comment fails closed (#560)" 2 "wrapper" \
+  'sudo -n $(printf "\147\150") issue comment 5 --body hi'
+# Controls: a cmdsub CONSUMED as a value-taking flag's argument is NOT command
+# position (env -u $(...) -> the synth is the var NAME, `pr merge` is the cmd),
+# and an echo argument just prints. Both stay allowed.
+assert_rc_contains "cmdsub as value-taking flag arg stays allowed (#560)" 0 "" \
+  'env -u $(printf "\147\150") pr merge 1'
+assert_rc_contains "cmdsub as echo argument stays allowed (#560)" 0 "" \
+  'echo $(printf "\147\150") pr merge'
+}
+case_pool_add pr_guard_case_15
+
+# --- #611 round 3 (Codex P1 x2): escape spellings + split placeholder runs ---
+# (1) The write verb can be escape-spelled (m\erge): bash unescapes it at
+# execution, but no literal probe can enumerate escape spellings. The
+# fast-path now force-tokenizes on ANY substitution; shlex canonicalizes the
+# escape and synth_cmdsub_write_label sees the bare verb.
+pr_guard_case_16() {
+assert_rc_contains "cmdsub-synth exe+noun then ESCAPED verb fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162") m\erge 123 --admin'
+# (2) The exe and noun split across a placeholder RUN with a literal verb:
+# evidence mode treats placeholders as transparent and blocks the guarded
+# verb reached across the run.
+assert_rc_contains "split placeholder run (gh)(pr) then merge fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150") $(printf "\160\162") merge 123 --admin'
+# (2b) A run containing an empty-expansion substitution before literal
+# noun+verb: $(true) expands to nothing, so bash still executes gh pr merge.
+assert_rc_contains "placeholder run with literal noun+verb fails closed (#611 r3)" 2 "wrapper" \
+  '$(printf "\147\150") $(true) pr merge 1'
+# (3) The EXECUTABLE escape-spelled with no substitution at all: the
+# backslash-stripped fast-path probe sees gh, and shlex canonicalizes the
+# token for the main walk.
+assert_rc_contains "escaped executable g\\h pr merge fails closed (#611 r3)" 2 "wrapper" \
+  'g\h pr merge 123 --admin'
+# (4) A LITERAL gh with a substitution in its subcommand stream (strict
+# mode): the substitution can synthesize the noun, the verb, or both, so no
+# literal evidence can clear it — fail closed on the placeholder itself.
+assert_rc_contains "literal gh + cmdsub noun + bare merge fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(printf "\160\162") merge 123 --admin'
+assert_rc_contains "literal gh + cmdsub noun-and-verb fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(printf "\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "literal gh pr + cmdsub verb fails closed (#611 r3)" 2 "wrapper" \
+  'gh pr $(printf "\155\145\162\147\145") 123 --admin'
+assert_rc_contains "literal gh + empty-expansion cmdsub + pr merge fails closed (#611 r3)" 2 "wrapper" \
+  'gh $(true) pr merge 123'
+# Controls: benign substitutions stay allowed — a path-building cmdsub, a
+# cmdsub argument after a literal gh READ verb, and a placeholder run with no
+# guarded evidence at all.
+assert_rc_contains "path-building cmdsub stays allowed (#611 r3)" 0 "" \
+  '$(brew --prefix)/bin/some-tool --admin'
+assert_rc_contains "gh read with cmdsub argument stays allowed (#611 r3)" 0 "" \
+  'gh pr view $(printf "\61") --json title'
+assert_rc_contains "placeholder run with no guarded evidence stays allowed (#611 r3)" 0 "" \
+  '$(printf a) $(printf b) c'
+}
+case_pool_add pr_guard_case_16
+
+# --- #611 round 2 (Codex P1): FULLY synthesized guarded writes ------------
+# $(printf "...") can emit the ENTIRE gh pr merge sequence, leaving zero
+# literal evidence in the outer command — undecidable by any placeholder
+# heuristic. Literal-only printf/echo spans are now statically EMULATED and
+# spliced into the token stream, so the walk decides the real expansion
+# exactly: synthesized writes block, synthesized data stays allowed, and
+# dynamic spans still fall back to the placeholder + evidence scan.
+# \147\150\40\160\162\40\155\145\162\147\145 = "gh pr merge".
+pr_guard_case_17() {
+assert_rc_contains "FULLY synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
+  '$(printf "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "echo-synthesized gh pr merge fails closed (#611 r2)" 2 "wrapper" \
+  '$(echo gh pr merge) 1'
+assert_rc_contains "percent-s printf synthesis fails closed (#611 r2)" 2 "wrapper" \
+  '$(printf "%s" gh) pr merge 1'
+assert_rc_contains "backtick fully synthesized issue comment fails closed (#611 r2)" 2 "wrapper" \
+  '`printf "\147\150\40\151\163\163\165\145\40\143\157\155\155\145\156\164"` 5 --body hi'
+# Controls: a statically expanded BENIGN span is allowed as the data it is,
+# and a non-static printf (format-reuse form, not emulated) still fails
+# closed via the placeholder evidence scan when guarded evidence follows.
+assert_rc_contains "statically expanded benign printf stays allowed (#611 r2)" 0 "" \
+  '$(printf hello) world'
+assert_rc_contains "non-static printf form still fails closed on evidence (#611 r2)" 2 "wrapper" \
+  '$(printf "\147\150" x) pr merge 1'
+}
+case_pool_add pr_guard_case_17
+
+# --- #611 round 4: IFS whitespace in expansions + benign parse failures ---
+# (P1) printf can emit NEWLINES between synthesized words; bash word-splits
+# them exactly like spaces. The expansion is whitespace-normalized before
+# the splice-safety check, so the walk sees the real gh pr merge.
+# \147\150 \n \160\162 \n \155\145\162\147\145 = gh<NL>pr<NL>merge.
+pr_guard_case_18() {
+assert_rc_contains "newline-separated synthesized gh pr merge fails closed (#611 r4)" 2 "wrapper" \
+  '$(printf "\147\150\n\160\162\n\155\145\162\147\145") 123 --admin'
+assert_rc_contains "tab-separated synthesized gh pr fails closed (#611 r4)" 2 "wrapper" \
+  '$(printf "\147\150\11\160\162") merge 1'
+# (P2) A substitution-bearing command the parser cannot tokenize (unbalanced
+# quote in otherwise-valid shell, e.g. heredoc bodies) must NOT fail closed
+# when it carries no guarded-write evidence — pre-broadening parity: the
+# evidence-free fast path always exited 0. Evidence keeps the block.
+assert_rc_contains "parse failure with no guarded evidence stays allowed (#611 r4)" 0 "" \
+  '$(date) "oops'
+assert_rc_contains "parse failure WITH gh evidence still fails closed (#611 r4)" 2 "tokenize" \
+  '$(date) "oops gh pr merge 1'
+}
+case_pool_add pr_guard_case_18
+
+# --- #611 round 9: assignment prefixes, escaped shells, unquoted bodies ---
+# (P1) a bare-assignment token consumes its VALUE in every walk: the
+# flattened FOO=$(date) leaves FOO= + placeholder, and the following
+# spliced gh write is the real command, not the placeholder-as-command.
+pr_guard_case_19() {
+assert_rc_contains "assignment-substitution prefix before synthesized write fails closed (#611 r9)" 2 "wrapper" \
+  'FOO=$(date) $(printf gh) pr merge 1'
+assert_rc_contains "assignment-substitution prefix with benign command stays allowed (#611 r9)" 0 "" \
+  'FOO=$(date) $(printf hello) world'
+# (P1) bash unescapes command words: an escape-spelled shell name feeding a
+# quoted-tag heredoc still executes the body as a script.
+assert_rc_contains "escape-spelled bash feeding quoted heredoc fails closed (#611 r9)" 2 "wrapper" \
+  'b\ash <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# (P1) UNQUOTED-tag heredoc bodies expand their substitutions while the
+# heredoc is built, so in-body gh evidence must keep failing closed on a
+# parse failure (only QUOTED-tag bodies are inert data).
+assert_rc_contains "parse failure with gh in an unquoted heredoc body fails closed (#611 r9)" 2 "tokenize" \
+  'cat <<EOF
+"unmatched
+$(gh pr merge 1)
+EOF'
+}
+case_pool_add pr_guard_case_19
+
+# --- #611 round 10: path-qualified synth, quoted-delim forms, cmd word ----
+# (P1) a path-qualified printf/echo word-splits into the same synthesized
+# write as the bare form — the basename is the literal-synth source.
+pr_guard_case_20() {
+assert_rc_contains "path-qualified /bin/echo synthesized write fails closed (#611 r10)" 2 "wrapper" \
+  '$(/bin/echo gh pr merge) 123 --squash'
+assert_rc_contains "path-qualified /usr/bin/printf synthesized write fails closed (#611 r10)" 2 "wrapper" \
+  '$(/usr/bin/printf "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+# (P2) more quoted-delimiter forms are inert data: <<\EOF (escaped) and a
+# quoted tag with punctuation <<'"'"'EOF-MP'"'"' — their fixture bodies with
+# encoded substitutions must stay allowed.
+assert_rc_contains "backslash-escaped heredoc delimiter body stays allowed (#611 r10)" 0 "" \
+  'cat <<\EOF > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+assert_rc_contains "punctuation quoted-delimiter body stays allowed (#611 r10)" 0 "" \
+  'cat <<'"'"'EOF-MP'"'"' > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF-MP'
+# (P2) a shell name in a REDIRECTION TARGET is not the command word: a
+# quoted-heredoc fixture written to a bash-named path is inert data for cat.
+assert_rc_contains "shell-named redirection target does not force body scan (#611 r10)" 0 "" \
+  'cat > /tmp/bash-fixture <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+# Fail-closed control: a real shell interpreter as the command word still
+# scans the quoted-tag body even with a redirection present.
+assert_rc_contains "bash command word with redirection still scans body (#611 r10)" 2 "wrapper" \
+  'bash > /tmp/out <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+}
+case_pool_add pr_guard_case_20
+
+# --- #611 round 11: quoted heredoc PIPED into a shell executes the body ---
+# cat <<'EOF' | bash runs the body even though the first command word is
+# cat, so any pipeline segment being an interpreter forces body scanning.
+pr_guard_case_21() {
+assert_rc_contains "quoted heredoc piped into bash fails closed (#611 r11)" 2 "wrapper" \
+  'cat <<'"'"'EOF'"'"' | bash
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+assert_rc_contains "quoted heredoc through tee then sh fails closed (#611 r11)" 2 "wrapper" \
+  'cat <<'"'"'EOF'"'"' | tee /tmp/x | sh
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# Control: piped into a NON-shell (grep) the body is not executed — stays
+# inert data for cat, allowed.
+assert_rc_contains "quoted heredoc piped into grep stays allowed (#611 r11)" 0 "" \
+  'cat <<'"'"'EOF'"'"' | grep merge
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+}
+case_pool_add pr_guard_case_21
+
+# --- #611 round 12: multi-heredoc, process substitution, prefixed synth ----
+# (P1) an UNQUOTED heredoc before a quoted one: the unquoted A body expands
+# its substitutions, so it must be scanned — the line is not simple (more
+# heredocs than quoted), so no body is skipped and the A-body write blocks.
+pr_guard_case_22() {
+assert_rc_contains "unquoted-before-quoted heredoc scans the unquoted body (#611 r12)" 2 "" \
+  'cat <<A <<'"'"'B'"'"'
+$(gh pr merge 1)
+A
+data
+B'
+# (P1) process substitution feeds a quoted body to a shell: not simple
+# (>(...) present), so the body is scanned and the literal write blocks.
+assert_rc_contains "quoted heredoc into process-sub shell fails closed (#611 r12)" 2 "" \
+  'cat <<'"'"'EOF'"'"' > >(bash)
+gh pr merge 1
+EOF'
+assert_rc_contains "tee into process-sub sh fails closed (#611 r12)" 2 "" \
+  'tee >(sh) <<'"'"'EOF'"'"'
+gh pr merge 1
+EOF'
+# (P1) a prefix command inside the synth span: command printf still emits
+# the write; the expander unwraps command/env/... to reach printf.
+assert_rc_contains "command-prefixed printf synthesis fails closed (#611 r12)" 2 "wrapper" \
+  '$(command printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+assert_rc_contains "env-prefixed printf synthesis fails closed (#611 r12)" 2 "wrapper" \
+  '$(env printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+# Control: a single quoted heredoc with no procsub / interpreter still skips
+# its inert body (the simple fixture case is unchanged).
+assert_rc_contains "single quoted heredoc fixture still allowed (#611 r12 regression)" 0 "" \
+  'cat <<'"'"'EOF'"'"' > /tmp/fx
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+}
+case_pool_add pr_guard_case_22
+
+# --- #611 round 13: value-taking prefix option before a piped shell --------
+# The pipeline command-word scan must consume a value-taking prefix option's
+# VALUE (sudo -u nobody bash) so the real interpreter (bash) is seen and the
+# heredoc body scanned.
+pr_guard_case_23() {
+assert_rc_contains "quoted heredoc piped to sudo -u USER bash fails closed (#611 r13)" 2 "" \
+  'cat <<'"'"'EOF'"'"' | sudo -u nobody bash
+gh pr merge 1
+EOF'
+# Control: the value-option VALUE itself is not mistaken for an interpreter
+# (piped to `sudo -u bash cat` — cat is the command, bash is -u value).
+assert_rc_contains "value-option value named bash is not the interpreter (#611 r13)" 0 "" \
+  'cat <<'"'"'EOF'"'"' | sudo -u bash cat
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+}
+case_pool_add pr_guard_case_23
+
+# --- #611 round 14: -R cmdsub, prefix value-opt in synth, eval-quoted, ANSI-C word
+# (P1) a cmdsub as the -R/--repo value can word-split a guarded verb into argv.
+pr_guard_case_24() {
+assert_rc_contains "cmdsub as -R value fails closed (#611 r14)" 2 "" \
+  'gh pr -R $(cat file) 1'
+# (P1) a value-taking prefix option inside a synth span: env -u X printf ...
+# unwraps to printf, so the write is recognized.
+assert_rc_contains "env -u VALUE printf synthesis fails closed (#611 r14)" 2 "wrapper" \
+  '$(env -u X printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin'
+# (P1) a literal-printf substitution inside eval double quotes is reparsed
+# and executed by eval, so it must be expanded, not left as a placeholder.
+assert_rc_contains "eval of quoted printf synthesis fails closed (#611 r14)" 2 "" \
+  'eval "$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1 --admin"'
+assert_rc_contains "bash -c of quoted printf synthesis fails closed (#611 r14)" 2 "" \
+  'bash -c "$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1"'
+# (P1) a bare ANSI-C-quoted command word: $'\147\150' pr merge -> gh pr merge.
+assert_rc_contains "ANSI-C-quoted bare command word fails closed (#611 r14)" 2 "wrapper" \
+  "\$'\\147\\150' pr merge 1 --admin"
+# Control: a benign quoted printf substitution as echo DATA stays allowed
+# (expanded to a single word, not a command position).
+assert_rc_contains "echo of quoted printf expansion stays allowed (#611 r14)" 0 "" \
+  'echo "$(printf "\147\150\40\160\162")"'
+assert_rc_contains "parse failure with octal gh spelling still fails closed (#611 r4)" 2 "tokenize" \
+  '$(printf "\147\150") pr merge 1 "oops'
+}
+case_pool_add pr_guard_case_24
+
+# --- #611 round 5: unexpandable literal printf + assignment-word splices ---
+# (P1a) printf %b decodes escapes in its ARGUMENT — not emulated, so the
+# span cannot be statically expanded. A literal printf/echo that cannot be
+# expanded now fails closed in command position (it can synthesize an
+# entire guarded write with zero outside evidence), instead of degrading to
+# an anonymous placeholder the evidence scan cannot see through.
+pr_guard_case_25() {
+assert_rc_contains "unexpandable percent-b printf synthesis fails closed (#611 r5)" 2 "wrapper" \
+  '$(printf %b "\147\150\40\160\162\40\155\145\162\147\145") 123 --admin'
+assert_rc_contains "unexpandable percent-d printf in command position fails closed (#611 r5)" 2 "wrapper" \
+  '$(printf "%d" 5) --admin'
+assert_rc_contains "literal gh + unexpandable printf noun fails closed (#611 r5)" 2 "wrapper" \
+  'gh $(printf %b "\160\162") merge 1'
+# Controls: an unexpandable literal printf in ARGUMENT or assignment-value
+# position is not command position and stays allowed.
+assert_rc_contains "unexpandable printf as echo argument stays allowed (#611 r5)" 0 "" \
+  'echo $(printf %b "\150\151")'
+assert_rc_contains "unexpandable printf as assignment value stays allowed (#611 r5)" 0 "" \
+  'X=$(printf %b hi) true'
+# (P1b) bash does NOT field-split a substitution inside an assignment word,
+# so a spacey expansion spliced there must stay ONE token — otherwise the
+# stray words shift command position and hide the real command
+# (X=$(printf "a b") $(printf gh) pr merge ran gh while the guard walked b).
+assert_rc_contains "assignment-word spacey splice keeps command position on the write (#611 r5)" 2 "wrapper" \
+  'X=$(printf "a b") $(printf "\147\150") pr merge 7 --admin'
+assert_rc_contains "assignment-word spacey splice with benign command stays allowed (#611 r5)" 0 "" \
+  'X=$(printf "a b") true'
+}
+case_pool_add pr_guard_case_25
+
+# --- #611 round 6: ANSI-C quoting, heredoc evidence, splice fidelity ------
+# (P1) $-single-quote ANSI-C strings are decoded and re-wrapped before the
+# literal classification, so an ANSI-C-synthesized write is spliced and
+# decided exactly like the plain-quoted octal forms.
+pr_guard_case_26() {
+assert_rc_contains "ANSI-C-quoted synthesized gh pr merge fails closed (#611 r6)" 2 "wrapper" \
+  "\$(echo \$'\\147\\150\\40\\160\\162\\40\\155\\145\\162\\147\\145') 1 --admin"
+assert_rc_contains "ANSI-C-quoted benign expansion stays allowed (#611 r6)" 0 "" \
+  "\$(echo \$'hi') there"
+# Locale quoting ($ + double-quoted string) is its literal content for any
+# untranslated string — the same dodge shape as ANSI-C, preempted with it.
+assert_rc_contains "locale-quoted synthesized gh pr merge fails closed (#611 r6)" 2 "wrapper" \
+  '$(echo $"gh pr merge") 1 --admin'
+assert_rc_contains "locale-quoted benign expansion stays allowed (#611 r6)" 0 "" \
+  '$(echo $"hello") world'
+}
+case_pool_add pr_guard_case_26
+
+# --- #611 round 7: source-fed heredocs + IFS-dependent splices ------------
+# (P1) source / the dot builtin execute their input: a parse failure whose
+# gh evidence sits in a source-fed heredoc body must keep failing closed.
+pr_guard_case_27() {
+assert_rc_contains "parse failure in source-fed heredoc with in-body gh fails closed (#611 r7)" 2 "tokenize" \
+  'source /dev/stdin <<EOF
+gh pr merge 1 "oops
+EOF'
+assert_rc_contains "parse failure in dot-builtin heredoc with in-body gh fails closed (#611 r7)" 2 "tokenize" \
+  '. /dev/stdin <<EOF
+gh pr merge 1 "oops
+EOF'
+# (P1) an IFS assignment re-defines word splitting for substitution output
+# (IFS=/ splits a synthesized gh-slash into a gh word) — static splicing is
+# disabled under ANY IFS touch, so the literal span fails closed as
+# unverifiable in command position.
+assert_rc_contains "IFS-modified synthesized write fails closed (#611 r7)" 2 "wrapper" \
+  'IFS=/; $(printf "gh/") pr merge 1'
+# Control: with DEFAULT IFS the same expansion is spliced faithfully — the
+# command word is gh-slash (not gh), which executes nothing gh-related.
+assert_rc_contains "default-IFS gh-slash expansion stays allowed (#611 r7)" 0 "" \
+  '$(printf "gh/") pr merge 1'
+}
+case_pool_add pr_guard_case_27
+
+# --- #611 round 8: quoted-tag heredoc bodies are inert data ---------------
+# bash performs NO expansion inside a quoted-tag heredoc body, so an encoded
+# substitution there is fixture text, not a command — the flattener skips
+# such bodies instead of statically expanding them into command segments.
+pr_guard_case_28() {
+assert_rc_contains "quoted-heredoc fixture with encoded write stays allowed (#611 r8)" 0 "" \
+  'cat <<'"'"'EOF'"'"' > /tmp/fixture
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+assert_rc_contains "double-quoted-tag heredoc fixture stays allowed (#611 r8)" 0 "" \
+  'cat <<"EOF" > /tmp/fixture
+$(printf "\147\150\40\160\162\40\155\145\162\147\145") 1
+EOF'
+# Fail-closed control: a shell-fed quoted-tag heredoc EXECUTES its body as a
+# script, so the body keeps being scanned and the synthesized write blocks.
+assert_rc_contains "bash-fed quoted-heredoc synthesized write fails closed (#611 r8)" 2 "wrapper" \
+  'bash <<'"'"'EOF'"'"'
+$(printf "\147\150\40\160\162") merge 1
+EOF'
+# (P2) QUOTED-tag heredoc BODIES are data for the receiving command: a
+# parse failure whose only guarded-verb evidence sits inside a quoted cat
+# heredoc body must not fail closed (#611 r9 narrowed this to quoted tags —
+# unquoted bodies expand their substitutions). A shell interpreter outside
+# the bodies keeps full-text evidence (bash <<EOF executes its body), and
+# command-line evidence outside the body still blocks.
+assert_rc_contains "parse failure with evidence only in a quoted cat heredoc body stays allowed (#611 r6)" 0 "" \
+  'cat <<'"'"'EOF'"'"' "oops
+$(date) merge
+EOF'
+assert_rc_contains "parse failure in a bash heredoc with in-body gh still fails closed (#611 r6)" 2 "tokenize" \
+  'bash <<EOF
+gh pr merge 1 "oops
+EOF'
+assert_rc_contains "parse failure with gh evidence outside the heredoc still fails closed (#611 r6)" 2 "tokenize" \
+  'cat <<EOF
+"oops
+EOF
+gh pr merge 1'
+# (P3) bash strips TRAILING newlines from substitution output before
+# concatenation: gh-then-newline glued to pr runs ghpr (not a gh write).
+assert_rc_contains "trailing-newline splice glues to adjacent text like bash (#611 r6)" 0 "" \
+  '$(printf "\147\150\n")pr merge 1'
+# (P3) an expansion-derived word is never an assignment prefix in bash
+# (assignment recognition precedes substitution): an = in the expansion is
+# no longer splice-safe, so the span fails closed as unverifiable in
+# command position instead of being re-parsed as an env assignment, and
+# stays inert elsewhere.
+assert_rc_contains "assignment-looking expansion in command position fails closed (#611 r6)" 2 "wrapper" \
+  '$(printf "X=Y") gh pr merge 1'
+assert_rc_contains "assignment-looking expansion as argument stays allowed (#611 r6)" 0 "" \
+  'echo $(printf "X=Y")'
+}
+case_pool_add pr_guard_case_28
+
+# #553 fix (b): the merge-state jq counts an un-timestamped PENDING re-run as
+# non-green even when a timestamped SUCCESS exists for the same check (the prior
+# max_by(.t) mis-ranked the empty-timestamp PENDING behind the SUCCESS, so an
+# UNSTABLE PR with a check still re-running could merge before CI finished).
+pr_guard_case_29() {
+GH_JQ_def=$(grep -m1 '^GH_JQ=' "$HOOK")
+eval "$GH_JQ_def"
+_ng=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","completedAt":"2026-06-28T10:00:00Z"},{"name":"ci","state":"PENDING"}],"labels":[]}' | jq -r "$GH_JQ" | sed -n '3p')
+if [ "${_ng:-0}" -ge 1 ]; then pass "merge-state jq: un-timestamped PENDING re-run counts non-green (#553)"; else fail "merge-state jq (#553): expected non-green >= 1, got '$_ng'"; fi
+_ng2=$(printf '%s' '{"statusCheckRollup":[{"name":"ci","conclusion":"SUCCESS","completedAt":"2026-06-28T10:00:00Z"},{"name":"lint","conclusion":"SUCCESS","completedAt":"2026-06-28T11:00:00Z"}],"labels":[]}' | jq -r "$GH_JQ" | sed -n '3p')
+if [ "${_ng2:-x}" = "0" ]; then pass "merge-state jq: all-terminal-green stays 0 (no false block) (#553)"; else fail "merge-state jq (#553): expected 0, got '$_ng2'"; fi
+}
+case_pool_add pr_guard_case_29
+
+# #1609: static admission must reach the real writer's fresh trusted gate.
+# Fake immutable-code/API transports only; includes stale/current generations,
+# missing evidence, poisoned candidate/env, cancellation/holds and a mutant.
+# Its tests are independent (each builds its own temp tree), so they run as
+# MERGE_WRITER_SLICES pool cases (#2990): slice k runs every test whose index
+# in the loader's deterministic order is k mod n, so the slices partition the
+# one discovered list. A slice that discovers no tests, selects none, or has
+# a failing or erroring test fails.
+MERGE_WRITER_SLICES=8
+merge_writer_slice() { # <k> <n>
+  if python3 - "$ROOT/tests/test_merge_writer.py" "$1" "$2" <<'PY'
+import importlib.util, sys, unittest
+path, k, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+spec = importlib.util.spec_from_file_location('test_merge_writer', path)
+module = importlib.util.module_from_spec(spec)
+sys.modules['test_merge_writer'] = module
+spec.loader.exec_module(module)
+def flatten(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from flatten(item)
+        else:
+            yield item
+tests = list(flatten(unittest.defaultTestLoader.loadTestsFromModule(module)))
+chosen = [t for i, t in enumerate(tests) if i % n == k]
+if not tests or not chosen:
+    print(f'merge writer slice {k}/{n}: no tests selected out of {len(tests)}', file=sys.stderr)
+    sys.exit(1)
+result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite(chosen))
+print(f'merge writer slice {k}/{n}: ran {result.testsRun} of {len(tests)}')
+sys.exit(0 if result.wasSuccessful() and result.testsRun == len(chosen) else 1)
+PY
+  then
+    pass "production merge writer freshly rejects uncovered request generations (slice $1 of $2)"
+  else
+    fail "production merge writer freshness integration (slice $1 of $2)"
+  fi
+}
+for ((mw = 0; mw < MERGE_WRITER_SLICES; mw++)); do
+  case_pool_add --first merge_writer_slice "$mw" "$MERGE_WRITER_SLICES"
+done
+
+case_pool_wait
+
+echo ""
+echo "test_gh_pr_guard: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
+fi
+exit 0

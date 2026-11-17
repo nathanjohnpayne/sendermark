@@ -1,0 +1,983 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sendermark—wireframes for the Mac app, every screen and state</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='12' fill='%234338b8'/%3E%3Ccircle cx='24' cy='24' r='12.5' fill='none' stroke='%23fff' stroke-width='4'/%3E%3C/svg%3E">
+<!--
+  Sendermark—first-pass interface proposal for the Mac app, drawn as wireframes.
+
+  One file: inline CSS + JS, no build step, no external fonts or scripts. Open it from disk.
+  The only network requests are company logos, loaded live from Logo.dev's image CDN once a
+  publishable key is supplied through the Logos control (kept in this browser's storage, never
+  written into this file). Without a key every company shows a neutral tile with initials.
+  No logo is drawn or stored in this file.
+
+  Every screen is authored ONCE (a JS function returning the frame's markup) and stamped
+  twice per state—light and dark appearance. Sendermark is a native Mac app, so there are two canvases instead of
+  three responsive widths: the main window (1180×760) and the menu-bar popover (360×400,
+  drawn under a slice of the menu bar). Frames are scaled with transform (the zoom control
+  at the top changes the scale); the layout inside is computed at the real size.
+
+  Fonts: the app frames use the system UI font (-apple-system → SF Pro on a Mac) and the
+  system monospace (SF Mono → Menlo) for sender handles, because a handle is an exact
+  identifier that has to be compared digit by digit. The document chrome keeps the stack
+  used by the other wireframe documents.
+
+  Icons: lucide-static (ISC), inlined, standing in for SF Symbols. Each svg's data-lucide
+  attribute names the icon; the build picks the nearest SF Symbol.
+
+  Sources read for this document:
+    projects/sendermark/prds/sendermark.md (v0.3)—goals, trust model, logo pipeline,
+      sender discovery and attribution, contact write rules, requirements
+  Structural template: friends-and-family-billing/plans/ffb-wireframes.html.
+
+  Sample data: the companies are real (most are on the manual cards this project started
+  from); Fernhill Dental is invented and stands in for a business Logo.dev has no logo for.
+  Sender numbers, message text, counts and dates are invented; ten-digit numbers use the
+  555-01xx range and the fake link in the held-back example uses .example.
+  Counts are internally consistent
+  (62 company cards = 49 current + 5 manual + 1 needing a look + 4 no logo + 3 needing a domain;
+  118 senders = 96 confirmed + 4 waiting + 5 shared + 2 suspicious + 9 unattributed + 2 rejected).
+  Snapshot date: Tuesday, November 17, 2026.
+-->
+<style>
+  /* ---------- page chrome (document, not app UI) ---------- */
+  body{margin:0;padding:32px 24px 64px;background:#ececf0;color:#2a2a2e;
+    font:14px/1.45 Inter,"Helvetica Neue",Arial,sans-serif}
+  h1{font-size:22px;margin:0 0 4px}
+  h1 .wm{font-weight:500;letter-spacing:-.02em}
+  h2{font-size:16px;margin:40px 0 12px;border-top:1px solid #c9c9d0;padding-top:20px}
+  h3{font-size:14px;margin:26px 0 8px}
+  h4{font-size:12px;margin:22px 0 6px;color:#4a4a52;text-transform:uppercase;letter-spacing:.1em;font-weight:700}
+  .sub{color:#77777f;margin:0 0 14px;max-width:860px}
+  .sub b{color:#2a2a2e}
+  .sub code,.cap code,.legend code,.tokens code,.rdtable code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;
+    background:#e2e2e8;padding:0 4px;border-radius:4px;color:#2a2a2e}
+  .callout{border-left:3px solid #8a8a95;padding-left:10px}
+  .frames{display:flex;flex-wrap:wrap;gap:36px 48px;align-items:flex-start}
+  .unit{flex:0 0 auto;display:flex;flex-direction:column;align-items:flex-start}
+  .cap{margin:14px 4px 0;font-size:12.5px;color:#77777f;max-width:var(--capw,520px)}
+  .cap b{color:#2a2a2e;display:block;font-size:13.5px;margin-bottom:2px}
+
+  /* frame label chips: doc chrome; the first children of every .unit */
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px 2px}
+  .fchip{display:inline-flex;align-items:center;gap:6px;padding:3px 10px 3px 8px;border-radius:11px;
+    background:#1b1d24;color:#fff;font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
+    border:1px solid #1b1d24;white-space:nowrap}
+  .fchip::before{content:"";width:9px;height:9px;border-radius:50%;flex:0 0 auto;background:var(--sw,#9aa3b2)}
+  .fchip.win{--sw:#3f66f0}.fchip.pop{--sw:#8fd0c3}
+  .fchip.proposed{--sw:#4338b8;background:#fff;color:#1b1d24;border-color:#c9c9d0}
+  .fchip.state{--sw:#f59e0b;background:#fff;color:#1b1d24;border-color:#c9c9d0}
+
+  /* numbered annotations: the badge inside a frame + the legend under the row */
+  .an,.legend li::before{width:14px;height:14px;border-radius:50%;background:#1b1d24;color:#fff;
+    font-size:9px;font-weight:800;display:inline-flex;align-items:center;justify-content:center;
+    flex:0 0 auto;font-style:normal;letter-spacing:0;line-height:1}
+  .an{vertical-align:middle;margin:0 0 0 4px;position:relative;z-index:2;box-shadow:0 0 0 2px #fff}
+  .legend{margin:12px 4px 0;padding:0;font-size:12.5px;color:#77777f;list-style:none;counter-reset:an;max-width:860px}
+  .legend li{margin:0 0 8px;padding-left:24px;position:relative;line-height:1.5}
+  .legend li::before{counter-increment:an;content:counter(an);position:absolute;left:0;top:2px}
+  .legend b{color:#2a2a2e}
+  .prd{font:700 10px/1 ui-monospace,Menlo,monospace;color:#1b1d24;background:#dcd9f5;padding:2px 5px;border-radius:4px;margin-left:4px;white-space:nowrap}
+
+  /* token legend + decision table */
+  .tokens,.rdtable{width:100%;max-width:1180px;border-collapse:collapse;font-size:12.5px;margin:10px 0 6px;background:#f5f5f8;border:1px solid #c9c9d0;border-radius:14px;overflow:hidden}
+  .tokens th,.rdtable th{text-align:left;font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#4a4a52;padding:10px 12px;border-bottom:1px solid #c9c9d0;vertical-align:bottom}
+  .tokens td{padding:8px 12px;border-bottom:1px solid #dcdce2;vertical-align:middle;color:#2a2a2e}
+  .rdtable td{padding:9px 12px;border-bottom:1px solid #dcdce2;vertical-align:top;color:#2a2a2e;line-height:1.45}
+  .tokens tr:last-child td,.rdtable tr:last-child td{border-bottom:0}
+  .rdtable td:first-child{font:700 11px ui-monospace,Menlo,monospace;white-space:nowrap}
+  .tokens .tsw{display:inline-flex;align-items:center;gap:8px}
+  .tokens .tsw i{width:22px;height:22px;border-radius:7px;display:inline-block;box-shadow:inset 0 0 0 1px rgba(0,0,0,.08)}
+  .tokens .sample{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-weight:600;font-size:12px}
+  .tokens .ratio{font-family:ui-monospace,Menlo,monospace;white-space:nowrap}
+  .tokens .ok{color:#1e6b3f;font-weight:700}.tokens .no{color:#9b2335;font-weight:700}
+  .tokens .ratio small{color:#77777f;font-weight:400}
+
+  /* contents */
+  .toc{max-width:1180px;margin:0 0 10px;padding:16px 20px 14px;border:1px solid #c9c9d0;border-radius:14px;background:#f5f5f8}
+  .toc .tt{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#4a4a52;margin:0 0 10px}
+  .toc ol{margin:0;padding-left:20px}
+  .toc > ol > li{margin-bottom:9px;font-weight:700}
+  .toc ol ol{padding-left:16px;margin:3px 0 0;font-weight:400}
+  .toc a{color:#2a2a2e}
+  .toc .vars{display:block;font-weight:400;margin-top:3px;line-height:1.9}
+  .toc .vars a{display:inline-block;margin:0 4px 0 0;padding:1px 6px;border-radius:7px;border:1px solid #d5d5dc;
+    background:#fff;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;text-decoration:none;color:#4a4a52}
+
+  /* zoom control */
+  .zoom{display:flex;gap:6px;align-items:center;margin:0 0 18px;font-size:12px;color:#4a4a52;position:sticky;top:0;
+    z-index:10;background:#ececf0;padding:8px 0}
+  .zoom button{font:inherit;padding:3px 10px;border-radius:8px;border:1px solid #c9c9d0;background:#fff;cursor:pointer;color:#2a2a2e}
+  .zoom button[aria-pressed=true]{background:#1b1d24;color:#fff;border-color:#1b1d24}
+  .zoom .sp{flex:1}
+  .logoctl{display:flex;gap:8px;align-items:center;margin:0 0 18px;font-size:12px;color:#4a4a52;max-width:1180px}
+  .logoctl input{font:12px ui-monospace,Menlo,monospace;padding:4px 8px;border:1px solid #c9c9d0;border-radius:8px;width:280px;background:#fff}
+  .logoctl button{font:inherit;padding:3px 10px;border-radius:8px;border:1px solid #c9c9d0;background:#fff;cursor:pointer;color:#2a2a2e}
+  .fchip.light{--sw:#f4d35e}.fchip.dark{--sw:#3b3f58}
+
+  /* ---------- frames: two fixed canvases, scaled with transform ---------- */
+  :root{--w-win:1180px;--h-win:760px;--w-pop:360px;--h-pop:400px;--s-win:.7;--s-pop:1}
+  .fw{position:relative;margin:2px 2px 10px}
+  .fw.win{width:calc(var(--w-win)*var(--s-win));height:calc(var(--h-win)*var(--s-win))}
+  .fw.pop{width:calc(var(--w-pop)*var(--s-pop));height:calc(var(--h-pop)*var(--s-pop))}
+  .frame{position:absolute;top:0;left:0;transform-origin:0 0;box-sizing:border-box;overflow:hidden;background:#fff}
+  .fw.win .frame{width:var(--w-win);height:var(--h-win);transform:scale(var(--s-win));border-radius:14px;
+    box-shadow:0 0 0 1px #b9b9c2,0 18px 44px rgba(0,0,0,.2)}
+  .fw.pop .frame{width:var(--w-pop);height:var(--h-pop);transform:scale(var(--s-pop));border-radius:10px;
+    box-shadow:0 0 0 1px #b9b9c2,0 10px 30px rgba(0,0,0,.14);background:linear-gradient(160deg,#cfd6e6,#b3bdd4 55%,#98a4c4)}
+  .unit.win{--capw:800px}.unit.pop{--capw:360px}
+
+  /* appearance tokens: light on .frame, dark on .frame.dark. Every colour inside a frame comes from these. */
+  .frame{--win:#ffffff;--side:#f1f2f4;--raise:#ffffff;--ink:#1c1d21;--gr:#5e6068;--hair:#dadce2;--hair2:#eceef2;--outline:#8b8e98;
+    --field:#eeeff2;--bar:#fafafb;--stamp:#4338b8;--stamp-t:#4338b8;--stamp-bg:#ecebfa;--bub:#e9e9eb;--mute:#c9cbd2;
+    --kbd:rgba(28,29,33,.08);--scrim:rgba(28,29,33,.3);--mbar:rgba(255,255,255,.55);
+    --sc:#1c6b45;--sc-bg:#e0f1e7;--tf:#8a5a00;--tf-bg:#fbf1dc;--tf-ink:#5c3c00;--lc:#9a3412;--lc-bg:#fce8dc;
+    --sh:#0f6e73;--sh-bg:#dcf0ef;--sh-ink:#0a4a4d;--su:#9b2335;--su-bg:#f9e3e6;--su-ink:#6d1423}
+  .frame.dark{--win:#1e1f22;--side:#27282c;--raise:#2c2d32;--ink:#ececee;--gr:#a2a4ad;--hair:#3a3b40;--hair2:#303136;--outline:#7b7d87;
+    --field:#303136;--bar:#232428;--stamp:#5b50d6;--stamp-t:#aaa3ff;--stamp-bg:#2e2b52;--bub:#3a3a3d;--mute:#5a5c64;
+    --kbd:rgba(255,255,255,.13);--scrim:rgba(0,0,0,.5);--mbar:rgba(30,31,36,.62);
+    --sc:#7fd4a4;--sc-bg:#16392a;--tf:#e8b85a;--tf-bg:#3d2f0c;--tf-ink:#f3d9a0;--lc:#f2a27c;--lc-bg:#44200f;
+    --sh:#6fd0d4;--sh-bg:#0f3537;--sh-ink:#b5e6e8;--su:#f29aa6;--su-bg:#4a1620;--su-ink:#f7c3cb}
+  .fw.win .frame.dark{background:#1e1f22;box-shadow:0 0 0 1px #000,inset 0 0 0 1px rgba(255,255,255,.14),0 18px 44px rgba(0,0,0,.35)}
+  .fw.pop .frame.dark{background:linear-gradient(160deg,#2b3147,#1d2233 55%,#141826);box-shadow:0 0 0 1px #000,0 10px 30px rgba(0,0,0,.3)}
+  .frame.dark .popv{box-shadow:0 0 0 .5px rgba(255,255,255,.22),0 14px 36px rgba(0,0,0,.55)}
+  .frame.dark .sheet{box-shadow:0 0 0 .5px rgba(255,255,255,.18),0 24px 60px rgba(0,0,0,.6)}
+  .frame.dark .mrow.new{box-shadow:0 0 0 2px var(--stamp-bg);border-color:var(--stamp-t)}
+  .frame.dark .cand.on{border-color:var(--stamp-t)}
+  /* ---------- app UI inside a frame—Sendermark system (hardcoded palette) ----------
+     Window #ffffff · Sidebar var(--side) · Ink var(--ink) text · Graphite var(--gr) muted text ·
+     Hairline var(--hair) · Outline var(--outline) control outlines · Stamp var(--stamp) accent / var(--stamp-bg) tint.
+     Sender types: Short code var(--sc)/var(--sc-bg) · Toll-free var(--tf)/var(--tf-bg) · Long code var(--lc)/var(--lc-bg) ·
+     Shared var(--sh)/var(--sh-bg) · Suspicious var(--su)/var(--su-bg) · Neutral var(--gr)/var(--field). */
+  .app{width:100%;height:100%;display:flex;position:relative;font:13px/1.4 -apple-system,"SF Pro Text",system-ui,"Helvetica Neue",sans-serif;
+    color:var(--ink);background:var(--win);box-sizing:border-box}
+  .app *{box-sizing:border-box}
+  .app h1,.app h2,.app h3,.app h4{border:0;padding:0;margin:0;text-transform:none;letter-spacing:inherit;color:inherit}
+  .app b{font-weight:600}
+  .mono{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .dim{color:var(--gr)}.sm{font-size:11.5px}.xs{font-size:10.5px}.num{font-variant-numeric:tabular-nums}
+  .ellip{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .row{display:flex;align-items:center;gap:8px}.sp{flex:1}
+  svg.lucide{width:14px;height:14px;vertical-align:-2.5px;flex:0 0 auto}
+  .h2{font-size:12px;font-weight:600;color:var(--gr);margin:0 0 6px}
+
+  /* sidebar */
+  .side{width:212px;flex:0 0 auto;background:var(--side);border-right:1px solid var(--hair);display:flex;flex-direction:column;padding:0 10px 10px}
+  .lights{height:46px;display:flex;align-items:center;gap:8px;padding-left:8px;flex:0 0 auto}
+  .lights i{width:12px;height:12px;border-radius:50%;display:block;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.15)}
+  .lights i:nth-child(1){background:#ff5f57}.lights i:nth-child(2){background:#febc2e}.lights i:nth-child(3){background:#28c840}
+  .brand{display:flex;align-items:center;gap:8px;padding:2px 8px 14px;font-weight:600;font-size:13px;letter-spacing:-.01em}
+  .brand svg{width:20px;height:20px}
+  .navi{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:7px;font-size:13px}
+  .navi svg.lucide{width:15px;height:15px;color:var(--stamp-t)}
+  .navi .ct{margin-left:auto;font-size:11px;color:var(--gr);font-variant-numeric:tabular-nums}
+  .navi.on{background:var(--stamp);color:#fff}
+  .navi.on svg.lucide,.navi.on .ct{color:#fff}
+  .navi .ct.hot{background:var(--stamp);color:#fff;border-radius:9px;padding:0 6px;font-weight:600}
+  .navi.on .ct.hot{background:#fff;color:#4338b8}
+  .side .foot{margin-top:auto}
+  .scanst{padding:8px;font-size:11px;color:var(--gr);line-height:1.5;border-top:1px solid var(--hair);margin-top:8px}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--sc);margin-right:5px;vertical-align:1px}
+  .dot.warn{background:var(--tf)}.dot.bad{background:var(--su)}
+
+  /* main */
+  .main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .tbar{height:46px;flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--hair)}
+  .tbar .tt{font-weight:600;font-size:14px;letter-spacing:-.01em}
+  .body{flex:1;min-height:0;display:flex}
+  .search{display:inline-flex;align-items:center;gap:6px;width:190px;height:26px;padding:0 8px;border-radius:7px;background:var(--field);color:var(--gr);font-size:12px}
+  .btn{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 11px;border-radius:7px;border:1px solid var(--outline);background:var(--raise);
+    font-size:12.5px;font-weight:500;white-space:nowrap;color:var(--ink)}
+  .btn.pri{background:var(--stamp);border-color:var(--stamp);color:#fff}
+  .btn.ink{background:var(--ink);border-color:var(--ink);color:var(--win)}
+  .btn.quiet{border-color:transparent;background:transparent;color:var(--stamp-t);padding:0 6px}
+  .btn.dis{opacity:.45}
+  .btn.lgb{height:32px;padding:0 16px;font-size:13px}
+  .kbd{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;border-radius:4px;
+    font:600 10px/1 "SF Mono",ui-monospace,Menlo,monospace;background:var(--kbd);color:inherit}
+  .btn.pri .kbd,.btn.ink .kbd{background:rgba(255,255,255,.22)}
+  .fchips{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--hair);flex:0 0 auto}
+  .fc{display:inline-flex;gap:5px;align-items:center;height:24px;padding:0 10px;border-radius:12px;border:1px solid var(--hair);font-size:12px;color:var(--gr)}
+  .fc b{color:var(--ink);font-variant-numeric:tabular-nums}
+  .fc.on{background:var(--ink);border-color:var(--ink);color:var(--win)}.fc.on b{color:var(--win)}
+
+  /* sender-type and status pills: icon + label + colour, always together */
+  .tier{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 8px 0 6px;border-radius:10px;font-size:11px;font-weight:600;white-space:nowrap}
+  .tier svg.lucide{width:11px;height:11px}
+  .tier.sc{background:var(--sc-bg);color:var(--sc)}.tier.tf{background:var(--tf-bg);color:var(--tf)}.tier.lc{background:var(--lc-bg);color:var(--lc)}
+  .tier.sh{background:var(--sh-bg);color:var(--sh)}.tier.su{background:var(--su-bg);color:var(--su)}.tier.nu{background:var(--field);color:var(--gr)}
+  .tier.st{background:var(--stamp-bg);color:var(--stamp-t)}
+
+  /* company marks: invented brands, a coloured tile with initials. The mark sits at 70% of the tile. */
+  .lg{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:24%;flex:0 0 auto;
+    color:#fff;font-weight:700;font-size:10.5px;letter-spacing:-.02em;overflow:hidden;position:relative}
+  .lg b{font-weight:700}
+  .lg.ci{border-radius:50%}
+  .lg.s18{width:18px;height:18px;font-size:7.5px}.lg.s22{width:22px;height:22px;font-size:8.5px}
+  .lg.s40{width:40px;height:40px;font-size:14px}.lg.s56{width:56px;height:56px;font-size:19px}
+  .lg.s112{width:112px;height:112px;font-size:36px}
+  .c1{background:#16365c}.c2{background:#0e7c86}.c3{background:#7a1f3d}.c4{background:#2f6b3a}.c5{background:#3b3fa6}
+  .c6{background:#191919}.c7{background:#b2541a}.c8{background:#55606e}.c9{background:#8a6a12}
+  .lg img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
+  .lg.has{background:#fff;outline:1px solid var(--hair);outline-offset:-1px}.lg.has b{visibility:hidden}
+  .lg.flat{border-radius:0}
+  .lg.old{font-size:17px}.lg.old b{transform:scale(1.5);filter:blur(.7px);white-space:nowrap}
+  .lg.old img{transform:scale(1.55);filter:blur(.8px)}
+  .lg.s56.old{font-size:26px}
+  .unk{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:var(--mute);color:#fff;flex:0 0 auto}
+  .unk.s40{width:40px;height:40px}.unk.s40 svg.lucide{width:20px;height:20px}
+  .unk.s18{width:18px;height:18px}.unk.s18 svg.lucide{width:10px;height:10px}
+
+  /* review: queue + detail */
+  .queue{width:300px;flex:0 0 auto;border-right:1px solid var(--hair);display:flex;flex-direction:column;padding:6px 8px;overflow:hidden}
+  .qsec{font-size:11px;font-weight:600;color:var(--gr);padding:10px 8px 4px}
+  .qi{padding:8px;border-radius:8px;display:grid;grid-template-columns:1fr auto;gap:3px 8px;align-items:center}
+  .qi.on{background:var(--stamp-bg)}
+  .qi .h{font-size:13.5px;font-weight:600}
+  .qi .to{grid-column:1 / -1;display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--gr);min-width:0}
+  .det{flex:1;min-width:0;display:flex;flex-direction:column}
+  .dscroll{flex:1;min-height:0;padding:16px 22px 0;overflow:hidden;display:flex;flex-direction:column;gap:13px}
+  .hnd{font-size:30px;font-weight:600;line-height:1;letter-spacing:-.03em}
+  .dest{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--hair);border-radius:10px}
+  .dest .nm{font-weight:600;font-size:13.5px}
+  .ev{border:1px solid var(--hair);border-radius:10px;overflow:hidden}
+  .ev .r{display:grid;grid-template-columns:128px 1fr 92px;gap:10px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--hair2);font-size:12.5px}
+  .ev .r:last-child{border-bottom:0}
+  .ev .k{color:var(--gr)}
+  .wt{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--gr);justify-content:flex-end}
+  .wt span{display:inline-flex;gap:2px}
+  .wt i{width:5px;height:12px;border-radius:1.5px;background:var(--hair);display:block}
+  .wt.w3 i,.wt.w2 i:nth-child(-n+2),.wt.w1 i:nth-child(1){background:var(--sc)}
+  .wt.bad.w3 i,.wt.bad.w2 i:nth-child(-n+2),.wt.bad.w1 i:nth-child(1){background:var(--su)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .bub{background:var(--bub);border-radius:15px;padding:6px 11px;font-size:12px;line-height:1.4;margin:0 0 5px;max-width:100%}
+  .rx{display:inline-block;height:9px;background:var(--ink);border-radius:2px;vertical-align:-1px}
+  .mrow{display:flex;gap:9px;align-items:center;padding:7px 9px;border:1px solid var(--hair);border-radius:10px;margin:0 0 5px}
+  .mrow .t{min-width:0;flex:1}.mrow .n{font-weight:600;font-size:12.5px}
+  .mrow.new{border-color:var(--stamp);box-shadow:0 0 0 2px var(--stamp-bg)}
+  .ban{display:flex;gap:9px;align-items:flex-start;padding:9px 12px;border-radius:9px;font-size:12.5px;line-height:1.45}
+  .ban svg.lucide{margin-top:2px}
+  .ban.warn{background:var(--tf-bg);color:var(--tf-ink)}.ban.bad{background:var(--su-bg);color:var(--su-ink)}.ban.info{background:var(--field);color:var(--ink)}
+  .ban.sh{background:var(--sh-bg);color:var(--sh-ink)}
+  .abar{flex:0 0 auto;border-top:1px solid var(--hair);padding:10px 16px;display:flex;gap:8px;align-items:center;background:var(--bar)}
+  .empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;text-align:center;color:var(--gr);padding:0 40px}
+  .empty .big{font-size:19px;font-weight:600;color:var(--ink);letter-spacing:-.02em}
+  .empty .glyph{width:54px;height:54px;border-radius:15px;background:var(--stamp-bg);color:var(--stamp-t);display:flex;align-items:center;justify-content:center;margin-bottom:6px}
+  .empty .glyph svg.lucide{width:26px;height:26px}
+  .newcard{border:1px solid var(--hair);border-radius:12px;padding:14px;display:flex;gap:14px;align-items:flex-start}
+  .newcard dl{margin:0;display:grid;grid-template-columns:86px 1fr;gap:4px 10px;font-size:12.5px}
+  .newcard dt{color:var(--gr)}.newcard dd{margin:0}
+  .brands{display:flex;flex-direction:column;gap:6px}
+  .brands .b{display:flex;align-items:center;gap:9px;padding:7px 10px;border:1px solid var(--hair);border-radius:9px;font-size:12.5px}
+
+  /* tables */
+  .tbl{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column}
+  .tr{display:grid;gap:12px;align-items:center;padding:0 16px;height:44px;border-bottom:1px solid var(--hair2);font-size:12.5px}
+  .tr.hd{height:30px;font-size:11px;font-weight:600;color:var(--gr);border-bottom:1px solid var(--hair)}
+  .tr.on{background:var(--stamp-bg)}
+  .tr.co{grid-template-columns:minmax(0,1.5fr) minmax(0,1.1fr) 170px 70px 110px}
+  .tr.se{grid-template-columns:170px 108px 128px minmax(0,1fr) 60px 110px}
+  .colm{display:flex;flex-direction:column;flex:1;min-width:0}
+
+  /* company detail */
+  .cd{flex:1;display:grid;grid-template-columns:372px 1fr;min-height:0}
+  .cd > div{padding:18px 22px;min-width:0}
+  .cd > div:first-child{border-right:1px solid var(--hair)}
+  .crops{display:flex;gap:18px;margin:4px 0 14px}
+  .crops figure{margin:0;text-align:center;font-size:11px;color:var(--gr)}
+  .crops figcaption{margin-top:6px}
+  .canvas{width:112px;height:112px;position:relative;display:inline-block;flex:0 0 auto;box-shadow:0 0 0 1px var(--hair)}
+  .canvas::after{content:"";position:absolute;inset:0;border-radius:50%;border:1.5px dashed #fff;mix-blend-mode:difference;z-index:1}
+  .canvas::before{content:"";position:absolute;inset:14.65%;border:1.5px dashed #fff;mix-blend-mode:difference;z-index:1}
+  .kv{display:grid;grid-template-columns:96px 1fr;gap:5px 10px;font-size:12.5px;margin:0}
+  .kv dt{color:var(--gr)}.kv dd{margin:0}
+  .srow{display:grid;grid-template-columns:150px 96px 1fr auto;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--hair2);font-size:12.5px}
+  .cand{display:flex;gap:12px;align-items:center;padding:10px 12px;border:1px solid var(--hair);border-radius:10px;margin:0 0 8px}
+  .cand.on{border-color:var(--stamp);box-shadow:0 0 0 2px var(--stamp-bg)}
+  .radio{width:15px;height:15px;border-radius:50%;border:1.5px solid var(--outline);flex:0 0 auto}
+  .cand.on .radio{border:4.5px solid var(--stamp)}
+  .inp{height:28px;border:1px solid var(--outline);border-radius:7px;padding:0 9px;display:flex;align-items:center;font-size:12.5px;color:var(--gr);background:var(--raise)}
+  .chk{width:15px;height:15px;border-radius:4px;border:1.5px solid var(--outline);flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;color:#fff}
+  .chk.on{background:var(--stamp);border-color:var(--stamp)}
+  .chk svg.lucide{width:11px;height:11px;stroke-width:3}
+
+  /* modal sheet */
+  .modal{position:absolute;inset:0;background:var(--scrim);display:flex;align-items:flex-start;justify-content:center;padding-top:54px;z-index:5}
+  .sheet{background:var(--raise);border-radius:14px;box-shadow:0 24px 60px rgba(0,0,0,.3);width:780px;padding:20px 22px 16px}
+  .sheet.narrow{width:460px}
+  .sheet h2{font-size:16px;font-weight:600;letter-spacing:-.01em}
+  .pairs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0}
+  .pair{border:1px solid var(--hair);border-radius:10px;padding:9px;display:flex;flex-direction:column;gap:8px;min-width:0}
+  .pair .row{min-width:0}
+  .pair .ba{display:flex;align-items:center;justify-content:center;gap:8px;color:var(--outline)}
+  .pair.off{background:var(--bar)}.pair.off .ba > :last-child{opacity:.35}
+
+  /* activity */
+  .runs{flex:1;padding:14px 22px;overflow:hidden}
+  .run{border:1px solid var(--hair);border-radius:12px;margin:0 0 12px;overflow:hidden}
+  .run .rh{display:flex;align-items:center;gap:10px;padding:9px 14px;background:var(--bar);border-bottom:1px solid var(--hair2);font-size:12.5px}
+  .run .ch{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--hair2);font-size:12.5px}
+  .run .ch:last-child{border-bottom:0}
+
+  /* settings */
+  .sett{flex:1;padding:14px 26px;overflow:hidden;max-width:760px}
+  .grp{border:1px solid var(--hair);border-radius:12px;margin:0 0 10px}
+  .grp .ln{display:flex;align-items:center;gap:12px;padding:7px 14px;border-bottom:1px solid var(--hair2);font-size:12.5px}
+  .grp .ln:last-child{border-bottom:0}
+  .grp .ln .l{flex:1;min-width:0}
+  .sw{width:32px;height:19px;border-radius:10px;background:var(--mute);position:relative;flex:0 0 auto}
+  .sw::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+  .sw.on{background:var(--stamp)}.sw.on::after{left:15px}
+  .sel{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 8px;border:1px solid var(--outline);border-radius:6px;font-size:12px;background:var(--raise)}
+
+  /* setup */
+  .setup{flex:1;display:flex;flex-direction:column;align-items:center;padding:34px 0 0;background:var(--side)}
+  .setup .card{width:560px;background:var(--raise);border:1px solid var(--hair);border-radius:14px;margin-top:20px}
+  .step{display:flex;gap:12px;align-items:flex-start;padding:13px 16px;border-bottom:1px solid var(--hair2)}
+  .step:last-child{border-bottom:0}
+  .step .nr{width:22px;height:22px;border-radius:50%;border:1.5px solid var(--outline);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex:0 0 auto;color:var(--gr)}
+  .step.done .nr{background:var(--sc);border-color:var(--sc);color:var(--win)}
+  .step.now .nr{background:var(--stamp);border-color:var(--stamp);color:#fff}
+  .step .nr svg.lucide{width:12px;height:12px;stroke-width:3}
+  .step .x{flex:1;min-width:0}
+
+  /* menu-bar popover */
+  .mbar{font:12px/1 -apple-system,"SF Pro Text",system-ui,sans-serif;height:28px;background:var(--mbar);display:flex;align-items:center;justify-content:flex-end;gap:14px;padding:0 12px;font-size:12px;color:var(--ink)}
+  .mbar .me{width:26px;height:22px;border-radius:5px;background:var(--kbd);display:flex;align-items:center;justify-content:center;position:relative}
+  .mbar .me svg{width:15px;height:15px}
+  .mbar .me .bdg{position:absolute;top:1px;right:1px;width:7px;height:7px;border-radius:50%;background:var(--stamp);box-shadow:0 0 0 1.5px var(--win)}
+  .popv{position:absolute;top:34px;right:10px;width:322px;border-radius:13px;background:var(--raise);box-shadow:0 0 0 .5px rgba(0,0,0,.2),0 14px 36px rgba(0,0,0,.28);
+    font:13px/1.4 -apple-system,"SF Pro Text",system-ui,"Helvetica Neue",sans-serif;color:var(--ink);overflow:hidden}
+  .popv *{box-sizing:border-box}
+  .popv .pad{padding:14px}
+  .popv .hl{font-size:17px;font-weight:600;letter-spacing:-.02em;line-height:1.25}
+  .popv .mi{display:flex;align-items:center;gap:8px;padding:7px 14px;font-size:13px}
+  .popv .sepr{height:1px;background:var(--hair2)}
+  .prog{height:5px;border-radius:3px;background:var(--hair2);overflow:hidden;margin:8px 0 4px}
+  .prog i{display:block;height:100%;width:62%;background:var(--stamp);border-radius:3px}
+  .stack{display:flex}.stack > *{margin-left:-6px;box-shadow:0 0 0 2px #fff}.stack > :first-child{margin-left:0}
+</style>
+</head>
+<body>
+
+<h1 id="sec-intro"><span class="wm">Sendermark</span>—wireframes for the Mac app, every screen and state</h1>
+<p class="sub">A first pass at the interface described in the PRD (<code>projects/sendermark/prds/sendermark.md</code>). Sendermark is a native Mac app with two surfaces: a <b>main window</b> (1180×760) and a <b>menu-bar popover</b> (360×400). Each screen is one source, drawn once per state in light and in dark appearance. Every frame has a stable anchor of the form <code>#fx-&lt;screen&gt;-&lt;state&gt;-&lt;light|dark&gt;</code>.</p>
+<p class="sub">Nothing here is built. The PRD builds a command-line tool first and this app second; the review screen below is also the specification for what <code>sendermark review</code> prints and in what order.</p>
+
+<p class="sub callout"><b>How to read a frame.</b>
+<br>· <b>Chips above a frame</b> name the canvas, the appearance (light or dark), and whether the frame is the <span class="fchip proposed" style="vertical-align:middle">proposed</span> default for that screen or a <span class="fchip state" style="vertical-align:middle">state</span> of it (empty, in progress, error, or a variant).
+<br>· <b>Numbered badges</b> <i class="an">1</i> point at the annotation with that number in the legend under the screen. A tag such as <span class="prd">PRD · Trust model</span> names the PRD section the element implements.
+<br>· <b>Sheets and dialogs</b> are drawn over their parent screen, dimmed.
+<br>· <b>Companies are real; logos load live.</b> Paste a Logo.dev publishable key into the Logos control below and each company’s logo is fetched from Logo.dev’s image CDN, the way the app’s own previews would fetch it. The key is kept in this browser and never written into the file. Without it, each company shows a neutral tile with initials. Sender numbers and message text are invented.
+<br>· <b>Zoom</b> (control below) scales the window canvas; the popover is 1:1 by default.</p>
+
+<h2 id="sec-tokens">Visual system—tokens, type and the sender-type palette</h2>
+<p class="sub">A quiet Mac utility: a white <b>Window</b>, a cool grey <b>Sidebar</b>, <b>Ink</b> text, <b>Graphite</b> for secondary text, and one accent—<b>Stamp</b>, an ink-pad indigo—for the selected sidebar item, the primary button, and selection. Type is the system font throughout. Sender handles are set in the system monospace, because approving a number means checking it digit by digit. Colour is reserved for the one thing that changes what you should do: <b>the type of sender</b>. Each type has its own hue, icon and label, and the three are never separated, so the type survives a greyscale screenshot.</p>
+<p class="sub"><b>Contrast is computed, not guessed</b>—the ratios below are calculated at page load from the hex values (WCAG 2.x relative luminance).</p>
+<table class="tokens"><thead><tr><th>Token</th><th>Hex</th><th>Usage</th><th>Sample</th><th>Contrast vs. its background</th></tr></thead><tbody id="tokenrows"></tbody></table>
+<h3 id="sec-tokens-dark">Dark appearance</h3>
+<p class="sub">The same roles with their own values, not an inversion. The window drops to a near-black grey and sheets, buttons and the popover sit one step lighter, so elevation reads without shadows. Stamp splits in two: a slightly lighter fill for buttons and selection, and a pale violet for links and icons, because the light-mode indigo fails as text on a dark window. Each sender type keeps its hue and swaps a pale tint for a deep one. Company logos are not recoloured: a logo with a white tile stays white, as a contact photo does.</p>
+<table class="tokens"><thead><tr><th>Token</th><th>Hex</th><th>Usage</th><th>Sample</th><th>Contrast vs. its background</th></tr></thead><tbody id="tokenrowsdark"></tbody></table>
+
+<div class="zoom" id="zoom"><span>Zoom</span>
+  <button data-z="fit">Fit</button><button data-z="read" aria-pressed="true">Read</button><button data-z="actual">Actual size</button>
+  <span class="sp"></span><span id="zoomnote">window ×0.7 · popover ×1</span></div>
+<div class="logoctl" id="logoctl"><b>Logos</b>
+  <input id="pk" type="password" placeholder="Logo.dev publishable key (pk_…)" autocomplete="off" spellcheck="false">
+  <button id="pkload">Load logos</button><button id="pkclear">Forget key</button>
+  <span id="pkstate">No key: showing initials.</span></div>
+
+<nav class="toc" id="toc"><p class="tt">Contents</p><ol id="toclist"></ol></nav>
+
+<div id="doc"></div>
+
+<h2 id="sec-decisions">Design decisions these wireframes add to the PRD</h2>
+<p class="sub">One row per decision that the PRD does not already make. Each is a proposal; the last column says what it rests on.</p>
+<table class="rdtable"><thead><tr><th>Id</th><th>Screen(s)</th><th>Decision</th><th>Why</th><th>PRD section</th></tr></thead><tbody id="drows"></tbody></table>
+
+<h2 id="sec-open">Open design questions</h2>
+<p class="sub">Questions the wireframes raise and do not answer.</p>
+<table class="rdtable"><thead><tr><th>Id</th><th>Question</th><th>What it changes</th></tr></thead><tbody id="orows"></tbody></table>
+
+<script>
+// ---------------------------------------------------------------------------
+// Authoring helpers. Each screen is a function (state) => frame markup string.
+// ---------------------------------------------------------------------------
+const an = n => `<i class="an">${n}</i>`;
+const prd = s => `<span class="prd">PRD · ${s}</span>`;
+const kbd = k => `<span class="kbd">${k}</span>`;
+const btn = (t, k = '') => `<span class="btn ${k}">${t}</span>`;
+// lucide icons (lucide-static, ISC), inlined so the page stays self-contained. Stand-ins for SF Symbols.
+const LUCIDE = {
+"arrow-right": "<path d=\"M5 12h14\"/> <path d=\"m12 5 7 7-7 7\"/>",
+"ban": "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"m4.9 4.9 14.2 14.2\"/>",
+"card": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"3\"/><circle cx=\"9\" cy=\"10.5\" r=\"2.2\"/><path d=\"M5.8 16.2c.9-1.7 5.5-1.7 6.4 0\"/><path d=\"M15 9.5h3\"/><path d=\"M15 13h3\"/>",
+"check": "<path d=\"M20 6 9 17l-5-5\"/>",
+"chevron-down": "<path d=\"m6 9 6 6 6-6\"/>",
+"chevron-left": "<path d=\"m15 18-6-6 6-6\"/>",
+"circle-check": "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"m9 12 2 2 4-4\"/>",
+"circle-help": "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3\"/><path d=\"M12 17h.01\"/>",
+"external-link": "<path d=\"M15 3h6v6\"/> <path d=\"M10 14 21 3\"/> <path d=\"M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6\"/>",
+"folder": "<path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/>",
+"hash": "<line x1=\"4\" x2=\"20\" y1=\"9\" y2=\"9\"/><line x1=\"4\" x2=\"20\" y1=\"15\" y2=\"15\"/><line x1=\"10\" x2=\"8\" y1=\"3\" y2=\"21\"/><line x1=\"16\" x2=\"14\" y1=\"3\" y2=\"21\"/>",
+"history": "<path d=\"M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8\"/> <path d=\"M3 3v5h5\"/> <path d=\"M12 7v5l4 2\"/>",
+"image": "<rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" ry=\"2\"/><circle cx=\"9\" cy=\"9\" r=\"2\"/><path d=\"m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21\"/>",
+"inbox": "<polyline points=\"22 12 16 12 14 15 10 15 8 12 2 12\"/><path d=\"M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z\"/>",
+"link": "<path d=\"M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71\"/> <path d=\"M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71\"/>",
+"lock": "<rect width=\"18\" height=\"11\" x=\"3\" y=\"11\" rx=\"2\" ry=\"2\"/> <path d=\"M7 11V7a5 5 0 0 1 10 0v4\"/>",
+"plus": "<path d=\"M5 12h14\"/> <path d=\"M12 5v14\"/>",
+"refresh-cw": "<path d=\"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8\"/> <path d=\"M21 3v5h-5\"/> <path d=\"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16\"/> <path d=\"M8 16H3v5\"/>",
+"search": "<circle cx=\"11\" cy=\"11\" r=\"8\"/><path d=\"m21 21-4.3-4.3\"/>",
+"settings-2": "<path d=\"M14 17H5\"/> <path d=\"M19 7h-9\"/> <circle cx=\"17\" cy=\"17\" r=\"3\"/> <circle cx=\"7\" cy=\"7\" r=\"3\"/>",
+"share-2": "<circle cx=\"18\" cy=\"5\" r=\"3\"/><circle cx=\"6\" cy=\"12\" r=\"3\"/><circle cx=\"18\" cy=\"19\" r=\"3\"/><line x1=\"8.59\" x2=\"15.42\" y1=\"13.51\" y2=\"17.49\"/><line x1=\"15.41\" x2=\"8.59\" y1=\"6.51\" y2=\"10.49\"/>",
+"shield-check": "<path d=\"M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z\"/><path d=\"m9 12 2 2 4-4\"/>",
+"triangle-alert": "<path d=\"m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3\"/> <path d=\"M12 9v4\"/> <path d=\"M12 17h.01\"/>",
+"undo-2": "<path d=\"M9 14 4 9l5-5\"/><path d=\"M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11\"/>",
+"user": "<path d=\"M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2\"/> <circle cx=\"12\" cy=\"7\" r=\"4\"/>",
+"wifi": "<path d=\"M12 20h.01\"/> <path d=\"M2 8.82a15 15 0 0 1 20 0\"/> <path d=\"M5 12.859a10 10 0 0 1 14 0\"/> <path d=\"M8.5 16.429a5 5 0 0 1 7 0\"/>",
+"x": "<path d=\"M18 6 6 18\"/> <path d=\"m6 6 12 12\"/>"
+};
+const ic = (n, cls = '') => `<svg class="lucide ${cls}" data-lucide="${n}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${LUCIDE[n]}</svg>`;
+const MARK = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1.5" y="1.5" width="21" height="21" rx="6" style="fill:var(--stamp)"/><circle cx="12" cy="12" r="6" fill="none" stroke="#fff" stroke-width="2"/></svg>`;
+const MARK_MONO = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="2.5" width="19" height="19" rx="5.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="2"/></svg>`;
+// redaction block: stands in for a digit run of four or more
+const rx = (w = 30) => `<i class="rx" style="width:${w}px"></i>`;
+
+// sender types and statuses: icon + label + colour, always together
+const TIER = { sc: ['shield-check', 'Short code'], tf: ['triangle-alert', 'Toll-free'], lc: ['triangle-alert', 'Long code'], sh: ['share-2', 'Shared sender'], su: ['ban', 'Suspicious'] };
+const tier = k => `<span class="tier ${k}">${ic(TIER[k][0])}${TIER[k][1]}</span>`;
+const STAT = { confirmed: ['sc', 'circle-check', 'Confirmed'], waiting: ['st', 'inbox', 'Waiting'], shared: ['sh', 'share-2', 'Shared'], suspicious: ['su', 'ban', 'Suspicious'], unattr: ['nu', 'circle-help', 'Unattributed'], rejected: ['nu', 'x', 'Rejected'],
+  current: ['sc', 'circle-check', 'Current'], manual: ['nu', 'user', 'Your photo'], nologo: ['nu', 'image', 'No logo found'], look: ['tf', 'triangle-alert', 'Needs a look'], needs: ['st', 'circle-help', 'Needs a domain'] };
+const stat = k => `<span class="tier ${STAT[k][0]}">${ic(STAT[k][1])}${STAT[k][2]}</span>`;
+const wt = (n, label, bad = '') => `<span class="wt w${n} ${bad}"><span><i></i><i></i><i></i></span>${label}</span>`;
+
+// ---------------------------------------------------------------------------
+// Sample data—invented. Twelve of the 62 company cards; five senders in the review queue.
+// ---------------------------------------------------------------------------
+const C = {
+  chase:    { n: 'Chase', d: 'chase.com', ab: 'C', c: 'c1' },
+  vg:       { n: 'Vanguard', d: 'vanguard.com', ab: 'V', c: 'c3' },
+  amex:     { n: 'American Express', d: 'americanexpress.com', ab: 'AE', c: 'c5' },
+  apple:    { n: 'Apple', d: 'apple.com', ab: 'A', c: 'c8' },
+  apc:      { n: 'A.P.C.', d: 'apc.fr', ab: 'A.P.C.', c: 'c6' },
+  affirm:   { n: 'Affirm', d: 'affirm.com', ab: 'a', c: 'c5' },
+  amazon:   { n: 'Amazon', d: 'amazon.com', ab: 'a', c: 'c7' },
+  alamo:    { n: 'Alamo Drafthouse', d: 'drafthouse.com', ab: 'AD', c: 'c6' },
+  partiful: { n: 'Partiful', d: 'partiful.com', ab: 'P', c: 'c5' },
+  elan:     { n: 'Elan Financial Services', d: 'elanfinancialservices.com', ab: 'E', c: 'c1' },
+  ups:      { n: 'UPS', d: 'ups.com', ab: 'UPS', c: 'c9' },
+  lyft:     { n: 'Lyft', d: 'lyft.com', ab: 'L', c: 'c3' },
+  al:       { n: 'Alliant', d: '', ab: 'A', c: 'c8' },
+  alcu:     { n: 'Alliant Credit Union', d: 'alliantcreditunion.org', ab: 'A', c: 'c2' },
+  alen:     { n: 'Alliant Energy', d: 'alliantenergy.com', ab: 'A', c: 'c4' },
+  alins:    { n: 'Alliant Insurance Services', d: 'alliant.com', ab: 'A', c: 'c1' },
+  fd:       { n: 'Fernhill Dental', d: '', site: 'fernhilldental.example', ab: 'F', c: 'c8' }, // invented
+};
+// A company tile: initials by default; applyLogos() adds the live Logo.dev image when a key is present.
+const lg = (k, cls = '') => `<span class="lg ${C[k].c} ${cls}"${C[k].d ? ` data-d="${C[k].d}"` : ''}><b>${C[k].ab}</b></span>`;
+const unk = (cls = '') => `<span class="unk ${cls}">${ic('user')}</span>`;
+
+// ---------------------------------------------------------------------------
+// Shell: sidebar + toolbar. `o.wait` overrides the Review badge; `o.after` is a sheet over the window.
+// ---------------------------------------------------------------------------
+const NAV = [['review', 'inbox', 'Review'], ['companies', 'card', 'Companies'], ['senders', 'hash', 'Senders'], ['activity', 'history', 'Activity']];
+const shell = (on, title, tools, body, o = {}) => {
+  const wait = o.wait ?? 4;
+  const ct = { review: wait ? `<span class="ct hot">${wait}</span>` : '', companies: '<span class="ct">62</span>', senders: '<span class="ct">118</span>', activity: '' };
+  return `<div class="app">
+  <aside class="side"><div class="lights"><i></i><i></i><i></i></div>
+    <div class="brand">${MARK}<span>Sendermark</span></div>
+    ${NAV.map(([id, i, l]) => `<div class="navi ${id === on ? 'on' : ''}">${ic(i)}<span>${l}</span>${ct[id]}</div>`).join('')}
+    <div class="foot"><div class="navi ${on === 'settings' ? 'on' : ''}">${ic('settings-2')}<span>Settings</span></div>
+      <div class="scanst">${o.scan || `<span class="dot"></span>Scanned Sun, Nov 15, 9:00 AM<br>Next scan Sun, Nov 22`}</div></div>
+  </aside>
+  <section class="main"><header class="tbar"><span class="tt">${title}</span>${tools}</header><div class="body">${body}</div></section>
+  ${o.after || ''}</div>`;
+};
+
+// ---------------------------------------------------------------------------
+// Review
+// ---------------------------------------------------------------------------
+const Q = [
+  { id: 'default', h: '48621', t: 'sc', n: 41, to: `${lg('chase', 's18')}<span class="ellip">Chase</span>` },
+  { id: 'tollfree', h: '+1 (833) 555-0142', t: 'tf', n: 6, to: `${lg('vg', 's18')}<span class="ellip">Vanguard</span>` },
+  { id: 'newcard', h: '772310', t: 'sc', n: 12, to: `${lg('ups', 's18')}<span class="ellip">UPS · new card</span>` },
+  { id: 'shared', h: '30414', t: 'sc', n: 15, to: `<span class="ellip">Names 3 different companies</span>` },
+  { id: 'suspicious', h: '+1 (415) 555-0178', t: 'lc', n: 1, to: `<span class="ellip">Links don’t match the company named</span>` },
+];
+const qi = (q, on) => `<div class="qi ${q.id === on ? 'on' : ''}"><span class="h mono">${q.h}</span><span class="xs dim num">${q.n} text${q.n === 1 ? '' : 's'}</span><span class="to">${tier(q.t)}${q.to}</span></div>`;
+const queue = on => `<div class="queue"><div class="qsec">Ready to approve · 3${an(1)}</div>${Q.slice(0, 3).map(q => qi(q, on)).join('')}
+  <div class="qsec">Needs your call · 1</div>${qi(Q[3], on)}<div class="qsec">Held back · 1${an(2)}</div>${qi(Q[4], on)}</div>`;
+const evRow = (k, v, w) => `<div class="r"><span class="k">${k}</span><span>${v}</span>${w}</div>`;
+const head = (q, meta) => `<div><div class="row" style="gap:12px"><span class="hnd mono">${q.h}</span>${tier(q.t)}</div><div class="sm dim" style="margin-top:6px">${meta}</div></div>`;
+const samples = (a, b) => `<div><div class="h2">From the messages${an(5)}</div><div class="bub">${a}</div><div class="bub">${b}</div><div class="xs dim">Runs of four or more digits are hidden.</div></div>`;
+const preview = (h, k, note) => `<div><div class="h2">In Messages after you approve${an(6)}</div>
+  <div class="mrow">${unk()}<div class="t"><div class="n mono">${h}</div><div class="xs dim ellip">How it looks today</div></div></div>
+  <div class="mrow new">${lg(k)}<div class="t"><div class="n ellip">${C[k].n}</div><div class="xs dim ellip">${note}</div></div></div></div>`;
+const tools = sel => `<span class="sp"></span>${btn(`Approve both short codes ${an(7)}`)}<span class="search">${ic('search')}Search</span>`;
+
+function review(state) {
+  if (state === 'empty') return shell('review', 'Review', `<span class="sp"></span><span class="search">${ic('search')}Search</span>`,
+    `<div class="empty"><div class="glyph">${ic('circle-check')}</div><div class="big">Nothing to review</div>
+     <div>118 senders checked on Sunday, November 15.<br>Every one is on a card, marked shared, or set aside.</div>
+     <div class="row" style="margin-top:8px">${btn('Scan now')}${btn('See all senders', 'quiet')}</div></div>`, { wait: 0 });
+  const q = Q.find(x => x.id === state);
+  let d = '', bar = '';
+  const acts = (primary) => `<div class="abar">${primary}${btn(`Reject ${kbd('R')}`)}${btn(`Choose another company ${kbd('M')}`)}<span class="sp"></span>${btn(`Skip ${kbd('→')}`, 'quiet')}</div>`;
+  if (state === 'default') {
+    d = head(q, 'First text March 3, 2025 · latest yesterday · 41 texts') +
+      `<div class="dest">${lg('chase', 's40')}<div style="flex:1;min-width:0"><div class="nm">Chase${an(3)}</div><div class="sm dim">chase.com · existing card with 2 numbers</div></div>${btn('Open card', 'quiet')}</div>
+      <div><div class="h2">Why Sendermark thinks so${an(4)}</div><div class="ev">
+        ${evRow('Links', '<b>chase.com</b> in 38 of 41 texts', wt(3, 'Strong'))}
+        ${evRow('Opening words', '“Chase:” in 41 of 41 texts', wt(3, 'Strong'))}
+        ${evRow('Company named', 'Matches a card you already have', wt(2, 'Supports'))}
+        ${evRow('Other links', 'None point anywhere else', wt(2, 'Supports'))}
+        ${evRow('Registry', `${btn(`${ic('external-link')} Look up 48621 in the Short Code Registry`, 'quiet')}`, wt(0, 'Not checked'))}
+      </div></div>
+      <div class="two">${samples(`Chase: You used the card ending ${rx()} for $84.20 at Alamo Drafthouse. Not you? Visit chase.com`, `Chase: Your one-time code is ${rx(44)}. We’ll never call or text to ask for it.`)}
+      ${preview('486-21', 'chase', 'Joins the 2 Chase numbers already on the card')}</div>`;
+    bar = acts(btn(`Add to Chase’s card ${kbd('A')}`, 'pri'));
+  } else if (state === 'tollfree') {
+    d = head(q, 'First text October 12, 2026 · latest November 15 · 6 texts over 34 days') +
+      `<div class="ban warn">${ic('triangle-alert')}<div><b>Toll-free numbers are easy for anyone to get.</b> Approve this one only if you recognize the messages below. It can’t be approved in a batch.${an(8)}</div></div>
+      <div class="dest">${lg('vg', 's40')}<div style="flex:1;min-width:0"><div class="nm">Vanguard</div><div class="sm dim">vanguard.com · existing card with 1 number</div></div>${btn('Open card', 'quiet')}</div>
+      <div><div class="h2">Why Sendermark thinks so</div><div class="ev">
+        ${evRow('Links', '<b>vanguard.com</b> in 6 of 6 texts', wt(3, 'Strong'))}
+        ${evRow('History', '6 texts over 34 days (needs 3 over 7)', wt(2, 'Supports'))}
+        ${evRow('Other links', 'None point anywhere else', wt(2, 'Supports'))}
+        ${evRow('Phone lookup', `Toll-free line · caller name “VANGUARD” (business)${an(9)}`, wt(2, 'Supports'))}
+      </div></div>
+      <div class="two">${samples(`Vanguard Msg: Your statement for the account ending in ${rx()} is ready. View it at vanguard.com`, `Vanguard Msg: Your contact details were changed. If this wasn’t you, call us.`)}
+      ${preview('+1 (833) 555-0142', 'vg', 'Joins the Vanguard number already on the card')}</div>`;
+    bar = acts(btn(`Add to Vanguard’s card ${kbd('A')}`, 'pri'));
+  } else if (state === 'newcard') {
+    d = head(q, 'First text August 2, 2026 · latest November 14 · 12 texts') +
+      `<div class="ban info">${ic('plus')}<div><b>You have no card for UPS.</b> Approving creates one with the details below and nothing else.</div></div>
+      <div class="newcard">${lg('ups', 's56')}<dl><dt>Name</dt><dd><b>UPS</b> · company card</dd><dt>Website</dt><dd>ups.com${an(10)}</dd><dt>text alerts</dt><dd class="mono">772310</dd><dt>Photo</dt><dd>Logo from Logo.dev, fetched when you approve</dd></dl></div>
+      <div><div class="h2">Why Sendermark thinks so</div><div class="ev">
+        ${evRow('Links', '<b>ups.com</b> in 12 of 12 texts', wt(3, 'Strong'))}
+        ${evRow('Opening words', '“UPS:” in 12 of 12 texts', wt(3, 'Strong'))}
+        ${evRow('Other links', 'None point anywhere else', wt(2, 'Supports'))}
+      </div></div>
+      <div class="two">${samples(`UPS: Your package arrives today by 8 PM. Tracking ${rx(40)}. Details at ups.com`, `UPS: Delivered at the front door. Tracking ${rx(40)}. Details at ups.com`)}
+      ${preview('772-310', 'ups', 'A new company in your contacts')}</div>`;
+    bar = acts(btn(`Create card and add number ${kbd('A')}`, 'pri'));
+  } else if (state === 'shared') {
+    d = head(q, 'First text January 9, 2026 · latest November 12 · 15 texts') +
+      `<div class="ban sh">${ic('share-2')}<div><b>Several companies send codes from this number.</b> It is a verification service, so it can’t belong on any one card.${an(11)}</div></div>
+      <div><div class="h2">Companies named in its texts</div><div class="brands">
+        <div class="b">${lg('partiful', 's22')}<b>Partiful</b><span class="sp"></span><span class="dim num">9 texts</span></div>
+        <div class="b">${lg('affirm', 's22')}<b>Affirm</b><span class="sp"></span><span class="dim num">4 texts</span></div>
+        <div class="b">${lg('alamo', 's22')}<b>Alamo Drafthouse</b><span class="sp"></span><span class="dim num">2 texts</span></div></div></div>
+      <div class="two">${samples(`Your Partiful verification code is ${rx(44)}.`, `${rx(44)} is your Affirm sign-in code. Don’t share it.`)}
+      <div><div class="h2">In Messages</div><div class="mrow">${unk()}<div class="t"><div class="n mono">304-14</div><div class="xs dim ellip">Stays a bare number. Sendermark stops asking about it.</div></div></div></div></div>`;
+    bar = `<div class="abar">${btn(`Mark as shared sender ${kbd('S')}`, 'pri')}${btn('Put it on one card anyway…')}<span class="sp"></span>${btn(`Skip ${kbd('→')}`, 'quiet')}</div>`;
+  } else if (state === 'suspicious') {
+    d = head(q, 'One text, November 16, 2026') +
+      `<div class="ban bad">${ic('ban')}<div><b>Held back.</b> This text names Chase, but its link goes to a different site. Sendermark will not offer to add it to Chase’s card.${an(12)}</div></div>
+      <div><div class="h2">What doesn’t match</div><div class="ev">
+        ${evRow('Link in the text', '<b>chase-account-verify.example</b>', wt(3, 'Conflict', 'bad'))}
+        ${evRow('Chase’s site', 'chase.com, in every text from Chase’s own numbers', '<span></span>')}
+        ${evRow('History', '1 text. Chase’s own numbers have 41 or more.', wt(1, 'Conflict', 'bad'))}
+        ${evRow('Phone lookup', 'Internet phone number (non-fixed VoIP) · no caller name', wt(2, 'Conflict', 'bad'))}
+      </div></div>
+      <div class="two">${samples(`Chase: Your account is locked. Verify now to restore access: chase-account-verify.example`, ``).replace('<div class="bub"></div>', '')}
+      <div><div class="h2">In Messages</div><div class="mrow">${unk()}<div class="t"><div class="n mono">+1 (415) 555-0178</div><div class="xs dim">Stays a bare number. Sendermark does not delete or block messages.</div></div></div></div></div>`;
+    bar = `<div class="abar">${btn(`Keep it off every card ${kbd('R')}`, 'ink')}${btn('This is really Chase…')}<span class="sp"></span>${btn(`Skip ${kbd('→')}`, 'quiet')}</div>`;
+  }
+  return shell('review', 'Review', tools(), `${queue(state)}<div class="det"><div class="dscroll">${d}</div>${bar}</div>`);
+}
+
+// ---------------------------------------------------------------------------
+// Companies
+// ---------------------------------------------------------------------------
+const CO = [['amex', 'current', 3, 'Nov 14'], ['chase', 'current', 2, 'Yesterday'], ['vg', 'current', 1, 'Nov 15'], ['apple', 'current', 3, 'Nov 9'], ['affirm', 'current', 1, 'Nov 12'],
+  ['apc', 'manual', 2, 'Oct 30'], ['al', 'needs', 1, 'Nov 3'], ['elan', 'look', 1, 'Yesterday'], ['fd', 'nologo', 0, '—'], ['amazon', 'current', 2, 'Nov 12'], ['partiful', 'current', 1, 'Sep 21'], ['lyft', 'current', 1, 'Today']];
+const coRow = ([k, s, n, last], i) => `<div class="tr co">${`<span class="row" style="gap:10px;min-width:0">${s === 'nologo' || s === 'needs' ? unk() : lg(k, s === 'manual' ? 'old' : '')}<b class="ellip">${C[k].n}</b></span>`}
+  <span class="dim ellip">${C[k].d || C[k].site || 'Not chosen yet'}</span><span>${stat(s)}${i === 5 ? an(2) : i === 6 ? an(3) : i === 7 ? an(5) : ''}</span><span class="num">${n || '—'}</span><span class="dim">${last}</span></div>`;
+const coList = () => `<div class="colm"><div class="fchips"><span class="fc on">All <b>62</b></span><span class="fc">Current <b>49</b></span><span class="fc">Your photo <b>5</b></span><span class="fc">Needs a look <b>1</b></span><span class="fc">No logo found <b>4</b></span><span class="fc">Needs a domain <b>3</b>${an(1)}</span></div>
+  <div class="tbl"><div class="tr co hd"><span>Company</span><span>Website</span><span>Logo</span><span>Numbers</span><span>Latest text</span></div>${CO.map(coRow).join('')}</div></div>`;
+const coTools = `<span class="sp"></span>${btn(`${ic('refresh-cw')} Check for new logos`)}<span class="search">${ic('search')}Search</span>`;
+const pair = (k, off = false) => `<div class="pair ${off ? 'off' : ''}"><div class="row"><span class="chk ${off ? '' : 'on'}">${off ? '' : ic('check')}</span><b class="sm ellip">${C[k].n}</b></div>
+  <div class="ba">${lg(k, 's56 old')}${ic('arrow-right')}${lg(k, 's56')}</div><div class="xs dim">${off ? 'Keeping your photo' : 'Your photo → new logo'}</div></div>`;
+function companies(state) {
+  let after = '';
+  if (state === 'adopt') after = `<div class="modal"><div class="sheet"><h2>36 cards already have a photo${an(4)}</h2>
+    <div class="sm dim" style="margin-top:4px">Sendermark won’t replace a photo you chose without asking. Uncheck any you want to keep. The 18 company cards with no photo get a logo either way.</div>
+    <div class="pairs">${['amex', 'chase', 'vg', 'apple'].map(k => pair(k)).join('')}${pair('apc', true)}${['affirm', 'amazon', 'partiful'].map(k => pair(k)).join('')}</div>
+    <div class="row"><span class="sm dim">Showing 8 of 36 · 5 unchecked</span><span class="sp"></span>${btn('Keep all of mine')}${btn('Replace 31 photos', 'pri')}</div></div></div>`;
+  return shell('companies', 'Companies', coTools, coList(), { after });
+}
+
+function company(state) {
+  const back = `<span class="dim">${ic('chevron-left')}</span>`;
+  if (state === 'resolve') return shell('companies', `${back} Alliant`, '<span class="sp"></span>', `<div class="cd">
+    <div><div class="h2">Logo</div><div class="crops"><figure>${unk('s40')}<figcaption>No logo yet</figcaption></figure></div>
+      <div class="ban info">${ic('circle-help')}<div>Sendermark needs to know which company this card is before it fetches a logo. You only answer once.</div></div></div>
+    <div><div class="h2">Which Alliant is this?${an(6)}</div>
+      <div class="cand on"><span class="radio"></span>${lg('alcu', 's40')}<div style="flex:1"><b>Alliant Credit Union</b><div class="sm dim">alliantcreditunion.org</div></div><span class="tier sc">${ic('link')}In 4 texts from 22801</span></div>
+      <div class="cand"><span class="radio"></span>${lg('alen', 's40')}<div style="flex:1"><b>Alliant Energy</b><div class="sm dim">alliantenergy.com</div></div><span class="sm dim">No texts link here</span></div>
+      <div class="cand"><span class="radio"></span>${lg('alins', 's40')}<div style="flex:1"><b>Alliant Insurance Services</b><div class="sm dim">alliant.com</div></div><span class="sm dim">No texts link here</span></div>
+      <div class="row" style="margin:12px 0 16px"><span class="sm dim" style="flex:0 0 auto">None of these?</span><span class="inp" style="flex:1">Type the company’s website</span></div>
+      <div class="row">${btn('Use alliantcreditunion.org', 'pri')}${btn('Not a company', 'quiet')}${an(7)}</div></div></div>`);
+  const k = state === 'manual' ? 'apc' : 'chase';
+  const logoCol = state === 'manual'
+    ? `<div class="h2">Photo</div><div class="crops"><figure>${lg('apc', 's112 old')}<figcaption>Messages</figcaption></figure><figure>${lg('apc', 's112 ci old')}<figcaption>Contacts list</figcaption></figure></div>
+       <div class="ban info">${ic('user')}<div><b>You kept your own photo on October 10.</b> Sendermark leaves it alone and stops checking for a new logo.${an(5)}</div></div>
+       <div class="h2" style="margin-top:16px">What Sendermark would use</div>
+       <div class="row" style="gap:12px">${lg('apc', 's56')}${lg('apc', 's56 ci')}<div class="sm dim">Logo from Logo.dev, fitted so neither crop clips it.</div></div>
+       <div class="row" style="margin-top:14px">${btn('Let Sendermark manage this photo')}</div>`
+    : `<div class="h2">Logo${an(1)}</div><div class="crops"><figure>${lg(k, 's112')}<figcaption>Messages</figcaption></figure><figure>${lg(k, 's112 ci')}<figcaption>Contacts list</figcaption></figure></div>
+       <div class="row" style="gap:14px;align-items:flex-start"><span class="canvas">${lg(k, 's112 flat')}</span><div class="sm dim" style="flex:1">The circle is the tightest crop Contacts uses; whatever sits in the square inside it always survives. Logo.dev’s tiles usually keep the mark inside the circle already, so Sendermark adds padding only when a mark touches the edge.${an(2)}</div></div>
+       <dl class="kv" style="margin-top:16px"><dt>Source</dt><dd>Logo.dev</dd><dt>Last checked</dt><dd>Sunday, November 1</dd><dt>Last changed</dt><dd>Not since it was added</dd><dt>File</dt><dd class="num">800 × 800 · 84 KB</dd></dl>
+       <div class="row" style="margin-top:14px">${btn('Check now')}${btn('Use my own photo…', 'quiet')}</div>`;
+  const senders = state === 'manual'
+    ? `<div class="srow"><span class="mono"><b>51180</b></span>${tier('sc')}<span class="dim">text alerts · added by Sendermark, Oct 10</span>${btn('Remove', 'quiet')}</div>
+       <div class="srow"><span class="mono"><b>+1 (844) 555-0113</b></span>${tier('tf')}<span class="dim">phone · added by you</span><span class="xs dim">Yours</span></div>`
+    : `<div class="srow"><span class="mono"><b>91557</b></span>${tier('sc')}<span class="dim">text alerts · added by Sendermark, today</span>${btn('Remove', 'quiet')}</div>
+       <div class="srow"><span class="mono"><b>+1 (800) 555-0199</b></span>${tier('tf')}<span class="dim">main · added by you</span><span class="xs dim">Yours${an(4)}</span></div>
+       <div class="srow"><span class="mono"><b>48621</b></span>${tier('sc')}<span>${stat('waiting')}</span>${btn('Review', 'quiet')}</div>`;
+  return shell('companies', `${back} ${C[k].n}`, `<span class="sp"></span>${btn(`${ic('external-link')} Open in Contacts`)}`, `<div class="cd"><div>${logoCol}</div>
+    <div><div class="h2">Website${state === 'manual' ? '' : an(3)}</div><div class="row" style="margin-bottom:18px"><b>${C[k].d}</b><span class="sm dim">· you confirmed this on October 10</span><span class="sp"></span>${btn('Change', 'quiet')}</div>
+      <div class="h2">Numbers on this card</div>${senders}
+      <div class="ban info" style="margin-top:18px">${ic('lock')}<div>Sendermark changes three things on a card: the photo, the website, and numbers labeled <b>text alerts</b>. Everything else is yours, including any number you added.</div></div></div></div>`);
+}
+
+// ---------------------------------------------------------------------------
+// Senders
+// ---------------------------------------------------------------------------
+const SE = [['48621', 'sc', 'waiting', 'chase', 41, 'Yesterday'], ['91557', 'sc', 'confirmed', 'chase', 63, 'Nov 14'], ['+1 (833) 555-0142', 'tf', 'waiting', 'vg', 6, 'Nov 15'], ['772310', 'sc', 'waiting', 'ups', 12, 'Nov 14'],
+  ['30414', 'sc', 'waiting', '', 15, 'Nov 12'], ['22000', 'sc', 'shared', '', 58, 'Nov 16'], ['+1 (415) 555-0178', 'lc', 'suspicious', '', 1, 'Yesterday'], ['55120', 'sc', 'confirmed', 'lyft', 9, 'Today'],
+  ['60233', 'sc', 'confirmed', 'amex', 112, 'Nov 14'], ['+1 (628) 555-0107', 'lc', 'unattr', '', 3, 'Oct 2'], ['88410', 'sc', 'unattr', '', 2, 'Jun 19'], ['+1 (888) 555-0161', 'tf', 'rejected', '', 4, 'Aug 30']];
+function senders() {
+  const rows = SE.map(([h, t, s, k, n, last], i) => `<div class="tr se"><span class="mono"><b>${h}</b></span><span>${tier(t)}</span><span>${stat(s)}${i === 9 ? an(2) : ''}</span>
+    <span class="row ellip" style="gap:8px">${k ? `${lg(k, 's22')}<span class="ellip">${C[k].n}</span>` : `<span class="dim">${s === 'shared' ? 'Many companies' : s === 'waiting' ? 'Names 3 companies' : '—'}</span>`}</span><span class="num">${n}</span><span class="dim">${last}</span></div>`).join('');
+  return shell('senders', 'Senders', `<span class="sp"></span><span class="search">${ic('search')}Search numbers</span>`, `<div class="colm">
+    <div class="fchips"><span class="fc on">All <b>118</b></span><span class="fc">Confirmed <b>96</b></span><span class="fc">Waiting <b>4</b></span><span class="fc">Shared <b>5</b></span><span class="fc">Suspicious <b>2</b></span><span class="fc">Unattributed <b>9</b></span><span class="fc">Rejected <b>2</b>${an(1)}</span></div>
+    <div class="tbl"><div class="tr se hd"><span>Number</span><span>Type</span><span>Status</span><span>Company</span><span>Texts</span><span>Latest</span></div>${rows}</div></div>`);
+}
+
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+function activity(state) {
+  const undo = btn(`${ic('undo-2')} Undo`, 'quiet');
+  const body = `<div class="runs">
+    <div class="run"><div class="rh"><b>Today, 10:42 AM</b><span class="dim">You reviewed 2 senders</span><span class="sp"></span></div>
+      <div class="ch">${lg('chase', 's22')}<span>Added <b class="mono">91557</b> to Chase</span><span class="sp"></span>${undo}${an(1)}</div>
+      <div class="ch">${lg('lyft', 's22')}<span>Created a card for Lyft with <b class="mono">55120</b></span><span class="sp"></span>${undo}</div></div>
+    <div class="run"><div class="rh"><b>Sunday, November 15, 9:00 AM</b><span class="dim">Weekly sender scan</span><span class="sp"></span></div>
+      <div class="ch"><span class="unk s18">${ic('user')}</span><span class="dim">Found 4 new senders and put them in Review. Nothing was changed.${an(2)}</span></div></div>
+    <div class="run"><div class="rh"><b>Sunday, November 1, 9:00 AM</b><span class="dim">Monthly logo check</span><span class="sp"></span>${btn('Undo this check', 'quiet')}</div>
+      <div class="ch">${lg('amazon', 's22 old')}${ic('arrow-right')}${lg('amazon', 's22')}<span>Updated the logo for Amazon</span><span class="sp"></span>${undo}</div>
+      <div class="ch">${lg('affirm', 's22 old')}${ic('arrow-right')}${lg('affirm', 's22')}<span>Updated the logo for Affirm</span><span class="sp"></span>${undo}</div></div>
+    <div class="run"><div class="rh"><b>Saturday, October 10, 4:15 PM</b><span class="dim">First run</span><span class="sp"></span>${btn('Undo first run', 'quiet')}</div>
+      <div class="ch">${ic('folder')}<span>Saved a backup of all contacts: <b>contacts-2026-10-10.vcf</b></span><span class="sp"></span>${btn('Show in Finder', 'quiet')}${an(3)}</div>
+      <div class="ch">${ic('image')}<span>Replaced 31 photos and added 18 logos</span><span class="sp"></span>${btn('See all 49', 'quiet')}</div>
+      <div class="ch">${ic('link')}<span>Saved a website on 55 company cards</span></div></div></div>`;
+  const after = state === 'undo' ? `<div class="modal"><div class="sheet narrow"><h2>Put back the old Amazon logo?</h2>
+    <div class="row" style="justify-content:center;gap:18px;margin:18px 0;color:var(--outline)">${lg('amazon', 's56')}${ic('arrow-right')}${lg('amazon', 's56 old')}</div>
+    <div class="sm dim">The card goes back to the photo it had before November 1. Sendermark won’t replace it again until Amazon’s logo changes.</div>
+    <div class="row" style="margin-top:16px"><span class="sp"></span>${btn('Cancel')}${btn('Put it back', 'pri')}</div></div></div>` : '';
+  return shell('activity', 'Activity', '<span class="sp"></span>', body, { after });
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+function settings() {
+  const ln = (l, hint, ctl) => `<div class="ln"><div class="l"><b>${l}</b>${hint ? `<div class="sm dim">${hint}</div>` : ''}</div>${ctl}</div>`;
+  const sel = t => `<span class="sel">${t}${ic('chevron-down')}</span>`;
+  return shell('settings', 'Settings', '<span class="sp"></span>', `<div class="sett">
+    <div class="h2">Scanning</div><div class="grp">
+      ${ln('Look for new senders', 'Reads Messages on this Mac. Tells you only when something is waiting for review.', sel('Every Sunday at 9:00 AM'))}
+      ${ln('Check for new logos', 'One Logo.dev lookup per company, about 62 a check. The free plan covers about 250 a month.', sel('First Sunday of the month'))}
+      ${ln('Change at most 15 cards a minute', 'Keeps iCloud from slowing down sync.', '<span class="sw on"></span>')}</div>
+    <div class="h2">Logos</div><div class="grp">
+      ${ln('Logo.dev keys', 'Secret key for the logos saved to cards; publishable key for previews. Both kept in your Keychain.', `<span class="mono dim">sk_•••• · pk_••••</span>${btn('Replace')}`)}
+      ${ln('Replace photos I chose myself', '', sel('Never'))}</div>
+    <div class="h2">Senders${an(1)}</div><div class="grp">
+      ${ln('Match senders using rules on this Mac', 'Links, opening words, and your existing cards. No message text leaves your Mac.', '<span class="tier sc">' + ic('lock') + 'Always on</span>')}
+      ${ln('Check toll-free and ten-digit numbers with Twilio Lookup', 'Sends only the phone number. About 2¢ a number, once.', '<span class="sw"></span>')}
+      ${ln('Ask a language model about senders the rules can’t place', 'Sends message text with digits hidden.', '<span class="sw"></span>')}</div>
+    <div class="h2">Safety</div><div class="grp">
+      ${ln('Contacts backup', 'Latest: contacts-2026-10-10.vcf', `${btn('Back up now')}${btn('Show in Finder', 'quiet')}`)}
+      ${ln('Access', 'Contacts: allowed · Full Disk Access (to read Messages): allowed', btn('Open System Settings', 'quiet'))}</div></div>`);
+}
+
+// ---------------------------------------------------------------------------
+// Setup (first run)
+// ---------------------------------------------------------------------------
+function setup(state) {
+  const ready = state === 'ready';
+  const step = (n, cls, t, hint, ctl = '') => `<div class="step ${cls}"><span class="nr">${cls === 'done' ? ic('check') : n}</span><div class="x"><b>${t}</b><div class="sm dim" style="margin-top:2px">${hint}</div></div>${ctl}</div>`;
+  return `<div class="app" style="flex-direction:column"><div class="lights" style="background:var(--side);padding-left:18px"><i></i><i></i><i></i></div>
+    <div class="setup"><div style="width:44px;height:44px">${MARK.replace('<svg ', '<svg style="width:44px;height:44px" ')}</div>
+      <h1 style="font-size:22px;font-weight:600;letter-spacing:-.02em;margin-top:12px">Set up Sendermark</h1>
+      <div class="dim" style="margin-top:4px">Four steps. Nothing in your contacts changes until you say so.</div>
+      <div class="card">
+        ${step(1, 'done', 'Allow access to Contacts', 'To read your company cards and, later, update them.')}
+        ${ready ? step(2, 'done', 'Allow Full Disk Access', 'To read your Messages history. Sendermark never changes or sends messages.')
+          : step(2, 'now', `Allow Full Disk Access${an(1)}`, 'macOS keeps Messages history behind this setting. Sendermark reads it to find the numbers companies text you from. It never changes or sends messages, and no message text leaves your Mac.', btn('Open System Settings', 'pri'))}
+        ${ready ? step(3, 'done', 'Add your Logo.dev keys', 'Kept in your Keychain.') : step(3, '', 'Add your Logo.dev keys', 'Free for personal use. The secret key fetches the logos saved to cards; the publishable key shows previews.', btn('Paste keys', 'dis'))}
+        ${ready ? step(4, 'done', 'Back up your contacts', 'Saved contacts-2026-10-10.vcf with 1,204 cards.') : step(4, '', `Back up your contacts${an(2)}`, 'Sendermark saves a copy of every card before its first change.', btn('Back up', 'dis'))}
+      </div>
+      <div class="row" style="margin-top:18px">${ready ? btn(`Look through my contacts and messages${an(3)}`, 'pri lgb') : btn('Look through my contacts and messages', 'pri lgb dis')}</div>
+      <div class="sm dim" style="margin-top:8px">${ready ? 'The first look changes nothing. You’ll see what Sendermark found before it touches a card.' : 'Finish the steps above first.'}</div></div></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Menu-bar popover
+// ---------------------------------------------------------------------------
+function popover(state) {
+  const bar = (badge) => `<div class="mbar">${ic('wifi')}<span class="me">${MARK_MONO}${badge ? '<span class="bdg"></span>' : ''}</span><span>Tue Nov 17&nbsp; 10:42 AM</span></div>`;
+  const menu = `<div class="sepr"></div>${state === 'scanning' ? '' : `<div class="mi">${ic('refresh-cw')}Scan now</div>`}<div class="mi">${ic('external-link')}Open Sendermark</div><div class="mi">${ic('settings-2')}Settings…</div><div class="sepr"></div><div class="mi dim">Quit Sendermark</div>`;
+  let top = '';
+  if (state === 'default') top = `<div class="pad"><div class="hl">4 senders are waiting for you${an(1)}</div>
+      <div class="row" style="margin:10px 0 12px"><span class="stack">${lg('chase', 'ci')}${lg('vg', 'ci')}${lg('ups', 'ci')}${unk()}</span><span class="sm dim">Chase, Vanguard, UPS, and 1 more</span></div>
+      <div class="row">${btn('Review', 'pri')}<span class="sm dim">About a minute</span></div></div>
+    <div class="sepr"></div><div class="pad sm dim" style="padding-top:10px;padding-bottom:10px"><span class="dot"></span>Scanned Sunday at 9:00 AM. 4 new senders.${an(2)}<br>Next scan Sunday, November 22.</div>`;
+  if (state === 'scanning') top = `<div class="pad"><div class="hl">Scanning…</div><div class="prog"><i></i></div>
+      <div class="sm dim">Reading Messages history · step 2 of 4</div><div class="row" style="margin-top:12px">${btn('Stop')}</div></div>
+    <div class="sepr"></div><div class="pad sm dim" style="padding-top:10px;padding-bottom:10px">Nothing is changed during a scan.</div>`;
+  if (state === 'clean') top = `<div class="pad"><div class="hl">Nothing needs you</div>
+      <div class="sm dim" style="margin-top:6px">62 company cards have what they need. 118 senders are sorted.</div></div>
+    <div class="sepr"></div><div class="pad sm dim" style="padding-top:10px;padding-bottom:10px"><span class="dot"></span>Scanned Sunday at 9:00 AM. No changes.<br>Next scan Sunday, November 22.</div>`;
+  if (state === 'error') top = `<div class="pad"><div class="hl">Sendermark can’t read Messages</div>
+      <div class="sm dim" style="margin:6px 0 12px">Full Disk Access was turned off, so Sunday’s scan couldn’t look for new senders.</div>
+      <div class="row">${btn('Open System Settings', 'pri')}</div></div>
+    <div class="sepr"></div><div class="pad sm dim" style="padding-top:10px;padding-bottom:10px"><span class="dot warn"></span>Last full scan Sunday, November 8.</div>`;
+  return `${bar(state === 'default' || state === 'error')}<div class="popv">${top}${menu}</div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Screen registry
+// ---------------------------------------------------------------------------
+const GROUPS = [
+  { id: 'review', title: 'Review—one sender, the evidence, one decision', sub: 'The screen the app exists for. Sendermark finds the numbers companies text from and proposes a card for each; nothing is written until you approve it. The controls change with how easy the number is to fake.', screens: [
+    { id: 'review', canvas: 'win', title: 'Review', fn: review, legend: [
+      `<b>The queue is sorted by what you have to do</b>, not by date: senders you can approve, senders that need a judgement, and senders Sendermark refuses to propose. The sidebar badge counts the first two. ${prd('User flow')}`,
+      `<b>Held back</b> senders are shown, not hidden. Seeing that a fake was caught is the reason to trust the rest of the queue. ${prd('Trust model')}`,
+      `<b>Where it goes</b>: the proposed company, its website, and how many numbers the card already has. “Open card” goes to the company’s page.`,
+      `<b>Evidence before the button.</b> Each row is one signal from the PRD, in plain words, with its strength as bars and a word. The registry row is a link that opens the official lookup in the browser; Sendermark does not query it. ${prd('Sender discovery and attribution')}`,
+      `<b>Two sample texts</b> with every run of four or more digits hidden, so a code or card number never sits on screen. ${prd('Requirements P0')}`,
+      `<b>The result, before you commit</b>: the bare number as Messages shows it today, and the row it becomes. The line under the name says whether it joins an existing conversation—this depends on the merge check in Phase 0 and is removed if that check fails. ${prd('Build plan')}`,
+      `<b>Batch approval covers short codes only.</b> The button counts them and never includes a toll-free or ten-digit number. ${prd('Trust model')}`,
+      `<b>Toll-free and ten-digit numbers carry a warning</b> and are approved one at a time. The primary button is the same; the warning and the missing batch are the difference.`,
+      `<b>Phone lookup</b> appears only when Twilio Lookup is turned on in Settings. It is supporting evidence and never enough alone. ${prd('Requirements P1')}`,
+      `<b>A new card shows exactly what will be created</b>: name, website, one number labeled <code>text alerts</code>, the logo. The website comes from the links in the texts, so it needs no separate confirmation here. ${prd('Contact write rules')}`,
+      `<b>A shared sender</b> is a decision, not an error: mark it once and it never returns to the queue. The escape hatch exists but is not the primary button.`,
+      `<b>A suspicious sender has no “add” button.</b> The primary action keeps it off every card. Overriding takes a second step that names the company.`],
+      states: [
+        { id: 'default', label: 'short code · existing card', kind: 'proposed', dark: 'The window drops to near-black and the action bar, buttons and destination card sit one step lighter. Sender-type pills swap pale tints for deep ones and keep their icons. The logo keeps its own tile.', cap: 'A short code with strong evidence for a company you already have. Queue on the left, the selected sender on the right: number and type, destination card, evidence, two sample texts, the Messages result, then the actions with their keys.' },
+        { id: 'tollfree', label: 'toll-free number', kind: 'state', cap: 'The amber warning sits above the destination. Evidence adds the history rule (at least three texts over seven days) and, with Twilio Lookup on, the line type and caller name. Batch approval in the toolbar still counts only the two short codes.' },
+        { id: 'newcard', label: 'creates a card', kind: 'state', cap: 'No UPS card exists. The destination row is replaced by a preview of the card to be created, field by field. The primary button says what it does.' },
+        { id: 'shared', label: 'shared sender', kind: 'state', cap: 'A number whose texts name three companies. The detail lists them with counts instead of proposing one. The primary action marks it shared; Messages keeps showing the bare number.' },
+        { id: 'suspicious', label: 'held back', kind: 'state', dark: 'The warning stays red on a deep red ground; conflict bars use the lighter red so they read against the dark table.', cap: 'A ten-digit number that names Chase but links elsewhere. The evidence table lists conflicts in red. The primary action is to keep it off every card; nothing here deletes or blocks the message.' },
+        { id: 'empty', label: 'nothing to review', kind: 'state', cap: 'The queue is empty and the sidebar badge is gone. The screen says when the last scan ran and offers a scan and the full sender list.' }] }] },
+  { id: 'companies', title: 'Companies—every company card and its logo', sub: 'Logos apply without review, so this is where you check on them rather than approve them. The list answers “which cards are not handled, and why”; the company page shows the logo in both crops Contacts and Messages use.', screens: [
+    { id: 'companies', canvas: 'win', title: 'Companies', fn: companies, legend: [
+      `<b>Filters partition the list</b> (49 + 5 + 1 + 4 + 3 = 62). The four that are not “Current” are the only ones that need attention. ${prd('Success metrics')}`,
+      `<b>Your photo</b>: a card whose photo you set yourself. Sendermark leaves it alone; the row shows your photo, not the logo. ${prd('Logo pipeline')}`,
+      `<b>Needs a domain</b>: the name alone is ambiguous. One click opens the company page with candidates. ${prd('Company resolution')}`,
+      `<b>First-run sheet.</b> Cards that already have a photo are shown before and after; you approve in bulk and uncheck the ones to keep. Cards with no photo are not listed—they have nothing to lose. ${prd('Logo pipeline')}`,
+      `<b>Needs a look</b>: Logo.dev returned a logo, but its source image is too small to trust, so it is not applied until you have seen it. In the Logo.dev test for this document, one of 19 real domains came back as an enlarged fragment of a logo. ${prd('Logo pipeline')}`],
+      states: [
+        { id: 'default', label: 'list', kind: 'proposed', cap: 'Twelve of 62 company cards. Each row: logo and name, website, logo status, how many numbers are on the card, and the latest text. Filter chips above carry counts.' },
+        { id: 'adopt', label: 'first run · replace photos', kind: 'state', dark: 'The sheet is lighter than the window behind it and carries a hairline edge, since a shadow alone disappears on a dark window.', cap: 'The sheet shown once, after the first scan. Eight of the 36 cards that already have a photo, each as before → after; A.P.C. is unchecked and keeps its photo. The button counts what will be replaced.' }] },
+    { id: 'company', canvas: 'win', title: 'Company page', fn: company, legend: [
+      `<b>Both crops, always together</b>: the rounded square Messages uses for a company and the circle the Contacts list uses. A logo is right only when it reads in both.`,
+      `<b>The canvas</b> shows the crop guides on the square image as stored: the circle Contacts cuts, and the square inside it that no crop can touch. Logo.dev’s logos arrive as finished square tiles, most with their own margin, so Sendermark leaves them alone unless the mark touches the edge. ${prd('Logo pipeline')}`,
+      `<b>Website</b> is the key that identifies the company. It is stored on the card itself, so it shows who confirmed it and when. ${prd('Company resolution')}`,
+      `<b>Numbers you added are marked “Yours”</b> and have no Remove button. Only numbers Sendermark added can be removed here. ${prd('Contact write rules')}`,
+      `<b>A photo you chose is left alone</b>, and the page says since when. Handing it over is one button, with a preview of what replaces it. ${prd('Logo pipeline')}`,
+      `<b>Candidates, not a guess.</b> The name matches several companies, so Sendermark asks once. The candidate whose website appears in your own texts is preselected and says so. ${prd('Company resolution')}`,
+      `<b>Not a company</b> takes the card out of Sendermark for good—for a person filed under a business name.`],
+      states: [
+        { id: 'default', label: 'managed logo', kind: 'proposed', dark: 'Both crops on the dark window. A logo on a white tile stays white, as a contact photo does; the crop guides invert against whatever is under them.', cap: 'Chase. Left: the logo in both crops, the canvas with its crop guides, and where the logo came from. Right: the website, the numbers on the card (one waiting in Review), and the note on what Sendermark will and won’t touch.' },
+        { id: 'manual', label: 'your own photo', kind: 'state', cap: 'A.P.C., whose photo you set. The page shows your photo in both crops, says Sendermark is leaving it alone, and previews what it would use if you handed the photo over.' },
+        { id: 'resolve', label: 'choose the company', kind: 'state', cap: 'A card named only “Alliant”. Three candidates, each with its logo and website. The one whose website appears in texts you have received is preselected and says why. A field takes any other website.' }] }] },
+  { id: 'senders', title: 'Senders—every number that has texted you', sub: 'The full ledger behind the review queue: what Sendermark has seen and what it concluded. This is where a decision can be found again and reversed.', screens: [
+    { id: 'senders', canvas: 'win', title: 'Senders', fn: senders, legend: [
+      `<b>Statuses partition the list</b> (96 + 4 + 5 + 2 + 9 + 2 = 118). Every number is in exactly one. ${prd('Data model')}`,
+      `<b>Unattributed</b> means no signal. Sendermark does not guess; the row waits until a later text gives it something. ${prd('Sender discovery and attribution')}`],
+      states: [
+        { id: 'default', label: 'all senders', kind: 'proposed', cap: 'Twelve of 118 numbers. Each row: the number in monospace, its type, its status, the company if there is one, how many texts, and the latest. Selecting a row opens it in the same detail layout as Review.' }] }] },
+  { id: 'activity', title: 'Activity—what changed, and how to put it back', sub: 'Every write is recorded with what was there before. Undo is on the change, on the scan, and on the first run.', screens: [
+    { id: 'activity', canvas: 'win', title: 'Activity', fn: activity, legend: [
+      `<b>Undo on every change.</b> A sender you approved a minute ago and a logo from last week are reversed the same way. ${prd('Contact write rules')}`,
+      `<b>Scans that only found things</b> say so. A line with no Undo changed nothing.`,
+      `<b>The backup</b> made before the first change is listed with the run that made it. ${prd('Requirements P0')}`],
+      states: [
+        { id: 'default', label: 'history', kind: 'proposed', cap: 'Four runs, newest first: a review session, the weekly sender scan, the monthly logo check, and the first run. Each change has its own Undo; a run that changed something can be undone whole.' },
+        { id: 'undo', label: 'undo a logo', kind: 'state', cap: 'Undoing one logo update. The sheet shows the current logo and the photo it will go back to, and says the logo won’t be replaced again until it changes at the source.' }] }] },
+  { id: 'settings', title: 'Settings', sub: 'Few settings, each a sentence. The two that send anything off the Mac are off by default and say what they send.', screens: [
+    { id: 'settings', canvas: 'win', title: 'Settings', fn: settings, legend: [
+      `<b>Senders</b>: matching on the Mac is always on. Twilio Lookup and the language-model pass are separate switches, both off, each naming what leaves the Mac and what it costs. ${prd('Decisions')}`],
+      states: [
+        { id: 'default', label: 'settings', kind: 'proposed', cap: 'Four groups—Scanning, Logos, Senders, Safety. Senders are scanned weekly and logos checked monthly, because each logo lookup spends Logo.dev credit. The Safety group shows the latest backup and whether macOS still grants the two kinds of access.' }] }] },
+  { id: 'setup', title: 'First run—access, key, backup', sub: 'Shown once. The order is the order of dependency: Contacts, then Messages history, then the keys, then the backup. The first scan changes nothing.', screens: [
+    { id: 'setup', canvas: 'win', title: 'Set up Sendermark', fn: setup, legend: [
+      `<b>Full Disk Access is the largest ask</b>, so its step says what is read, what is never done, and that message text stays on the Mac. ${prd('Risks')}`,
+      `<b>The backup is a step, not a background task.</b> The first changing run refuses to start without it. ${prd('Requirements P0')}`,
+      `<b>The button names the action.</b> The first look is a scan that writes nothing; the result is the Companies list and the first-run sheet. ${prd('User flow')}`],
+      states: [
+        { id: 'default', label: 'step 2 of 4', kind: 'proposed', cap: 'Contacts access is granted. Full Disk Access is the current step, with its explanation and the button that opens System Settings. Later steps are listed and disabled.' },
+        { id: 'ready', label: 'all steps done', kind: 'state', cap: 'Four ticks. The main button is enabled and the line under it repeats that the first look changes nothing.' }] }] },
+  { id: 'menubar', title: 'Menu bar—quiet unless something is waiting', sub: 'Sendermark runs weekly without a window. The menu-bar item is how it tells you, and the dot on the icon is the only notification it needs.', screens: [
+    { id: 'popover', canvas: 'pop', title: 'Menu-bar popover', fn: popover, legend: [
+      `<b>One sentence, one button.</b> The headline is the count; the marks show which companies. “Review” opens the window on the Review screen.`,
+      `<b>The scan line</b> reports what the last scan found. Logo updates need no approval and are checked monthly; they appear in Activity.`],
+      states: [
+        { id: 'default', label: 'senders waiting', kind: 'proposed', dark: 'A dark menu bar and popover. The menu-bar icon is drawn in the text colour, so it follows the appearance.', cap: 'The icon carries a dot. The popover leads with the count and a Review button, then the last and next scan, then the menu.' },
+        { id: 'scanning', label: 'scanning', kind: 'state', cap: 'A scan in progress: a bar, the current step, and Stop.' },
+        { id: 'clean', label: 'nothing waiting', kind: 'state', cap: 'No dot on the icon. The popover says so in one line and gives the totals.' },
+        { id: 'error', label: 'access turned off', kind: 'state', cap: 'Full Disk Access was revoked. The popover says what failed, what still worked, and opens System Settings.' }] }] },
+];
+const CANVAS = { win: 'Window · 1180×760', pop: 'Menu bar · 360×400' };
+
+// ---------------------------------------------------------------------------
+// Decisions and open questions
+// ---------------------------------------------------------------------------
+const DEC = [
+  ['D-01', 'Review', 'Review is the first item in the sidebar and the screen the app opens to whenever anything is waiting.', 'Approval is the only thing the app cannot do without you. Everything else is something to look up.', 'User flow'],
+  ['D-02', 'Review', 'The evidence sits above the buttons, and the buttons sit in a fixed bar at the bottom.', 'You read down to the decision. The primary action is never the first thing the eye reaches.', 'Trust model'],
+  ['D-03', 'Review', 'Every proposal previews the Messages row before and after.', 'The outcome you want is in Messages, not Contacts. Showing it makes “approve” concrete and makes a wrong company obvious.', 'What the manual cards show'],
+  ['D-04', 'Review', 'Risk changes the controls, not only the colour: short codes can be batched, toll-free and ten-digit numbers cannot, suspicious senders have no add button.', 'A warning you can click through with the same key is decoration. Removing the shortcut is what slows the hand.', 'Trust model'],
+  ['D-05', 'Company page', 'A logo is always shown in both crops, with the crop guides drawn on the stored square.', 'One of the hand-made cards has a wordmark that runs past the edge of its crop. Showing both crops is the check.', 'Logo pipeline'],
+  ['D-06', 'Activity', 'There is no separate “undo” mode. Every recorded change carries its own Undo, and so does every run.', 'The journal already holds the before-state. One list serves as history and as the way back.', 'Contact write rules'],
+  ['D-07', 'Menu bar', 'No notifications. A dot on the menu-bar icon is the only signal, and only when senders are waiting.', 'A weekly utility that interrupts is one you turn off. Logos update silently and are reported after the fact.', 'Product goals'],
+  ['D-08', 'Review', 'Every review action has a single-key shortcut, shown on the button.', 'The goal is five minutes a week. Four proposals should take four keystrokes when the evidence is clean.', 'Product goals'],
+  ['D-09', 'Companies', 'A logo whose source image is too small is held as “Needs a look” instead of being applied.', 'The Logo.dev test returned one enlarged fragment in 19 domains. Automatic is right for good logos and wrong for that one.', 'Logo pipeline'],
+  ['D-10', 'Settings, Activity', 'Senders are scanned weekly; logos are checked monthly.', 'Logos saved to a card must come from Logo.dev’s paid API, about 2¢ a company a check. Monthly keeps 62 companies inside the free credit; scanning Messages costs nothing.', 'Logo pipeline'],
+  ['D-11', 'All', 'In dark appearance a logo keeps its own tile, white included.', 'Recolouring a logo to suit the window would change the brand. Contact photos behave the same way in Messages.', 'Logo pipeline'],
+];
+const OPEN = [
+  ['Q-01', 'Should held-back senders appear in the Review queue, or only under Senders → Suspicious?', 'In the queue they build trust and add noise. If a week brings ten, they need their own collapsed section.'],
+  ['Q-02', 'Does the app need a main window at all, or can Review live entirely in the popover?', 'A popover-only app is smaller to build. The evidence table and both logo crops do not fit in 360 points.'],
+  ['Q-03', 'Should numbers be labeled by purpose (codes, fraud alerts, marketing) instead of one “text alerts” label?', 'Adds a label picker to every proposal and a classification step the PRD does not have.'],
+  ['Q-04', 'What does the “joins an existing conversation” line say if the Phase 0 merge check fails on iOS but passes on the Mac?', 'The preview would have to show two devices, or drop the claim.'],
+  ['Q-05', 'How is a logo change announced when the new logo is plainly worse than the old one?', 'Today it is silent with an Undo. A “hold new logos for a week” setting is the alternative.'],
+  ['Q-06', 'What does “Needs a look” offer when the logo really is bad?', 'Keep the card without a photo, use my own, or report the logo to Logo.dev. The company page needs a state for it.'],
+  ['Q-07', 'Should a logo that Logo.dev returns for the right domain but the wrong brand be catchable?', 'In the test one domain returned what looks like another company’s mark. Only a person can see that; the first-run sheet is the one place it gets looked at.'],
+];
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+const MODES = [['light', 'Light'], ['dark', 'Dark']];
+function unit(screen, state, mode) {
+  const w = screen.canvas, id = `fx-${screen.id}-${state.id}-${mode}`;
+  const cap = mode === 'light' ? `<b>${state.label}</b>${state.cap}` : `<b>${state.label} · dark</b>${state.dark || 'The same frame in dark appearance.'}`;
+  return `<div class="unit ${w}" id="${id}">
+    <div class="chips"><span class="fchip ${w}">${CANVAS[w]}</span><span class="fchip ${mode}">${mode}</span><span class="fchip ${state.kind}">${state.kind}</span></div>
+    <div class="fw ${w}"><div class="frame ${mode}">${screen.fn(state.id)}</div></div>
+    <p class="cap">${cap}</p></div>`;
+}
+const pairOf = (s, st) => `<div class="frames">${MODES.map(([m]) => unit(s, st, m)).join('')}</div>`;
+let html = '', tocHtml = '';
+for (const g of GROUPS) {
+  html += `<h2 id="sec-${g.id}">${g.title}</h2><p class="sub">${g.sub}</p>`;
+  let tocSub = '';
+  for (const s of g.screens) {
+    html += `<h3 id="scr-${s.id}">${s.title}</h3>`;
+    s.states.forEach((st, i) => {
+      html += (i === 0 ? '' : `<h4 id="st-${s.id}-${st.id}">${s.title} · ${st.label}</h4>`) + pairOf(s, st);
+      if (i === 0) html += `<ol class="legend">${s.legend.map(l => `<li>${l}</li>`).join('')}</ol>`;
+    });
+    tocSub += `<li><a href="#scr-${s.id}">${s.title}</a><span class="vars">${s.states.flatMap(st => MODES.map(([m]) => `<a href="#fx-${s.id}-${st.id}-${m}">fx-${s.id}-${st.id}-${m}</a>`)).join('')}</span></li>`;
+  }
+  tocHtml += `<li><a href="#sec-${g.id}">${g.title}</a><ol>${tocSub}</ol></li>`;
+}
+document.getElementById('doc').innerHTML = html;
+document.getElementById('toclist').innerHTML = tocHtml + `<li><a href="#sec-decisions">Design decisions these wireframes add to the PRD</a></li><li><a href="#sec-open">Open design questions</a></li>`;
+document.getElementById('drows').innerHTML = DEC.map(([id, scr, d, why, p]) => `<tr><td>${id}</td><td>${scr}</td><td>${d}</td><td>${why}</td><td>${p}</td></tr>`).join('');
+document.getElementById('orows').innerHTML = OPEN.map(([id, q, c]) => `<tr><td>${id}</td><td>${q}</td><td>${c}</td></tr>`).join('');
+
+// token legend with computed WCAG contrast
+const lum = h => { const c = h.replace('#', ''); const [r, g, b] = [0, 2, 4].map(i => parseInt(c.slice(i, i + 2), 16) / 255).map(v => v <= .03928 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4); return .2126 * r + .7152 * g + .0722 * b; };
+const ratio = (a, b) => { const [l1, l2] = [lum(a), lum(b)].sort((x, y) => y - x); return (l1 + .05) / (l2 + .05); };
+// [name, hex, usage, sample background (null = swatch only), [[background, label]], kind: text | nontext | none]
+const TOKENS = [
+  ['Window', '#ffffff', 'Content area, sheets, the popover', null, [], 'none'],
+  ['Sidebar', '#f1f2f4', 'Sidebar, search field, neutral banners', null, [], 'none'],
+  ['Ink', '#1c1d21', 'Text; the “keep it off every card” button', '#ffffff', [['#ffffff', 'Window'], ['#f1f2f4', 'Sidebar']], 'text'],
+  ['Graphite', '#5e6068', 'Secondary text: hints, metadata, column heads', '#ffffff', [['#ffffff', 'Window'], ['#f1f2f4', 'Sidebar']], 'text'],
+  ['Hairline', '#dadce2', 'Dividers and card borders (decorative)', '#ffffff', [['#ffffff', 'Window']], 'none'],
+  ['Outline', '#8b8e98', 'Button, field, checkbox and radio outlines', '#ffffff', [['#ffffff', 'Window']], 'nontext'],
+  ['Stamp', '#4338b8', 'Accent: selected sidebar item, primary button (white text), selection, links', '#ecebfa', [['#ffffff', 'Window, and white text on Stamp'], ['#ecebfa', 'its tint']], 'text'],
+  ['Short code', '#1c6b45', 'Sender type: leased and carrier-vetted. Also “Confirmed”, “Current”, evidence bars', '#e0f1e7', [['#e0f1e7', 'its tint'], ['#ffffff', 'Window']], 'text'],
+  ['Toll-free', '#8a5a00', 'Sender type: cheap to obtain. Also “No logo found”', '#fbf1dc', [['#fbf1dc', 'its tint'], ['#ffffff', 'Window']], 'text'],
+  ['Long code', '#9a3412', 'Sender type: ten-digit number, the usual channel for fakes', '#fce8dc', [['#fce8dc', 'its tint'], ['#ffffff', 'Window']], 'text'],
+  ['Shared', '#0f6e73', 'A number many companies send from', '#dcf0ef', [['#dcf0ef', 'its tint'], ['#ffffff', 'Window']], 'text'],
+  ['Suspicious', '#9b2335', 'Held back: evidence conflicts with the company named', '#f9e3e6', [['#f9e3e6', 'its tint'], ['#ffffff', 'Window']], 'text'],
+];
+document.getElementById('tokenrows').innerHTML = TOKENS.map(([name, hex, use, sampleBg, pairs, kind]) => {
+  const sample = sampleBg ? `<span class="sample" style="background:${sampleBg};color:${hex};border:1px solid ${hex}22">${name}</span>` : `<span class="sample" style="background:${hex};color:#1c1d21;border:1px solid rgba(0,0,0,.08)">${name}</span>`;
+  const ratios = pairs.length ? pairs.map(([bg, lbl]) => { const r = ratio(hex, bg); if (kind === 'none') return `<span class="ratio"><b>${r.toFixed(2)}:1</b> <small>${lbl} · decorative, no target</small></span>`; const text = kind === 'text'; const pass = text ? r >= 4.5 : r >= 3; return `<span class="ratio"><b class="${pass ? 'ok' : 'no'}">${r.toFixed(2)}:1</b> <small>${lbl} · ${text ? 'AA text ≥4.5' : 'non-text ≥3'} ${pass ? '✓' : '✗'}</small></span>`; }).join('<br>') : '<span class="ratio"><small>background—no text target</small></span>';
+  return `<tr><td><span class="tsw"><i style="background:${hex}"></i>${name}</span></td><td><code>${hex}</code></td><td>${use}</td><td>${sample}</td><td>${ratios}</td></tr>`;
+}).join('');
+
+const TOKENS_DARK = [
+  ['Window', '#1e1f22', 'Content area', null, [], 'none'],
+  ['Sidebar', '#27282c', 'Sidebar', null, [], 'none'],
+  ['Raised', '#2c2d32', 'Sheets, buttons, fields, cards, the popover', null, [], 'none'],
+  ['Ink', '#ececee', 'Text; the “keep it off every card” button (dark text on Ink)', '#1e1f22', [['#1e1f22', 'Window'], ['#27282c', 'Sidebar'], ['#2c2d32', 'Raised']], 'text'],
+  ['Graphite', '#a2a4ad', 'Secondary text', '#1e1f22', [['#1e1f22', 'Window'], ['#27282c', 'Sidebar'], ['#2c2d32', 'Raised']], 'text'],
+  ['Hairline', '#3a3b40', 'Dividers and card borders (decorative)', '#1e1f22', [['#1e1f22', 'Window']], 'none'],
+  ['Outline', '#7b7d87', 'Button, field, checkbox and radio outlines', '#1e1f22', [['#1e1f22', 'Window'], ['#2c2d32', 'Raised']], 'nontext'],
+  ['Stamp fill', '#5b50d6', 'Selected sidebar item, primary button (white text), selection', '#5b50d6', [['#ffffff', 'white text on Stamp fill']], 'text'],
+  ['Stamp text', '#aaa3ff', 'Links, sidebar icons, quiet buttons', '#2e2b52', [['#1e1f22', 'Window'], ['#27282c', 'Sidebar'], ['#2e2b52', 'its tint']], 'text'],
+  ['Short code', '#7fd4a4', 'Sender type; “Confirmed”, “Current”, evidence bars', '#16392a', [['#16392a', 'its tint'], ['#1e1f22', 'Window']], 'text'],
+  ['Toll-free', '#e8b85a', 'Sender type; “Needs a look”', '#3d2f0c', [['#3d2f0c', 'its tint'], ['#1e1f22', 'Window']], 'text'],
+  ['Long code', '#f2a27c', 'Sender type', '#44200f', [['#44200f', 'its tint'], ['#1e1f22', 'Window']], 'text'],
+  ['Shared', '#6fd0d4', 'A number many companies send from', '#0f3537', [['#0f3537', 'its tint'], ['#1e1f22', 'Window']], 'text'],
+  ['Suspicious', '#f29aa6', 'Held back', '#4a1620', [['#4a1620', 'its tint'], ['#1e1f22', 'Window']], 'text'],
+];
+document.getElementById('tokenrowsdark').innerHTML = TOKENS_DARK.map(([name, hex, use, sampleBg, pairs, kind]) => {
+  const white = name === 'Stamp fill';
+  const sample = sampleBg ? `<span class="sample" style="background:${sampleBg};color:${white ? '#fff' : hex};border:1px solid ${hex}55">${name}</span>` : `<span class="sample" style="background:${hex};color:#ececee;border:1px solid rgba(255,255,255,.12)">${name}</span>`;
+  const ratios = pairs.length ? pairs.map(([bg, lbl]) => { const r = ratio(hex, bg); if (kind === 'none') return `<span class="ratio"><b>${r.toFixed(2)}:1</b> <small>${lbl} · decorative, no target</small></span>`; const text = kind === 'text'; const pass = text ? r >= 4.5 : r >= 3; return `<span class="ratio"><b class="${pass ? 'ok' : 'no'}">${r.toFixed(2)}:1</b> <small>${lbl} · ${text ? 'AA text ≥4.5' : 'non-text ≥3'} ${pass ? '✓' : '✗'}</small></span>`; }).join('<br>') : '<span class="ratio"><small>background—no text target</small></span>';
+  return `<tr><td><span class="tsw"><i style="background:${hex}"></i>${name}</span></td><td><code>${hex}</code></td><td>${use}</td><td>${sample}</td><td>${ratios}</td></tr>`;
+}).join('');
+
+// Live logos. Each company tile carries data-d="<domain>". With a publishable key, the tile gets an <img> from
+// Logo.dev's image CDN (the same request the app's previews make); a failed load leaves the initials in place.
+// The key comes from this browser's storage or a ?token= parameter and is never written into this file.
+const PK_STORE = 'sendermark.logodev.pk';
+const readPk = () => { try { const u = new URLSearchParams(location.search).get('token'); if (u) return u; return localStorage.getItem(PK_STORE) || ''; } catch (e) { return ''; } };
+function applyLogos(pk) {
+  document.querySelectorAll('.lg[data-d]').forEach(el => {
+    el.querySelectorAll('img').forEach(i => i.remove()); el.classList.remove('has');
+    if (!pk) return;
+    const px = Math.max(32, Math.round(el.offsetWidth || 28));
+    const img = new Image();
+    img.alt = ''; img.loading = 'lazy'; img.decoding = 'async';
+    img.onload = () => el.classList.add('has');
+    img.onerror = () => img.remove();
+    img.src = `https://img.logo.dev/${el.dataset.d}?token=${encodeURIComponent(pk)}&size=${px}&retina=true&format=png&fallback=404`;
+    el.appendChild(img);
+  });
+  const n = document.querySelectorAll('.lg[data-d]').length;
+  document.getElementById('pkstate').textContent = pk ? `Key set: loading logos for ${n} tiles from Logo.dev.` : 'No key: showing initials.';
+}
+document.getElementById('pkload').addEventListener('click', () => { const v = document.getElementById('pk').value.trim(); if (!v) return; try { localStorage.setItem(PK_STORE, v); } catch (e) {} document.getElementById('pk').value = ''; applyLogos(v); });
+document.getElementById('pkclear').addEventListener('click', () => { try { localStorage.removeItem(PK_STORE); } catch (e) {} applyLogos(''); });
+applyLogos(readPk());
+
+// zoom: scales the canvases; layout inside is computed at the real size
+const ZOOM = { fit: [.5, .8], read: [.7, 1], actual: [1, 1] };
+document.getElementById('zoom').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const [w, p] = ZOOM[b.dataset.z];
+  const r = document.documentElement.style;
+  r.setProperty('--s-win', w); r.setProperty('--s-pop', p);
+  document.querySelectorAll('#zoom button').forEach(x => x.setAttribute('aria-pressed', x === b));
+  document.getElementById('zoomnote').textContent = `window ×${w} · popover ×${p}`;
+});
+</script>
+</body>
+</html>

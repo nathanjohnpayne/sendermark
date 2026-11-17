@@ -16,7 +16,6 @@
 # Set to 0 to require external review on every PR.
 # Set to a very high number (e.g., 999999) to effectively disable.
 external_review_threshold: 300
-
 # ---------------------------------------------------------------------------
 # Protected Paths
 # ---------------------------------------------------------------------------
@@ -40,7 +39,6 @@ external_review_paths:
   - "**/*secret*"
   - "**/*credential*"
   - ".github/**"
-
 # ---------------------------------------------------------------------------
 # Propagation PR review lane (#264)
 # ---------------------------------------------------------------------------
@@ -83,13 +81,11 @@ external_review_paths:
 # on arrival regardless of upstream provenance).
 propagation_prs:
   enabled: true
-
   # Branch-name prefix that scripts/sync-to-downstream.sh uses for the
   # PRs it opens. Must match SYNC_BRANCH_PREFIX in that script
   # (currently "mergepath-sync"). The trailing slash anchors the match
   # to the directory boundary.
   branch_prefix: "mergepath-sync/"
-
 # ---------------------------------------------------------------------------
 # Reviewer Identities
 # ---------------------------------------------------------------------------
@@ -100,7 +96,6 @@ available_reviewers:
   - nathanpayne-claude
   - nathanpayne-cursor
   - nathanpayne-codex
-
 # Retained archival enrollment (#1437). This list grants archival eligibility
 # only, never review/approval/merge standing. Keep verified former identities
 # here as status: retired after removing them from available_reviewers. Enroll
@@ -113,7 +108,6 @@ feedback_archive:
     - {login: nathanpayne-claude, provider: reviewer, status: active}
     - {login: nathanpayne-cursor, provider: reviewer, status: active}
     - {login: nathanpayne-codex, provider: reviewer, status: active}
-
 # ---------------------------------------------------------------------------
 # Non-Reviewer Identities
 # ---------------------------------------------------------------------------
@@ -142,7 +136,6 @@ non_reviewer_identities:
   # The hosted Octo STS app's bot (#2727 / #2732): the CI app identity that
   # resolves threads below. Never a reviewer.
   - octo-sts[bot]
-
 # ---------------------------------------------------------------------------
 # Dependabot-Only Approver Identities (#2874)
 # ---------------------------------------------------------------------------
@@ -165,7 +158,6 @@ non_reviewer_identities:
 # non_reviewer_identities (that gate would fail every approved Dependabot PR).
 dependabot_reviewer_identities:
   - nathanpayne-deps
-
 # ---------------------------------------------------------------------------
 # CI App Thread-Resolution Identity (#2726)
 # ---------------------------------------------------------------------------
@@ -189,7 +181,6 @@ dependabot_reviewer_identities:
 # repository's installation and the thread-resolution trust policy in
 # .github/chainguard/ (docs/audits/ci-app-credentials-2026-10.md § Hosting).
 thread_resolution_ci_app_identity: "octo-sts[bot]"
-
 # ---------------------------------------------------------------------------
 # Default External Reviewer
 # ---------------------------------------------------------------------------
@@ -197,14 +188,12 @@ thread_resolution_ci_app_identity: "octo-sts[bot]"
 # it defaults to this identity. The agent may override this suggestion based
 # on context (e.g., suggesting the agent with the most relevant expertise).
 default_external_reviewer: nathanpayne-codex
-
 # ---------------------------------------------------------------------------
 # Author Identity
 # ---------------------------------------------------------------------------
 # All agents commit code under this single shared identity.
 # Do not change this unless the repo owner account changes.
 author_identity: nathanjohnpayne
-
 # ---------------------------------------------------------------------------
 # Author merge token class (#2728)
 # ---------------------------------------------------------------------------
@@ -218,7 +207,6 @@ author_identity: nathanjohnpayne
 # specs/author_merge_token.md. Absent means `any`; any other value fails
 # closed.
 author_merge_token_class: any
-
 # ---------------------------------------------------------------------------
 # Native merge-queue rollout (#1058)
 # ---------------------------------------------------------------------------
@@ -252,7 +240,6 @@ merge_queue_required_workflow_repository: ""
 merge_queue_required_workflow_repository_id: 0
 merge_queue_required_workflow_ref: ""
 merge_queue_required_workflow_sha: ""
-
 # ---------------------------------------------------------------------------
 # Review-feedback disposition policy (#574)
 # ---------------------------------------------------------------------------
@@ -272,7 +259,6 @@ feedback_policy:
     p2: discretionary
     p3: discretionary
     nitpick: discretionary
-
 # ---------------------------------------------------------------------------
 # CodeRabbit (Automated External Review — Phase 2.5)
 # ---------------------------------------------------------------------------
@@ -348,8 +334,7 @@ coderabbit:
   # failing classifier -- to INVOKE, because skipping wrongly silently drops a
   # review round while invoking wrongly only costs time.
   invoke: complex-changes
-  enabled: true
-
+  enabled: false
   # Whether the AGENT blocks in Phase 2.5 for CodeRabbit's review of the
   # current head before proceeding to Phase 3 (#2166). Default false: Phase
   # 2.5 is NON-BLOCKING. The agent used to hold every round's Codex request
@@ -370,11 +355,9 @@ coderabbit:
   # Any other or ambiguous value falls back to waiting -- an unclear
   # instruction about the wait resolves to the slower, older behaviour.
   wait_for_review: false
-
   # GitHub login of the CodeRabbit bot. Comments by this login are what
   # `scripts/coderabbit-wait.sh` filters on when classifying PR activity.
   bot_login: "coderabbitai[bot]"
-
   # Maximum total seconds `scripts/coderabbit-wait.sh` will poll before
   # timing out. Used by the Phase 2.5 grace window (only when
   # wait_for_review above is true, #2166), by the Phase 4b barrier's bounded
@@ -409,7 +392,6 @@ coderabbit:
   # default alone does not migrate them; that migration is a sync-wave
   # follow-up tracked separately (Codex P2 on #688).
   max_wait_seconds: 1245
-
   # #727: shortened CodeRabbit poll ceiling for the auto-merge-on-approval
   # POST-CLEARANCE fast path. When the current HEAD already carries a verified
   # Codex / Phase-4b clearance AND a reviewer-identity APPROVED (i.e.
@@ -428,23 +410,19 @@ coderabbit:
   # the merge is already cleared to proceed). Set >= max_wait_seconds to make
   # the fast path a no-op.
   post_clearance_max_wait_seconds: 240
-
   # On the timeout path, ask CodeRabbit for a narrative status update
   # before returning exit 4. This does NOT change the exit-code
   # contract: timeout remains advisory and callers still decide whether
   # to proceed. The reply is surfaced in `status_probe` JSON/log output
   # only; it is never treated as a review or clearance signal.
   status_probe_enabled: true
-
   # Extra bounded wait after posting `@coderabbitai, how is the review
   # going?` on the timeout path. This adds latency only when the normal
   # `max_wait_seconds` grace window has already elapsed.
   status_probe_wait_seconds: 60
-
   # Deprecated compatibility field (#2139). The waiter never sleeps out a
   # rate-limit window or posts a retry; this value no longer changes behavior.
   max_rate_limit_retries: 2
-
   # On a published or trusted per-head rate-limit refusal, request Codex
   # immediately through the canonical trigger-only requester (#489/#2139).
   # The request is not clearance. Under-threshold approval requires the full
@@ -453,7 +431,6 @@ coderabbit:
   # refusal stops the substitution wait with human_attention_required.
   # Normal Phase 4 gates still apply. False opts out and requires attention.
   codex_failover_on_rate_limit: true
-
   # Maximum number of times `scripts/coderabbit-wait.sh` will post
   # `@coderabbitai resume` to recover from CodeRabbit's auto-pause state
   # (the durable "Reviews paused" NOTE CodeRabbit emits after
@@ -464,7 +441,6 @@ coderabbit:
   # code 6 / status=paused / skip_reason=paused on the first pause NOTE).
   # See nathanjohnpayne/mergepath#490.
   max_resume_retries: 2
-
   # Wallclock freshness floor for the HEAD_ANCHOR in
   # `scripts/coderabbit-wait.sh`. Stacked with the `head_ref_force_pushed`
   # anchor advance — `HEAD_ANCHOR = max(HEAD_COMMITTER_DATE,
@@ -485,7 +461,6 @@ coderabbit:
   # for repos where PRs commonly take longer than 30min of wall time
   # between consecutive CodeRabbit reviews.
   wallclock_freshness_window_seconds: 1800
-
   # Use CodeRabbit's per-SHA `CodeRabbit` StatusContext check as a
   # fast-path gate trigger in `scripts/coderabbit-wait.sh`. When
   # `true` (default), the wait helper exits as soon as the
@@ -511,7 +486,6 @@ coderabbit:
   # CodeRabbit's narrative for some other purpose).
   # See nathanjohnpayne/mergepath#221.
   trust_status_context_for_clearance: true
-
   # CodeRabbit severity gate (#574 / #577) — the CodeRabbit twin of
   # codex.p1_gate below. When enabled, scripts/coderabbit-severity-gate.sh
   # runs as the required check `CodeRabbit Severity Gate / CodeRabbit
@@ -528,7 +502,6 @@ coderabbit:
   # so it is safe to add to required checks everywhere.
   severity_gate:
     enabled: true
-
 # ---------------------------------------------------------------------------
 # Codex (Automated External Review — Phase 4a)
 # ---------------------------------------------------------------------------
@@ -601,7 +574,6 @@ coderabbit:
 #      behavior, and #218 for the Phase 4b substitute path.
 codex:
   enabled: true
-
   # Request `@codex review` on EVERY PR, not only the ones that meet the
   # external-review threshold or touch a protected path (#486).
   #
@@ -642,7 +614,6 @@ codex:
   # required gates. The measurement behind it: 88 of 223 under-300-line PRs
   # (39%) drew a Codex round the under-threshold path never required.
   request_by_default: false
-
   # The moving-head guard (#2166). A Codex request is posted once per BATCH,
   # on a head that is final for the round: every known finding addressed,
   # local tests green, no further push planned. Measured over the 14 most
@@ -684,18 +655,15 @@ codex:
   # Both signals fail OPEN on an unreadable input with a distinct log line:
   # this is a cycle-time guard, not a merge gate.
   request_min_head_age_seconds: 300
-
   # GitHub login of the Codex GitHub App bot. Reviews posted by this login
   # satisfy the external-review requirement in `.github/workflows/pr-audit.yml`.
   # Do not change unless OpenAI renames the app. Confirmed via GitHub API
   # metadata; see issue #26 for the audit trail.
   bot_login: "chatgpt-codex-connector[bot]"
-
   # Fallback CLI reviewer identity used when the Codex App path times out.
   # This identity posts reviews manually via the Codex CLI as a human-driven
   # Phase 4b handoff. Must be a member of `available_reviewers` above.
   cli_login: nathanpayne-codex
-
   # The per-PR Codex request ceiling: the 11th request is refused (exit 7,
   # kind "request-ceiling"). Normal termination is either approval,
   # disagreement (repeat-after-rebuttal), or timeout → Phase 4b fallback.
@@ -715,7 +683,6 @@ codex:
   # automated APPROVED. The others are the blocking budget, an untested
   # rebuttal and a disagreement (REVIEW_POLICY.md, Disagreements signal 4).
   max_review_rounds: 10
-
   # Blocking-review budget (#1560 slice 3). Before every new request the
   # requester counts the PR's SOLICITED Codex responses that are blocking (a
   # finding at p0 or a feedback_policy-required tier), unknown-tier, or
@@ -730,7 +697,6 @@ codex:
   # human-tiebreaker route. At a spent request ceiling the effective budget is
   # the lower of this and max_review_rounds (the runaway stop).
   max_blocking_reviews: 10
-
   # Poll timeout per round, in seconds, for `codex-review-request.sh`.
   # If Codex has not posted a review within this window, treat as timeout
   # and exit with code 4. Silence is NEVER treated as implicit approval;
@@ -746,7 +712,6 @@ codex:
   # non-response tail (#570) is still out of scope: no foreground wait
   # catches it, and --trigger-only (#489) remains its escape path.
   review_timeout_seconds: 1800
-
   # Short acknowledgment window for `@codex review` trigger comments
   # (#419). The Codex GitHub integration reacts with 👀 to the comment
   # that invoked the review; in the REST reactions payload that content
@@ -762,24 +727,20 @@ codex:
   # Eyes is ACKNOWLEDGMENT ONLY. It is never treated as clearance.
   # PR-level reactions are observations only: they have no commit anchor.
   ack_wait_seconds: 30
-
   # Maximum number of bounded re-posts when the trigger comment does not
   # receive the `eyes` acknowledgment. After this cap, the script keeps
   # the existing default contract: continue the normal review wait and
   # exit 4 on timeout rather than fast-failing on an acknowledgment
   # false-negative.
   max_ack_retries: 1
-
   # When true, `codex-review-check.sh` requires all required CI checks to
   # report green before allowing merge. Strongly recommended; do not disable
   # without explicit human authorization.
   require_ci_green: true
-
   # Compatibility setting retained for older consumers. PR-level +1 / 👍
   # reactions never clear gate (c) or terminate requester scans. Clearance
   # requires a qualifying commit-anchored review or affirmative verdict.
   reaction_freshness_window_seconds: 1800
-
   # When true (default), `codex-review-check.sh` accepts an APPROVED
   # review on the current HEAD from a non-author identity in
   # `available_reviewers` as a Codex-equivalent gate (c) clearance.
@@ -797,7 +758,6 @@ codex:
   # App provides domain-specific checks no other reviewer matches).
   # See nathanjohnpayne/mergepath#218.
   allow_phase_4b_substitute: true
-
   # Codex P1 merge gate (nathanjohnpayne/mergepath#235).
   #
   # scripts/codex-p1-gate.sh always runs complete-history feedback
@@ -825,7 +785,6 @@ codex:
   # knob flips it to enforced.
   p1_gate:
     enabled: true
-
   # External-review merge-clearance gate (nathanjohnpayne/mergepath#428).
   #
   # When enabled, scripts/merge-clearance-gate.sh runs as the required CI
@@ -847,7 +806,6 @@ codex:
   # as p1_gate above — enabled here first, then propagated.
   external_review_gate:
     enabled: true
-
 # ---------------------------------------------------------------------------
 # GitHub Advanced Security / code scanning (CodeQL) — (#1101)
 # ---------------------------------------------------------------------------
@@ -942,11 +900,9 @@ codex:
 # scanning in the repo's Security settings — not this flag.
 code_scanning:
   enabled: true
-
   # GitHub login of the code-scanning bot that posts inline alert comments.
   # Do not change unless GitHub renames the integration.
   bot_login: "github-advanced-security[bot]"
-
 # ---------------------------------------------------------------------------
 # Dependabot reviewer-approval merge gate (#427)
 # ---------------------------------------------------------------------------
@@ -975,7 +931,6 @@ code_scanning:
 dependabot:
   reviewer_gate:
     enabled: true
-
   # Dependabot action-pin bump lane (mergepath#2164). When enabled, a
   # Dependabot PR is exempt from the `.github/**` entry in
   # external_review_paths above IFF scripts/workflow/
@@ -1021,7 +976,6 @@ dependabot:
   # cannot be parsed, fails closed (not exempt).
   pin_bump_exemption:
     enabled: true
-
 # ---------------------------------------------------------------------------
 # Phase 4b proactive triggers (#158)
 # ---------------------------------------------------------------------------
@@ -1053,7 +1007,6 @@ dependabot:
 # scripts/codex-review-check.sh's parser — no behavior change without
 # explicit opt-in. See REVIEW_POLICY.md § Migration for existing consumers.
 phase_4b_default: complex-changes
-
 # ---------------------------------------------------------------------------
 # Phase 4b automated review handoff (reference feature)
 # ---------------------------------------------------------------------------
@@ -1097,25 +1050,21 @@ phase_4b_automation:
   # (#628): a new repo opts in to local reviewer-CLI automation
   # explicitly, after validating plan-logins on its own machine.
   enabled: false
-
   # Execution model. 'local' = the authoring agent's session shells out to
   # the reviewer CLI on the same machine (reuses op-preflight + the gh
   # reviewer wrapper). 'manual' defers to the human handoff. A CI mode is a
   # future follow-up (not implemented in the reference).
   mode: local
-
   # Enforced cap on completed automated Phase 4b rounds per PR (#2663). Read
   # from the governing base policy; slots are reserved in the per-PR Git-ref
   # round ledger before any adapter run (specs/phase_4b_round_cap.md).
   # Lowered 20 -> 3 by #2665 (epic #2657): a 4th completed round is refused
   # for an owner decision.
   max_review_rounds: 3
-
   # Fail closed: an ambiguous / non-schema-conformant adapter verdict must
   # NEVER become an APPROVED. The orchestrator falls back to the manual
   # handoff instead. (Documentary; the reference always fails closed.)
   fail_closed: true
-
   # Policy step 9 executor (#672). On an APPROVED verdict carrying
   # discretionary-tier findings (the validator already rejects APPROVED +
   # any policy-REQUIRED tier), the orchestrator files one `post-review` +
@@ -1127,11 +1076,9 @@ phase_4b_automation:
   # post-review/observation labels; note any issue-filing failure already
   # degrades to the refusal fail-closed).
   post_review_issues: true
-
   # What to do on adapter error/timeout: emit the manual chat-side handoff
   # block and alert the human. (Documentary; the only implemented behavior.)
   fallback_on_error: manual-handoff
-
   # --- Reviewer CLI runtime bounds (#589) ---------------------------------
   # Per-adapter timeout + effort for the reviewer CLI, so Codex and Claude can
   # be tuned without editing the adapter scripts. Conservative defaults below
@@ -1144,7 +1091,7 @@ phase_4b_automation:
   # running the CLI unbounded). Absent ⇒ 900. Env vars
   # P4B_ADAPTER_TIMEOUT_SECONDS / P4B_REVIEW_CLI_TIMEOUT_SECONDS still override
   # at runtime for tests and manual runs.
-  adapter_timeout_seconds: 900   # shared default for both adapters
+  adapter_timeout_seconds: 900 # shared default for both adapters
   # codex_timeout_seconds: 900   # optional per-adapter override
   # claude_timeout_seconds: 900  # optional per-adapter override
 
@@ -1178,7 +1125,6 @@ phase_4b_automation:
   # disputed rebuttal. Timeout stays 900s — high fits it with ~4x margin.
   claude_effort: high
   codex_effort: high
-
   # --- Review-diff byte budget (#635/#636) ---------------------------------
   # A PR whose diff carries bulk committed artifacts can exceed the reviewer
   # CLI's model context (#629: 6.4 MB, the CLI exits 1 and the whole
@@ -1208,7 +1154,6 @@ phase_4b_automation:
   # e.g. the #623 study data that motivated all of this).
   diff_omit_globs:
     - "docs/audits/data/*"
-
   # --- Approval-loop accounting (#602) -------------------------------------
   # Folds the "## Phase 4b Approval Accounting" block (plus the embedded
   # machine-readable `p4b-accounting:v1` record) into the automated APPROVED
@@ -1238,7 +1183,6 @@ phase_4b_automation:
     # opt in once the reviewer CLIs' models are known for this repo.
     # codex_price_key: openai.gpt-5.3-codex.standard
     # claude_price_key: anthropic.claude-sonnet-4.6.standard
-
 # ---------------------------------------------------------------------------
 # Propagation-wave audit (#662)
 # ---------------------------------------------------------------------------
@@ -1287,7 +1231,6 @@ propagation_audit:
   # Holds recorded for one range before it becomes needs-owner [1, 10].
   # Read only under hold.
   hold_max_attempts: 3
-
 # ---------------------------------------------------------------------------
 # Auto-clear blocking labels (#195/#197)
 # ---------------------------------------------------------------------------

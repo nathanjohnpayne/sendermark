@@ -10,7 +10,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/sendermark/prds/sendermark.md
-source_ref: 2075774e90c9e678339c4865092199d3054094fa
+source_ref: 045f37cb279781e88ecec6c9c40730232998f2d7
 project: sendermark
 document_class: prd
 document_slug: sendermark
@@ -31,7 +31,7 @@ Sendermark keeps the company cards in my Contacts current—a clean, high-resolu
 Wordmark: sender|mark
 Favicon: s|
 
-**Name (2026-11-17):** renamed from the working title Callsign in v0.2. `callsign.app` has been registered since 2018, and Callsign Inc ships an authentication app under that name—too close to a tool that decides which senders to trust. The .app registry had no record of `sendermark.app` on November 17, 2026; it is not registered yet, and trademarks and the App Store have not been checked.
+**Name (2026-11-17):** renamed from the working title Callsign in v0.2. `callsign.app` has been registered since 2018, and Callsign Inc ships an authentication app under that name—too close to a tool that decides which senders to trust. I registered `sendermark.app` on November 17, 2026, and found no conflicting trademark or App Store listing for the name.
 
 **Interface:** wireframes for the Mac app, in light and dark appearance, are in [sendermark-wireframes.html](sendermark-wireframes.html), in this folder.
 
@@ -126,8 +126,8 @@ These are recommendations, recorded so they can be challenged.
 Facts the design depends on. Sources are listed at the end.
 
 - **Identity in Messages comes from Contacts.** A sender whose handle matches a number on a card shows that card's name and photo. Cards marked as a company render with a rounded-square avatar in Messages on macOS 26.
-- **Conversation merging is undocumented.** My manual cards show several numbers on one card appearing as one conversation. Apple Community threads report the same since iOS 13, but Apple documents no such feature and other sources say it does not exist. Sendermark's second goal depends on this, so it is the first thing to verify (see [Build plan](#build-plan)).
-- **Reply routing in a merged conversation follows the most recent sender**, per the same community reports. A reply of `STOP` or `1` goes to whichever number texted last. That is usually right; it is worth knowing.
+- **Conversation merging is undocumented.** My manual cards show several numbers on one card appearing as one conversation. Apple Community threads report the same since iOS 13, but Apple documents no such feature and other sources say it does not exist. Sendermark's second goal depends on this, so it was the first thing verified: on November 17, 2026, the American Express card's three short codes showed as one conversation on macOS 27.2.1 and on iOS 27.2.1. Messages still stores one chat per short code in `chat.db`; the merging happens when it displays them.
+- **Reply routing in a merged conversation follows the most recent sender**, per the same community reports. A reply of `STOP` or `1` goes to whichever number texted last. That is usually right; it is worth knowing. Messages does not show which number a reply will go to. The four replies in my Amex history each went to the most recent sender, but that sender also held nearly all the history, so they do not prove the rule.
 - **iCloud limits.** A contact photo may be at most 224 KB and a whole card 256 KB; JPEG, PNG, BMP, and GIF are accepted. One third-party developer reports that editing more than 15–20 contacts within a few minutes can trigger iCloud throttling.
 - **Logo.dev** has two services with different rules: an image CDN for display, called with a publishable key, and an API for files you may keep, called with a secret key. Details and test results are in the next section.
 - **Messages history** is a SQLite database at `~/Library/Messages/chat.db`. Reading it requires Full Disk Access for the reading process. The `handle` table holds sender identifiers. Message text is sometimes only in the `attributedBody` blob rather than the `text` column.
@@ -419,7 +419,7 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Conversation merging is undocumented and may not behave the same on every OS version, or may change | Half the value proposition | Verify in Phase 0 on macOS and iOS; if it fails, ship logos and names only and say so |
+| Conversation merging is undocumented and may not behave the same on every OS version, or may change | Half the value proposition | Verified in Phase 0 on macOS 27.2.1 and iOS 27.2.1; check again after each major OS release, and if it stops, ship logos and names only and say so |
 | A scam sender is attached to a trusted card | Phishing texts inherit a bank's identity and bypass unknown-sender screening | Approval for every number; higher bar for toll-free and long codes; conflicting link domains block a proposal |
 | Wrong domain yields a wrong logo | Confident, wrong branding | Name lookup always needs confirmation; domain stored on the card |
 | Logo.dev credit runs out—the free plan has $5 a month and cannot buy more | Logo checks stop until the month renews | Monthly checks ($1.24 for 62 companies); stop cleanly on a 402; move to the Startup plan if the list passes about 250 companies |
@@ -434,11 +434,11 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
 
 - [x] **Legal/terms.** Does Logo.dev permit saving a logo into a contact card? Yes, through the secret-key API on any plan; not from the CDN. See [Logo.dev: what the test showed](#logodev-what-the-test-showed).
 - [x] **Blocking—platform.** Call the secret-key logo endpoint once and confirm the response shape, the size of the source images, and the credit charge. Run on November 17, 2026; see [What the API returned](#what-the-api-returned). The header reported 1 credit where the docs say 2; the dashboard has not been read.
-- [ ] **Blocking—platform.** Does one card with several sender numbers produce one conversation on current macOS and iOS, for SMS short codes specifically? The American Express card, with three, is the test.
+- [x] **Blocking—platform.** Does one card with several sender numbers produce one conversation on current macOS and iOS, for SMS short codes specifically? Yes: the American Express card's three short codes show as one conversation on macOS 27.2.1 and iOS 27.2.1, checked November 17, 2026.
 - [ ] **Platform.** Does writing `imageData` through `Contacts.framework` preserve the image as written, or does Contacts re-crop or recompress it?
 - [ ] **Product.** Should the label be `text alerts` for every sender, or should Sendermark label by purpose (verification, fraud, marketing)? Purpose labels are nicer and add a classification problem.
 - [ ] **Product.** Should shared verification senders get a generic "Verification codes" card, or stay bare?
-- [ ] **Product.** Register `sendermark.app`, and check trademarks and the App Store for the name before anything is published.
+- [x] **Product.** Register `sendermark.app`, and check trademarks and the App Store for the name before anything is published. Registered November 17, 2026; no conflict found.
 - [ ] **Engineering.** How does the app bundle obtain Full Disk Access cleanly for a scheduled run, and is a Developer ID signature needed for the grant to persist across builds?
 - [ ] **Engineering.** How much of my history has message text only in `attributedBody`, and is a decoder needed in P0?
 

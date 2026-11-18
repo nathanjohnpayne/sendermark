@@ -10,7 +10,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/sendermark/prds/sendermark.md
-source_ref: 10f60bcbfebd3ddd3bdb6ae5640569d8dc41fe94
+source_ref: 2075774e90c9e678339c4865092199d3054094fa
 project: sendermark
 document_class: prd
 document_slug: sendermark
@@ -35,7 +35,7 @@ Favicon: s|
 
 **Interface:** wireframes for the Mac app, in light and dark appearance, are in [sendermark-wireframes.html](sendermark-wireframes.html), in this folder.
 
-**Logo.dev (2026-11-17):** tested with my publishable key, and the download question is answered—see [Logo.dev: what the test showed](#logodev-what-the-test-showed). Logos saved to a card must come from the secret-key API, not the image CDN. That changes the logo pipeline, the schedule, and the cost.
+**Logo.dev (2026-11-17):** tested with my publishable key, then with one call to the secret-key API, and the download question is answered—see [Logo.dev: what the test showed](#logodev-what-the-test-showed). Logos saved to a card must come from the secret-key API, not the image CDN. That changes the logo pipeline, the schedule, and the cost.
 
 ## Contents
 
@@ -118,7 +118,7 @@ These are recommendations, recorded so they can be challenged.
 4. **Square mark, not lockup.** One treatment for every card. Wordmarks are illegible at avatar size.
 5. **Deterministic attribution first; no message text leaves the Mac in v1.** Business texts contain verification codes, balances, and account suffixes. Sender prefixes and link domains attribute most senders without a model. An LLM pass is P1, off by default, and runs on redacted text.
 6. **Start as a CLI; add the Mac app second.** The risky parts are platform behavior, not interface. The CLI proves them in days. Scheduled, unattended runs wait for the app bundle, because macOS privacy permissions for a bare binary launched by `launchd` are awkward. The app is designed now so that the CLI's `review` output follows the same order as the app's review screen (see [Interface](#interface)).
-7. **Saved logos come from the Logo.dev API; the CDN is for previews (added in v0.3).** Logo.dev licenses storing only what its secret-key API returns. So every image written to a card is fetched through the API at 2¢ a company, and the image CDN is used only to show logos on screen. Because each check costs credit and the free plan cannot buy more, logos are checked monthly and senders weekly.
+7. **Saved logos come from the Logo.dev API; the CDN is for previews (added in v0.3).** Logo.dev licenses storing only what its secret-key API returns. So every image written to a card is fetched through the API at up to 2¢ a company, and the image CDN is used only to show logos on screen. Because each check costs credit and the free plan cannot buy more, logos are checked monthly and senders weekly.
 8. **Outside lookups are supporting evidence only (added in v0.2).** There is no API that maps a sender to a company. Twilio Lookup can say whether a toll-free or ten-digit number is a real toll-free line or a disposable internet number, and sometimes return a caller name; that is enough to strengthen or block a proposal, never enough to make one. It is P1, off by default, and sends only the phone number. Short codes get a link to the official registry lookup, opened in the browser—no scraping of third-party directories.
 
 ## How the platform behaves
@@ -138,7 +138,7 @@ Facts the design depends on. Sources are listed at the end.
 
 ## Logo.dev: what the test showed
 
-Tested November 17, 2026, with my publishable key against the image CDN. The secret-key API was not called: 1Password would not reveal the secret key without taking over the screen, so that one test is still open.
+Tested November 17, 2026, with my publishable key against the image CDN. The secret-key API was called once the same day, for `americanexpress.com`; see [What the API returned](#what-the-api-returned).
 
 ### The download question
 
@@ -146,9 +146,9 @@ Tested November 17, 2026, with my publishable key against the image CDN. The sec
 
 - **Technically** nothing stops it. The CDN returns an ordinary 800×800 PNG that can be written to disk.
 - **Under Logo.dev's rules** the CDN is for display. Its self-hosting page says every plan may store the images the API returns, and says not to download from the CDN to build your own copy. Its pricing page says the same of API results.
-- **The API call** is `GET https://api.logo.dev/v2/brands/logo?domain=<domain>` with `Authorization: Bearer <secret key>`. It returns a temporary download URL (valid about 24 hours), an `etag` that identifies the version, and the source image's dimensions and format. `size`, `format`, and `theme` go on the download URL.
-- **Cost.** 2 credits (2¢) a lookup, billed once per domain per 24 hours. A 404 or a 202 is free, and so is the download itself. The free plan includes $5 of credit a month—about 250 lookups—and cannot buy more; it must upgrade first. Logo-change webhooks are not on the free plan.
-- **For 62 company cards** a full check costs $1.24. Monthly fits the free plan; weekly ($5.33 a month) does not.
+- **The API call** is `GET https://api.logo.dev/v2/brands/logo?domain=<domain>` with `Authorization: Bearer <secret key>`. It returns a temporary download URL (valid about 24 hours), an `etag` that identifies the version, and the source image's dimensions and format. `size`, `format`, and `theme` go on the download URL. The download URL is itself on the CDN host, `img.logo.dev`, so the rule is about where a URL came from, not its host: save only from the URL the API returned.
+- **Cost.** Logo.dev's docs say 2 credits (2¢) a lookup, billed once per domain per 24 hours. The one call made reported `credits-charged: 1` in its response headers; the dashboard has not been read to see which is billed, so the figures here keep 2¢ as the upper bound. A 404 or a 202 is free, and so is the download itself. The free plan includes $5 of credit a month—about 250 lookups—and cannot buy more; it must upgrade first. Logo-change webhooks are not on the free plan.
+- **For 62 company cards** a full check costs at most $1.24. Monthly fits the free plan; weekly ($5.33 a month) does not.
 - **Conflicting copies of the docs exist.** Third-party summaries and an older copy of the docs say self-hosting needs a Pro or Enterprise plan. The current self-hosting and pricing pages say every plan. I am going by the current pages; I am not a lawyer, and a one-line email to Logo.dev would settle it.
 
 ### What the CDN returned
@@ -164,6 +164,34 @@ Tested November 17, 2026, with my publishable key against the image CDN. The sec
 | Unknown domain | Status 202 and a generated monogram; with `fallback=404`, status 404 |
 | `redirect=404` | Returned 404 for `alliantcreditunion.com` (which redirects to `.org`) and for `apc.com` |
 | Quality | One of 19 (`elanfinancialservices.com`) came back as an enlarged fragment of a logo |
+
+### What the API returned
+
+One lookup, for `americanexpress.com`, returned HTTP 200. Everything is nested under `data`, with a separate `metadata` object.
+
+| Field | Type | Value seen |
+|---|---|---|
+| `data.object`, `data.kind` | string | `image`, `logo` |
+| `data.brand_id` | string | `brand_` plus 26 characters |
+| `data.status` | string | `ready` |
+| `data.url` | string | The temporary download URL: `https://img.logo.dev/assets/<opaque token>`, with no query string |
+| `data.etag` | string | 64 hex characters |
+| `data.blurhash` | string | 36 characters |
+| `data.source.width`, `data.source.height` | integer | 200, 200 |
+| `data.source.format` | string | `jpg` |
+| `data.source.has_transparency`, `data.source.is_vector` | boolean | false, false |
+| `data.last_updated_at` | string, ISO 8601 with offset | 2024-08-28 |
+| `data.expires_at` | string, ISO 8601 UTC | About 24.4 hours after the call |
+| `metadata.request_id` | string | `request_` plus 26 characters |
+| `metadata.resolution` | object | `type` `domain`, `value` the domain, `method` `direct`, `context` empty |
+
+| Check | Result |
+|---|---|
+| The download URL as returned | 128×128 JPEG, 11 KB |
+| The download URL with `?size=800&format=png` | 800×800 PNG, no alpha channel, 187 KB |
+| Source image | 200×200 JPEG, so the 800×800 PNG is a four-times upscale; the quality gate in the [logo pipeline](#logo-pipeline) would hold this logo as "Needs a look" |
+| Credit | `credits-charged: 1` on the lookup; no charge header on either download |
+| Rate limit | `ratelimit-limit: 100`, `ratelimit-reset: 60`: 100 requests per 60 seconds |
 
 ### Where it returned the wrong company
 
@@ -219,7 +247,7 @@ Revised in v0.3 after the Logo.dev test.
 
 1. **Look up** the logo through the API by domain. A 404 means no logo: leave the card alone and report it. A 202 means the brand is still being indexed: retry after 30 seconds, for at most five minutes. A 402 means the month's credit is spent: stop the check and say so.
 2. **Gate on quality.** If the source image the API reports is a small raster—below 256 px on its short side, a threshold to tune—hold the logo as "Needs a look" instead of applying it.
-3. **Download** from the temporary URL at `size=800&format=png`. Never save an image from the CDN.
+3. **Download** from the temporary URL the API returned, adding `size=800&format=png`; without them it returns a 128×128 JPEG. That URL is on the CDN host, so the test is where the URL came from: never save an image from a URL built with the publishable key.
 4. **Normalize** only where needed:
    - Leave an opaque square tile as delivered. Most arrive finished, and shrinking them makes them worse.
    - Flatten a transparent logo onto white, or onto black when the mark itself is light.
@@ -405,7 +433,7 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
 ## Open questions
 
 - [x] **Legal/terms.** Does Logo.dev permit saving a logo into a contact card? Yes, through the secret-key API on any plan; not from the CDN. See [Logo.dev: what the test showed](#logodev-what-the-test-showed).
-- [ ] **Blocking—platform.** Call the secret-key logo endpoint once and confirm the response shape, the size of the source images, and the credit charge. Not yet run.
+- [x] **Blocking—platform.** Call the secret-key logo endpoint once and confirm the response shape, the size of the source images, and the credit charge. Run on November 17, 2026; see [What the API returned](#what-the-api-returned). The header reported 1 credit where the docs say 2; the dashboard has not been read.
 - [ ] **Blocking—platform.** Does one card with several sender numbers produce one conversation on current macOS and iOS, for SMS short codes specifically? The American Express card, with three, is the test.
 - [ ] **Platform.** Does writing `imageData` through `Contacts.framework` preserve the image as written, or does Contacts re-crop or recompress it?
 - [ ] **Product.** Should the label be `text alerts` for every sender, or should Sendermark label by purpose (verification, fraud, marketing)? Purpose labels are nicer and add a classification problem.

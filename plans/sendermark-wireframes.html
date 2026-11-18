@@ -29,7 +29,7 @@
   attribute names the icon; the build picks the nearest SF Symbol.
 
   Sources read for this document:
-    projects/sendermark/prds/sendermark.md (v0.3)—goals, trust model, logo pipeline,
+    projects/sendermark/prds/sendermark.md (v0.4)—goals, trust model, logo pipeline,
       sender discovery and attribution, contact write rules, requirements
   Structural template: friends-and-family-billing/plans/ffb-wireframes.html.
 
@@ -229,6 +229,7 @@
   .lg.s56.old{font-size:26px}
   .unk{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:var(--mute);color:#fff;flex:0 0 auto}
   .unk.s40{width:40px;height:40px}.unk.s40 svg.lucide{width:20px;height:20px}
+  .unk.s56{width:56px;height:56px}.unk.s56 svg.lucide{width:26px;height:26px}
   .unk.s18{width:18px;height:18px}.unk.s18 svg.lucide{width:10px;height:10px}
 
   /* review: queue + detail */
@@ -601,14 +602,14 @@ const coRow = ([k, s, n, last], i) => `<div class="tr co">${`<span class="row" s
 const coList = () => `<div class="colm"><div class="fchips"><span class="fc on">All <b>62</b></span><span class="fc">Current <b>49</b></span><span class="fc">Your photo <b>5</b></span><span class="fc">Needs a look <b>1</b></span><span class="fc">No logo found <b>4</b></span><span class="fc">Needs a domain <b>3</b>${an(1)}</span></div>
   <div class="tbl"><div class="tr co hd"><span>Company</span><span>Website</span><span>Logo</span><span>Numbers</span><span>Latest text</span></div>${CO.map(coRow).join('')}</div></div>`;
 const coTools = `<span class="sp"></span>${btn(`${ic('refresh-cw')} Check for new logos`)}<span class="search">${ic('search')}Search</span>`;
-const pair = (k, off = false) => `<div class="pair ${off ? 'off' : ''}"><div class="row"><span class="chk ${off ? '' : 'on'}">${off ? '' : ic('check')}</span><b class="sm ellip">${C[k].n}</b></div>
-  <div class="ba">${lg(k, 's56 old')}${ic('arrow-right')}${lg(k, 's56')}</div><div class="xs dim">${off ? 'Keeping your photo' : 'Your photo → new logo'}</div></div>`;
+const pair = (k, off = false, none = false) => `<div class="pair ${off ? 'off' : ''}"><div class="row"><span class="chk ${off ? '' : 'on'}">${off ? '' : ic('check')}</span><b class="sm ellip">${C[k].n}</b></div>
+  <div class="ba">${none ? unk('s56') : lg(k, 's56 old')}${ic('arrow-right')}${lg(k, 's56')}</div><div class="xs dim">${off ? 'Keeping your photo' : none ? 'No photo → new logo' : 'Your photo → new logo'}</div></div>`;
 function companies(state) {
   let after = '';
-  if (state === 'adopt') after = `<div class="modal"><div class="sheet"><h2>36 cards already have a photo${an(4)}</h2>
-    <div class="sm dim" style="margin-top:4px">Sendermark won’t replace a photo you chose without asking. Uncheck any you want to keep. The 18 company cards with no photo get a logo either way.</div>
-    <div class="pairs">${['amex', 'chase', 'vg', 'apple'].map(k => pair(k)).join('')}${pair('apc', true)}${['affirm', 'amazon', 'partiful'].map(k => pair(k)).join('')}</div>
-    <div class="row"><span class="sm dim">Showing 8 of 36 · 5 unchecked</span><span class="sp"></span>${btn('Keep all of mine')}${btn('Replace 31 photos', 'pri')}</div></div></div>`;
+  if (state === 'adopt') after = `<div class="modal"><div class="sheet"><h2>54 cards are about to get their first logo${an(4)}</h2>
+    <div class="sm dim" style="margin-top:4px">36 already have a photo and 18 have none. Each new logo shown is the exact image that will be saved. Sendermark adds no first logo, and replaces no photo you chose, without your approval. Uncheck any card to leave it as it is.</div>
+    <div class="pairs">${['amex', 'chase', 'vg', 'apple'].map(k => pair(k)).join('')}${pair('apc', true)}${['affirm', 'amazon'].map(k => pair(k)).join('')}${pair('partiful', false, true)}</div>
+    <div class="row"><span class="sm dim">Showing 8 of 54 · 5 unchecked</span><span class="sp"></span>${btn('Leave all as they are')}${btn('Approve 49 logos', 'pri')}</div></div></div>`;
   return shell('companies', 'Companies', coTools, coList(), { after });
 }
 
@@ -783,11 +784,11 @@ const GROUPS = [
       `<b>Filters partition the list</b> (49 + 5 + 1 + 4 + 3 = 62). The four that are not “Current” are the only ones that need attention. ${prd('Success metrics')}`,
       `<b>Your photo</b>: a card whose photo you set yourself. Sendermark leaves it alone; the row shows your photo, not the logo. ${prd('Logo pipeline')}`,
       `<b>Needs a domain</b>: the name alone is ambiguous. One click opens the company page with candidates. ${prd('Company resolution')}`,
-      `<b>First-run sheet.</b> Cards that already have a photo are shown before and after; you approve in bulk and uncheck the ones to keep. Cards with no photo are not listed—they have nothing to lose. ${prd('Logo pipeline')}`,
+      `<b>First-logo sheet.</b> Every card about to get its first logo is listed, before and after: cards that already have a photo, cards with none, and cards Sendermark creates. You approve in bulk and uncheck the ones to leave alone. The logo shown is the exact normalized image that will be saved, fetched through the Logo.dev API, not a CDN preview, and the approval is tied to that image; if it changes before it is written, the card comes back to the sheet. ${prd('Logo pipeline')}`,
       `<b>Needs a look</b>: Logo.dev returned a logo, but its source image is too small to trust, so it is not applied until you have seen it. In the Logo.dev test for this document, one of 19 real domains came back as an enlarged fragment of a logo. ${prd('Logo pipeline')}`],
       states: [
         { id: 'default', label: 'list', kind: 'proposed', cap: 'Twelve of 62 company cards. Each row: logo and name, website, logo status, how many numbers are on the card, and the latest text. Filter chips above carry counts.' },
-        { id: 'adopt', label: 'first run · replace photos', kind: 'state', dark: 'The sheet is lighter than the window behind it and carries a hairline edge, since a shadow alone disappears on a dark window.', cap: 'The sheet shown once, after the first scan. Eight of the 36 cards that already have a photo, each as before → after; A.P.C. is unchecked and keeps its photo. The button counts what will be replaced.' }] },
+        { id: 'adopt', label: 'first logos · approve', kind: 'state', dark: 'The sheet is lighter than the window behind it and carries a hairline edge, since a shadow alone disappears on a dark window.', cap: 'The sheet shown after the first scan, and again whenever a card is about to get its first logo. Eight of the 54 cards, each as before → after: seven that already have a photo and one, Partiful, that has none. A.P.C. is unchecked and keeps its photo. The button counts what will be approved.' }] },
     { id: 'company', canvas: 'win', title: 'Company page', fn: company, legend: [
       `<b>Both crops, always together</b>: the rounded square Messages uses for a company and the circle the Contacts list uses. A logo is right only when it reads in both.`,
       `<b>The canvas</b> shows the crop guides on the square image as stored: the circle Contacts cuts, and the square inside it that no crop can touch. Logo.dev’s logos arrive as finished square tiles, most with their own margin, so Sendermark leaves them alone unless the mark touches the edge. ${prd('Logo pipeline')}`,
@@ -823,7 +824,7 @@ const GROUPS = [
     { id: 'setup', canvas: 'win', title: 'Set up Sendermark', fn: setup, legend: [
       `<b>Full Disk Access is the largest ask</b>, so its step says what is read, what is never done, and that message text stays on the Mac. ${prd('Risks')}`,
       `<b>The backup is a step, not a background task.</b> The first changing run refuses to start without it. ${prd('Requirements P0')}`,
-      `<b>The button names the action.</b> The first look is a scan that writes nothing; the result is the Companies list and the first-run sheet. ${prd('User flow')}`],
+      `<b>The button names the action.</b> The first look is a scan that writes nothing; the result is the Companies list and the first-logo sheet. ${prd('User flow')}`],
       states: [
         { id: 'default', label: 'step 2 of 4', kind: 'proposed', cap: 'Contacts access is granted. Full Disk Access is the current step, with its explanation and the button that opens System Settings. Later steps are listed and disabled.' },
         { id: 'ready', label: 'all steps done', kind: 'state', cap: 'Four ticks. The main button is enabled and the line under it repeats that the first look changes nothing.' }] }] },
@@ -862,7 +863,7 @@ const OPEN = [
   ['Q-04', 'What does the “joins an existing conversation” line say if the Phase 0 merge check fails on iOS but passes on the Mac?', 'The preview would have to show two devices, or drop the claim.'],
   ['Q-05', 'How is a logo change announced when the new logo is plainly worse than the old one?', 'Today it is silent with an Undo. A “hold new logos for a week” setting is the alternative.'],
   ['Q-06', 'What does “Needs a look” offer when the logo really is bad?', 'Keep the card without a photo, use my own, or report the logo to Logo.dev. The company page needs a state for it.'],
-  ['Q-07', 'Should a logo that Logo.dev returns for the right domain but the wrong brand be catchable?', 'In the test one domain returned what looks like another company’s mark. Only a person can see that; the first-run sheet is the one place it gets looked at.'],
+  ['Q-07', 'Should a logo that Logo.dev returns for the right domain but the wrong brand be catchable?', 'In the test one domain returned what looks like another company’s mark. Only a person can see that; the first-logo sheet is the one place it gets looked at.'],
 ];
 
 // ---------------------------------------------------------------------------

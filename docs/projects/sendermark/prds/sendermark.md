@@ -10,7 +10,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/sendermark/prds/sendermark.md
-source_ref: 59fcf3e5a36ffb148d9a59a3d4924ad3dc793c42
+source_ref: 6a56f25378eebae928fc1970cf3ae183aa0efbc5
 project: sendermark
 document_class: prd
 document_slug: sendermark
@@ -19,7 +19,7 @@ sync_direction: central-to-repo
 
 # Sendermark—Product Requirements Document
 
-Version: v0.3
+Version: v0.4
 Author: Nathan Payne
 Status: Draft
 Last updated: November 17, 2026
@@ -34,6 +34,8 @@ Favicon: s|
 **Name (2026-11-17):** renamed from the working title Callsign in v0.2. `callsign.app` has been registered since 2018, and Callsign Inc ships an authentication app under that name—too close to a tool that decides which senders to trust. I registered `sendermark.app` on November 17, 2026, and found no conflicting trademark or App Store listing for the name.
 
 **Interface:** wireframes for the Mac app, in light and dark appearance, are in [sendermark-wireframes.html](sendermark-wireframes.html), in this folder.
+
+**Safety review (v0.4, 2026-11-17):** the write, snapshot, first-logo, sender-identity and privacy contracts were tightened after a review of this document and its tickets. Messages is read from a consistent snapshot; every first logo is approved against the exact image saved; senders are matched on canonical handles; approvals are rechecked when applied; undo reverts Sendermark's changes without overwriting later edits and survives a crash; reply routing is treated as unproven; and local files have a stated privacy lifecycle.
 
 **Logo.dev (2026-11-17):** tested with my publishable key, then with one call to the secret-key API, and the download question is answered—see [Logo.dev: what the test showed](#logodev-what-the-test-showed). Logos saved to a card must come from the secret-key API, not the image CDN. That changes the logo pipeline, the schedule, and the cost.
 
@@ -114,7 +116,7 @@ These are recommendations, recorded so they can be challenged.
 
 1. **Mac only, native Swift.** `Contacts.framework` is the only supported path that writes contact images and syncs them properly, and the Messages database exists in readable form only on the Mac. A web stack or a script driving Contacts through AppleScript would be slower to build correctly, not faster.
 2. **My own Messages history is the source of truth for senders—not a registry.** The U.S. Short Code Registry has a web lookup but, as far as I can find, no public API, and it does not cover toll-free or ten-digit senders at all. The numbers that matter are, by definition, the ones that have texted me. Outside sources corroborate; they do not attribute (decision 8).
-3. **A card's first logo is reviewed once; numbers require approval every time.** The original ask was for both to be automatic. A wrong logo is cosmetic and reversible, so it gets one review: the first logo on any card—one that has a photo, one that has none, or one Sendermark creates—is approved against the exact image that will be saved. Whether a later change to an approved logo applies without review is an open question. A wrong number is not: attaching a scammer's number to the Chase card gives every future text from it the Chase name, the Chase logo, a place in the trusted Chase conversation, and—with Screen Unknown Senders on—a promotion from the Unknown Senders folder to the main inbox with notifications. Sendermark automates discovery and evidence; I make the call.
+3. **A card's first logo is reviewed once; numbers require approval every time (revised in v0.4).** The original ask was for both to be automatic. A wrong logo is cosmetic and reversible, so it gets one review: the first logo on any card—one that has a photo, one that has none, or one Sendermark creates—is approved against the exact image that will be saved. Whether a later change to an approved logo applies without review is an open question. A wrong number is not: attaching a scammer's number to the Chase card gives every future text from it the Chase name, the Chase logo, a place in the trusted Chase conversation, and—with Screen Unknown Senders on—a promotion from the Unknown Senders folder to the main inbox with notifications. Sendermark automates discovery and evidence; I make the call.
 4. **Square mark, not lockup.** One treatment for every card. Wordmarks are illegible at avatar size.
 5. **Deterministic attribution first; no message text leaves the Mac in v1.** Business texts contain verification codes, balances, and account suffixes. Sender prefixes and link domains attribute most senders without a model. An LLM pass is P1 and off by default. Redacting digit runs does not remove names, email addresses, link tokens, or every code, so the pass stays off until an outgoing-data policy says exactly what may leave the Mac.
 6. **Start as a CLI; add the Mac app second.** The risky parts are platform behavior, not interface. The CLI proves them in days. Scheduled, unattended runs wait for the app bundle, because macOS privacy permissions for a bare binary launched by `launchd` are awkward. The app is designed now so that the CLI's `review` output follows the same order as the app's review screen (see [Interface](#interface)).
@@ -243,7 +245,7 @@ Likely duplicates ("Chase" and "Chase Bank" resolving to one domain) are reporte
 
 ## Logo pipeline
 
-Revised in v0.3 after the Logo.dev test.
+Revised in v0.3 after the Logo.dev test, and in v0.4 so that every first logo is reviewed against the exact image saved.
 
 1. **Look up** the logo through the API by domain. A 404 means no logo: leave the card alone and report it. A 202 means the brand is still being indexed: retry after 30 seconds, for at most five minutes. A 402 means the month's credit is spent: stop the check and say so.
 2. **Gate on quality.** If the source image the API reports is a small raster—below 256 px on its short side, a threshold to tune—hold the logo as "Needs a look" instead of applying it.

@@ -310,7 +310,12 @@
   .sheet{background:var(--raise);border-radius:14px;box-shadow:0 24px 60px rgba(0,0,0,.3);width:780px;padding:20px 22px 16px}
   .sheet.narrow{width:460px}
   .sheet h2{font-size:16px;font-weight:600;letter-spacing:-.01em}
-  .pairs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0}
+  .pairs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0 0}
+  .pscroll{position:relative;padding-right:14px;margin-bottom:12px}
+  .pscroll .sbar{position:absolute;right:2px;top:14px;bottom:30px;width:6px;border-radius:3px;background:var(--field)}
+  .pscroll .sbar i{position:absolute;left:0;right:0;top:0;height:15%;border-radius:3px;background:var(--mute)}
+  .pscroll .more{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:10px;padding:5px 0;border-top:.5px dashed var(--mute);font-size:11.5px;color:var(--mute)}
+  .rwarn{display:flex;gap:6px;align-items:flex-start;margin-top:8px;font-size:11.5px;line-height:1.4;color:var(--tf-ink)}.rwarn svg.lucide{margin-top:1px;flex:0 0 auto}
   .pair{border:1px solid var(--hair);border-radius:10px;padding:9px;display:flex;flex-direction:column;gap:8px;min-width:0}
   .pair .row{min-width:0}
   .pair .ba{display:flex;align-items:center;justify-content:center;gap:8px;color:var(--outline)}
@@ -515,9 +520,9 @@ const queue = on => `<div class="queue"><div class="qsec">Ready to approve · 3$
 const evRow = (k, v, w) => `<div class="r"><span class="k">${k}</span><span>${v}</span>${w}</div>`;
 const head = (q, meta) => `<div><div class="row" style="gap:12px"><span class="hnd mono">${q.h}</span>${tier(q.t)}</div><div class="sm dim" style="margin-top:6px">${meta}</div></div>`;
 const samples = (a, b) => `<div><div class="h2">From the messages${an(5)}</div><div class="bub">${a}</div><div class="bub">${b}</div><div class="xs dim">Runs of four or more digits are hidden.</div></div>`;
-const preview = (h, k, note) => `<div><div class="h2">In Messages after you approve${an(6)}</div>
+const preview = (h, k, note, joins = false) => `<div><div class="h2">In Messages after you approve${an(6)}</div>
   <div class="mrow">${unk()}<div class="t"><div class="n mono">${h}</div><div class="xs dim ellip">How it looks today</div></div></div>
-  <div class="mrow new">${lg(k)}<div class="t"><div class="n ellip">${C[k].n}</div><div class="xs dim ellip">${note}</div></div></div></div>`;
+  <div class="mrow new">${lg(k)}<div class="t"><div class="n ellip">${C[k].n}</div><div class="xs dim ellip">${note}</div></div></div>${joins ? `<div class="rwarn">${ic('triangle-alert')}<span>A reply in this conversation may go to any of the card’s numbers. Messages does not show which.</span></div>` : ''}</div>`;
 const tools = sel => `<span class="sp"></span>${btn(`Approve both short codes ${an(7)}`)}<span class="search">${ic('search')}Search</span>`;
 
 function review(state) {
@@ -539,7 +544,7 @@ function review(state) {
         ${evRow('Registry', `${btn(`${ic('external-link')} Look up 48621 in the Short Code Registry`, 'quiet')}`, wt(0, 'Not checked'))}
       </div></div>
       <div class="two">${samples(`Chase: You used the card ending ${rx()} for $84.20 at Alamo Drafthouse. Not you? Visit chase.com`, `Chase: Your one-time code is ${rx(44)}. We’ll never call or text to ask for it.`)}
-      ${preview('486-21', 'chase', 'Joins the 2 Chase numbers already on the card')}</div>`;
+      ${preview('486-21', 'chase', 'Joins the 2 Chase numbers already on the card', true)}</div>`;
     bar = acts(btn(`Add to Chase’s card ${kbd('A')}`, 'pri'));
   } else if (state === 'tollfree') {
     d = head(q, 'First text October 12, 2026 · latest November 15 · 6 texts over 34 days') +
@@ -552,12 +557,12 @@ function review(state) {
         ${evRow('Phone lookup', `Toll-free line · caller name “VANGUARD” (business)${an(9)}`, wt(2, 'Supports'))}
       </div></div>
       <div class="two">${samples(`Vanguard Msg: Your statement for the account ending in ${rx()} is ready. View it at vanguard.com`, `Vanguard Msg: Your contact details were changed. If this wasn’t you, call us.`)}
-      ${preview('+1 (833) 555-0142', 'vg', 'Joins the Vanguard number already on the card')}</div>`;
-    bar = acts(btn(`Add to Vanguard’s card ${kbd('A')}`, 'pri'));
+      ${preview('+1 (833) 555-0142', 'vg', 'Joins the Vanguard number already on the card', true)}</div>`;
+    bar = acts(btn('Add to Vanguard’s card', 'pri'));
   } else if (state === 'newcard') {
     d = head(q, 'First text August 2, 2026 · latest November 14 · 12 texts') +
       `<div class="ban info">${ic('plus')}<div><b>You have no card for UPS.</b> Approving creates one with the details below and nothing else.</div></div>
-      <div class="newcard">${lg('ups', 's56')}<dl><dt>Name</dt><dd><b>UPS</b> · company card</dd><dt>Website</dt><dd>ups.com${an(10)}</dd><dt>text alerts</dt><dd class="mono">772310</dd><dt>Photo</dt><dd>Logo from Logo.dev, fetched when you approve</dd></dl></div>
+      <div class="newcard">${lg('ups', 's56')}<dl><dt>Name</dt><dd><b>UPS</b> · company card</dd><dt>Website</dt><dd>ups.com${an(10)}</dd><dt>text alerts</dt><dd class="mono">772310</dd><dt>Photo</dt><dd>The logo shown, exactly as it will be saved</dd></dl></div>
       <div><div class="h2">Why Sendermark thinks so</div><div class="ev">
         ${evRow('Links', '<b>ups.com</b> in 12 of 12 texts', wt(3, 'Strong'))}
         ${evRow('Opening words', '“UPS:” in 12 of 12 texts', wt(3, 'Strong'))}
@@ -607,9 +612,10 @@ const pair = (k, off = false, none = false) => `<div class="pair ${off ? 'off' :
 function companies(state) {
   let after = '';
   if (state === 'adopt') after = `<div class="modal"><div class="sheet"><h2>54 cards are about to get their first logo${an(4)}</h2>
-    <div class="sm dim" style="margin-top:4px">36 already have a photo and 18 have none. Each new logo shown is the exact image that will be saved. Sendermark adds no first logo, and replaces no photo you chose, without your approval. Uncheck any card to leave it as it is.</div>
-    <div class="pairs">${['amex', 'chase', 'vg', 'apple'].map(k => pair(k)).join('')}${pair('apc', true)}${['affirm', 'amazon'].map(k => pair(k)).join('')}${pair('partiful', false, true)}</div>
-    <div class="row"><span class="sm dim">Showing 8 of 54 · 5 unchecked</span><span class="sp"></span>${btn('Leave all as they are')}${btn('Approve 49 logos', 'pri')}</div></div></div>`;
+    <div class="sm dim" style="margin-top:4px">36 already have a photo and 18 have none. Each new logo is the exact image that will be saved. A logo can be approved only after it has been shown here, so scroll through them; the button counts the ones shown so far. Uncheck any card to leave it as it is.</div>
+    <div class="pscroll"><div class="pairs">${['amex', 'chase', 'vg', 'apple'].map(k => pair(k)).join('')}${pair('apc', true)}${['affirm', 'amazon'].map(k => pair(k)).join('')}${pair('partiful', false, true)}</div>
+      <div class="more">${ic('chevron-down')}46 more below · scroll, or press Space for the next eight</div><div class="sbar"><i></i></div></div>
+    <div class="row"><span class="sm dim"><b>8 of 54 shown</b> · 46 still to view · 1 unchecked</span><span class="sp"></span>${btn('Leave all as they are')}${btn('Approve the 7 shown', 'pri')}</div></div></div>`;
   return shell('companies', 'Companies', coTools, coList(), { after });
 }
 
@@ -765,16 +771,16 @@ const GROUPS = [
       `<b>Where it goes</b>: the proposed company, its website, and how many numbers the card already has. “Open card” goes to the company’s page.`,
       `<b>Evidence before the button.</b> Each row is one signal from the PRD, in plain words, with its strength as bars and a word. The registry row is a link that opens the official lookup in the browser; Sendermark does not query it. ${prd('Sender discovery and attribution')}`,
       `<b>Two sample texts</b> with every run of four or more digits hidden, so a code or card number never sits on screen. ${prd('Requirements P0')}`,
-      `<b>The result, before you commit</b>: the bare number as Messages shows it today, and the row it becomes. The line under the name says whether it joins an existing conversation—this depends on the merge check in Phase 0 and is removed if that check fails. ${prd('Build plan')}`,
+      `<b>The result, before you commit</b>: the bare number as Messages shows it today, and the row it becomes. The line under the name says whether it joins an existing conversation; the merge check in Phase 0 passed on the Mac and the iPhone. When the number joins a card that already has another sender, a warning says a reply may go to any of the card’s numbers. The warning stays until the Phase 0 reply-routing test shows where a reply goes. ${prd('How the platform behaves')}`,
       `<b>Batch approval covers short codes only.</b> The button counts them and never includes a toll-free or ten-digit number. ${prd('Trust model')}`,
-      `<b>Toll-free and ten-digit numbers carry a warning</b> and are approved one at a time. The primary button is the same; the warning and the missing batch are the difference.`,
+      `<b>Toll-free and ten-digit numbers carry a warning</b> and are approved one at a time. The primary button has no <b>A</b> shortcut, so it takes a deliberate click; the warning, the missing batch and the missing shortcut are the difference.`,
       `<b>Phone lookup</b> appears only when Twilio Lookup is turned on in Settings. It is supporting evidence and never enough alone. ${prd('Requirements P1')}`,
-      `<b>A new card shows exactly what will be created</b>: name, website, one number labeled <code>text alerts</code>, the logo. The website comes from the links in the texts, so it needs no separate confirmation here. ${prd('Contact write rules')}`,
+      `<b>A new card shows exactly what will be created</b>: name, website, one number labeled <code>text alerts</code>, and the logo, which is the exact image that will be saved, already fetched; nothing is fetched after you approve. The website comes from the links in the texts, so it needs no separate confirmation here. ${prd('Contact write rules')}`,
       `<b>A shared sender</b> is a decision, not an error: mark it once and it never returns to the queue. The escape hatch exists but is not the primary button.`,
       `<b>A suspicious sender has no “add” button.</b> The primary action keeps it off every card. Overriding takes a second step that names the company.`],
       states: [
         { id: 'default', label: 'short code · existing card', kind: 'proposed', dark: 'The window drops to near-black and the action bar, buttons and destination card sit one step lighter. Sender-type pills swap pale tints for deep ones and keep their icons. The logo keeps its own tile.', cap: 'A short code with strong evidence for a company you already have. Queue on the left, the selected sender on the right: number and type, destination card, evidence, two sample texts, the Messages result, then the actions with their keys.' },
-        { id: 'tollfree', label: 'toll-free number', kind: 'state', cap: 'The amber warning sits above the destination. Evidence adds the history rule (at least three texts over seven days) and, with Twilio Lookup on, the line type and caller name. Batch approval in the toolbar still counts only the two short codes.' },
+        { id: 'tollfree', label: 'toll-free number', kind: 'state', cap: 'The amber warning sits above the destination. Evidence adds the history rule (at least three texts over seven days) and, with Twilio Lookup on, the line type and caller name. Batch approval in the toolbar still counts only the two short codes, and the primary button carries no A shortcut.' },
         { id: 'newcard', label: 'creates a card', kind: 'state', cap: 'No UPS card exists. The destination row is replaced by a preview of the card to be created, field by field. The primary button says what it does.' },
         { id: 'shared', label: 'shared sender', kind: 'state', cap: 'A number whose texts name three companies. The detail lists them with counts instead of proposing one. The primary action marks it shared; Messages keeps showing the bare number.' },
         { id: 'suspicious', label: 'held back', kind: 'state', dark: 'The warning stays red on a deep red ground; conflict bars use the lighter red so they read against the dark table.', cap: 'A ten-digit number that names Chase but links elsewhere. The evidence table lists conflicts in red. The primary action is to keep it off every card; nothing here deletes or blocks the message.' },
@@ -784,11 +790,11 @@ const GROUPS = [
       `<b>Filters partition the list</b> (49 + 5 + 1 + 4 + 3 = 62). The four that are not “Current” are the only ones that need attention. ${prd('Success metrics')}`,
       `<b>Your photo</b>: a card whose photo you set yourself. Sendermark leaves it alone; the row shows your photo, not the logo. ${prd('Logo pipeline')}`,
       `<b>Needs a domain</b>: the name alone is ambiguous. One click opens the company page with candidates. ${prd('Company resolution')}`,
-      `<b>First-logo sheet.</b> Every card about to get its first logo is listed, before and after: cards that already have a photo, cards with none, and cards Sendermark creates. You approve in bulk and uncheck the ones to leave alone. The logo shown is the exact normalized image that will be saved, fetched through the Logo.dev API, not a CDN preview, and the approval is tied to that image; if it changes before it is written, the card comes back to the sheet. ${prd('Logo pipeline')}`,
+      `<b>First-logo sheet.</b> Every card about to get its first logo is listed, before and after: cards that already have a photo, cards with none, and cards Sendermark creates. You approve in bulk and uncheck the ones to leave alone. The logo shown is the exact normalized image that will be saved, fetched through the Logo.dev API, not a CDN preview, and the approval is tied to that image. A logo can be approved only after it has been shown: the sheet scrolls, counts how many have been shown and how many remain, and its button approves only the shown, checked cards. Being shown is a record that the image was on screen, not proof it was looked at. If an image changes after it was shown or approved, the card loses both and comes back to the sheet. ${prd('Logo pipeline')}`,
       `<b>Needs a look</b>: Logo.dev returned a logo, but its source image is too small to trust, so it is not applied until you have seen it. In the Logo.dev test for this document, one of 19 real domains came back as an enlarged fragment of a logo. ${prd('Logo pipeline')}`],
       states: [
         { id: 'default', label: 'list', kind: 'proposed', cap: 'Twelve of 62 company cards. Each row: logo and name, website, logo status, how many numbers are on the card, and the latest text. Filter chips above carry counts.' },
-        { id: 'adopt', label: 'first logos · approve', kind: 'state', dark: 'The sheet is lighter than the window behind it and carries a hairline edge, since a shadow alone disappears on a dark window.', cap: 'The sheet shown after the first scan, and again whenever a card is about to get its first logo. Eight of the 54 cards, each as before → after: seven that already have a photo and one, Partiful, that has none. A.P.C. is unchecked and keeps its photo. The button counts what will be approved.' }] },
+        { id: 'adopt', label: 'first logos · approve', kind: 'state', dark: 'The sheet is lighter than the window behind it and carries a hairline edge, since a shadow alone disappears on a dark window.', cap: 'The sheet shown after the first scan, and again whenever a card is about to get its first logo. Eight of the 54 cards, each as before → after: seven that already have a photo and one, Partiful, that has none. A.P.C. is unchecked and keeps its photo. The footer counts 8 shown and 46 still to view, a scroll bar and a “46 more below” row mark the rest, and the button approves only the 7 shown and checked.' }] },
     { id: 'company', canvas: 'win', title: 'Company page', fn: company, legend: [
       `<b>Both crops, always together</b>: the rounded square Messages uses for a company and the circle the Contacts list uses. A logo is right only when it reads in both.`,
       `<b>The canvas</b> shows the crop guides on the square image as stored: the circle Contacts cuts, and the square inside it that no crop can touch. Logo.dev’s logos arrive as finished square tiles, most with their own margin, so Sendermark leaves them alone unless the mark touches the edge. ${prd('Logo pipeline')}`,
@@ -851,7 +857,7 @@ const DEC = [
   ['D-05', 'Company page', 'A logo is always shown in both crops, with the crop guides drawn on the stored square.', 'One of the hand-made cards has a wordmark that runs past the edge of its crop. Showing both crops is the check.', 'Logo pipeline'],
   ['D-06', 'Activity', 'There is no separate “undo” mode. Every recorded change carries its own Undo, and so does every run.', 'The journal already holds the before-state. One list serves as history and as the way back.', 'Contact write rules'],
   ['D-07', 'Menu bar', 'No notifications. A dot on the menu-bar icon is the only signal, and only when senders are waiting.', 'A weekly utility that interrupts is one you turn off. Logos update silently and are reported after the fact.', 'Product goals'],
-  ['D-08', 'Review', 'Every review action has a single-key shortcut, shown on the button.', 'The goal is five minutes a week. Four proposals should take four keystrokes when the evidence is clean.', 'Product goals'],
+  ['D-08', 'Review', 'Every review action has a single-key shortcut, shown on the button, except approving a toll-free or ten-digit number (D-04).', 'The goal is five minutes a week. Four proposals should take four keystrokes when the evidence is clean.', 'Product goals'],
   ['D-09', 'Companies', 'A logo whose source image is too small is held as “Needs a look” instead of being applied.', 'The Logo.dev test returned one enlarged fragment in 19 domains. Automatic is right for good logos and wrong for that one.', 'Logo pipeline'],
   ['D-10', 'Settings, Activity', 'Senders are scanned weekly; logos are checked monthly.', 'Logos saved to a card must come from Logo.dev’s paid API, about 2¢ a company a check. Monthly keeps 62 companies inside the free credit; scanning Messages costs nothing.', 'Logo pipeline'],
   ['D-11', 'All', 'In dark appearance a logo keeps its own tile, white included.', 'Recolouring a logo to suit the window would change the brand. Contact photos behave the same way in Messages.', 'Logo pipeline'],

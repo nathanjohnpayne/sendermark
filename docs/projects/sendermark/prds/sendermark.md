@@ -10,7 +10,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/sendermark/prds/sendermark.md
-source_ref: 6a56f25378eebae928fc1970cf3ae183aa0efbc5
+source_ref: 9efce13699f5dde4138743694668808380ca7e09
 project: sendermark
 document_class: prd
 document_slug: sendermark
@@ -35,7 +35,7 @@ Favicon: s|
 
 **Interface:** wireframes for the Mac app, in light and dark appearance, are in [sendermark-wireframes.html](sendermark-wireframes.html), in this folder.
 
-**Safety review (v0.4, 2026-11-17):** the write, snapshot, first-logo, sender-identity and privacy contracts were tightened after a review of this document and its tickets. Messages is read from a consistent snapshot; every first logo is approved against the exact image saved; senders are matched on canonical handles; approvals are rechecked when applied; undo reverts Sendermark's changes without overwriting later edits and survives a crash; reply routing is treated as unproven; and local files have a stated privacy lifecycle.
+**Safety review (v0.4, 2026-11-17):** the write, snapshot, first-logo, sender-identity and privacy contracts were tightened after a review of this document and its tickets. Messages is read from a consistent snapshot; every first logo is approved against the exact image saved; senders are matched on canonical handles; approvals are rechecked when applied; undo reverts Sendermark's changes without overwriting later edits, survives a crash, and has no expiry; one writer runs at a time; reply routing is treated as unproven; and local files have a stated privacy lifecycle.
 
 **Logo.dev (2026-11-17):** tested with my publishable key, then with one call to the secret-key API, and the download question is answered—see [Logo.dev: what the test showed](#logodev-what-the-test-showed). Logos saved to a card must come from the secret-key API, not the image CDN. That changes the logo pipeline, the schedule, and the cost.
 
@@ -70,7 +70,7 @@ Favicon: s|
 
 A Mac utility that does two jobs against the system Contacts database:
 
-1. **Logos.** Finds every company card, resolves it to a domain, fetches the current logo from Logo.dev, normalizes it for how Contacts and Messages crop avatars, and writes it to the card. Reruns on a schedule and replaces a logo only when the source has changed.
+1. **Logos.** Finds every company card, resolves it to a domain, fetches the current logo from Logo.dev, normalizes it for how Contacts and Messages crop avatars, and writes it to the card. Reruns on a schedule and offers a new logo only when the source has changed.
 2. **Senders.** Reads my own Messages history, finds the short codes, toll-free numbers, and long codes that businesses text from, attributes each to a company, and proposes adding it to that company's card—creating the card if none exists.
 
 iCloud carries the result to the iPhone, iPad, and Watch. There is no iOS app.
@@ -116,7 +116,7 @@ These are recommendations, recorded so they can be challenged.
 
 1. **Mac only, native Swift.** `Contacts.framework` is the only supported path that writes contact images and syncs them properly, and the Messages database exists in readable form only on the Mac. A web stack or a script driving Contacts through AppleScript would be slower to build correctly, not faster.
 2. **My own Messages history is the source of truth for senders—not a registry.** The U.S. Short Code Registry has a web lookup but, as far as I can find, no public API, and it does not cover toll-free or ten-digit senders at all. The numbers that matter are, by definition, the ones that have texted me. Outside sources corroborate; they do not attribute (decision 8).
-3. **A card's first logo is reviewed once; numbers require approval every time (revised in v0.4).** The original ask was for both to be automatic. A wrong logo is cosmetic and reversible, so it gets one review: the first logo on any card—one that has a photo, one that has none, or one Sendermark creates—is approved against the exact image that will be saved. Whether a later change to an approved logo applies without review is an open question. A wrong number is not: attaching a scammer's number to the Chase card gives every future text from it the Chase name, the Chase logo, a place in the trusted Chase conversation, and—with Screen Unknown Senders on—a promotion from the Unknown Senders folder to the main inbox with notifications. Sendermark automates discovery and evidence; I make the call.
+3. **A card's first logo is reviewed once; numbers require approval every time (revised in v0.4).** The original ask was for both to be automatic. A wrong logo is cosmetic and reversible, so it gets one review: the first logo on any card—one that has a photo, one that has none, or one Sendermark creates—is approved against the exact image that will be saved. Until I decide otherwise, a later change to an approved logo is held for the same review. A wrong number is not: attaching a scammer's number to the Chase card gives every future text from it the Chase name, the Chase logo, a place in the trusted Chase conversation, and—with Screen Unknown Senders on—a promotion from the Unknown Senders folder to the main inbox with notifications. Sendermark automates discovery and evidence; I make the call.
 4. **Square mark, not lockup.** One treatment for every card. Wordmarks are illegible at avatar size.
 5. **Deterministic attribution first; no message text leaves the Mac in v1.** Business texts contain verification codes, balances, and account suffixes. Sender prefixes and link domains attribute most senders without a model. An LLM pass is P1 and off by default. Redacting digit runs does not remove names, email addresses, link tokens, or every code, so the pass stays off until an outgoing-data policy says exactly what may leave the Mac.
 6. **Start as a CLI; add the Mac app second.** The risky parts are platform behavior, not interface. The CLI proves them in days. Scheduled, unattended runs wait for the app bundle, because macOS privacy permissions for a bare binary launched by `launchd` are awkward. The app is designed now so that the CLI's `review` output follows the same order as the app's review screen (see [Interface](#interface)).
@@ -225,7 +225,7 @@ Three conclusions follow. Lookup by name cannot choose a logo. A correct domain 
 3. **Apply logos.** `sendermark logos --apply` writes normalized logos to resolved cards. A card's first logo needs my approval on the contact sheet; a summary lists what changed.
 4. **Review senders.** `sendermark review` walks the proposal queue. Each proposal shows the handle, its type, the proposed company, message count, first and last seen, two redacted sample messages, and the evidence. Short-code proposals include a link to the official registry lookup. Keys: approve, reject, reassign, skip, mark as shared sender.
 5. **Apply senders.** Approved proposals are written to cards; new cards are created where needed.
-6. **Maintain.** A weekly run looks for new senders and signals only if proposals are waiting. A monthly run checks every company's logo and replaces the ones that changed.
+6. **Maintain.** A weekly run looks for new senders and signals only if proposals are waiting. A monthly run checks every company's logo and holds the ones that changed for my review.
 
 ## Company resolution
 
@@ -253,24 +253,24 @@ Revised in v0.3 after the Logo.dev test, and in v0.4 so that every first logo is
 4. **Normalize** only where needed:
    - Leave an opaque square tile as delivered. Most arrive finished, and shrinking them makes them worse.
    - Flatten a transparent logo onto white, or onto black when the mark itself is light.
-   - Add padding only when the mark touches the edge of the canvas, so that the circle crop Contacts uses cannot clip it. A square survives a circle crop at 1/√2 (about 70.7 percent) of the diameter.
+   - Add padding when any part of the mark falls outside the circular safe area—the circle inscribed in the canvas, which is what Contacts shows, less a margin. Touching the edge is not the test: a mark near a corner is clipped without touching either edge. A square survives a circle crop at 1/√2 (about 70.7 percent) of the diameter.
    - Re-encode until the file is under 200 KB, leaving margin below iCloud's 224 KB limit.
 5. **Compare.** Store the `etag`. On later checks, an unchanged `etag` means no download and no write.
 6. **Respect manual photos.** If the card's current photo does not match the hash Sendermark last wrote, I changed it. Skip the card, flag it once, and offer `--take-over` for that card.
-7. **Review every first logo.** No card receives its first Sendermark logo without my approval, whether it already has a photo, has none, or was just created. A before-and-after contact sheet shows the exact normalized image that will be saved, fetched through the API, and I approve in bulk or per card. Each approval is bound to that image's hash; if the image differs at write time, nothing is written and the card returns to the sheet. This is the one moment every logo is seen by a person, which is the only defence against a right domain returning the wrong company's mark.
+7. **Review every first logo.** No card receives its first Sendermark logo without my approval, whether it already has a photo, has none, or was just created. A before-and-after contact sheet shows the exact normalized image that will be saved, fetched through the API, and I approve in bulk or per card. A logo can be approved only after its exact image has been displayed; bulk approval covers the displayed logos and no others, and the sheet counts how many have been shown and how many remain. Display is an auditable record that the image was on screen, not proof that I looked at it. Each approval is bound to that image's hash; if the image changes afterward, its displayed state and its approval are both cleared, nothing is written, and the card returns to the sheet. This is the one moment every logo is seen by a person, which is the only defence against a right domain returning the wrong company's mark.
 8. **Report a bad logo.** A wrong or poor logo can be flagged to Logo.dev through its free flag endpoint.
 
-On-screen previews—candidate logos during domain resolution, the before-and-after sheet—load from the CDN with the publishable key and are not saved.
+On-screen previews of candidate logos during domain resolution, and the logos in lists, load from the CDN with the publishable key and are not saved. The before-and-after sheet is the exception: it shows the image fetched through the API and normalized, because that is the image being approved. So a card's lookup is spent before its logo is approved.
 
 ## Sender discovery and attribution
 
 **Candidates.** Every handle in the Messages database that has sent me a message and is one of: short code (five or six digits), toll-free number, ten-digit long code not matching a person card, or a non-numeric sender ID. Handles already on a company card are confirmed, not re-proposed.
 
-**Handles.** Each handle keeps its raw form, exactly as Messages reports it, and gains a canonical form: E.164 for a number with a country code, the same for a number without one only when Messages records its region, and digits plus region for a short code, because one short code in two countries is two senders. Two handles are the same sender only when their canonical forms match; bare digits do not show that `+1 415…` and `415…` are one number. Only SMS handles are candidates. Numbers on person cards are excluded through an index that holds those numbers and nothing else from the cards. A handle that cannot be made canonical is skipped and reported, never guessed.
+**Handles.** Each handle keeps its raw form, exactly as Messages reports it, and gains a canonical form: E.164 for a number with a country code, the same for a number without one only when Messages records its region, and digits plus region for a short code, because one short code in two countries is two senders. Two handles are the same sender only when their canonical forms match; bare digits do not show that `+1 415…` and `415…` are one number. Only SMS handles are candidates. Numbers on person cards are excluded through an index that holds those numbers and nothing else from the cards. A handle that cannot be made canonical is skipped and reported, never guessed. The seed map, the sender records, the proposals, and the approvals all use this one canonical key.
 
 **Signals**, in order of weight:
 
-1. **Seed map.** A hand-maintained file in the repository mapping known handles to domains, seeded from the cards I have already built by hand.
+1. **Seed map.** A hand-maintained file in the repository mapping known handles, in canonical form, to domains, seeded from the cards I have already built by hand.
 2. **Link domains.** The registrable domain of URLs in the sender's messages (`vanguard.com`). Link shorteners are ignored, not treated as a match.
 3. **Sender prefix.** A consistent leading brand string ("Vanguard Msg:", "Chase Sapphire Preferred Visa:").
 4. **Company name in body**, matched against existing company cards.
@@ -292,7 +292,7 @@ On-screen previews—candidate logos during domain resolution, the before-and-af
 | Email address or iMessage sender | Trivially spoofable identity | Never proposed |
 | Any sender whose link domains conflict with the proposed company | — | Never proposed; listed as suspicious |
 
-Nothing is written without approval in v1. An approval is a decision about the evidence and the destination I saw, so it is bound to both. Before a number is written, Sendermark rechecks the evidence, the destination card, and whether the number has since appeared on another card; anything that changed goes back to review. Brand names and links in a message are signals, not proof of who sent it. Auto-approval for short codes with a seed-map match is a P2 option, to be considered only after a month with zero reverts.
+Nothing is written without approval in v1. An approval is a decision about the evidence and the destination I saw, so it is bound to both: the evidence, and the destination card's identifier, name, and domain. Before a number is written, Sendermark rechecks the evidence, that the destination is still the same card with the same name and domain, and whether the number has since appeared on another card; anything that changed goes back to review. Brand names and links in a message are signals, not proof of who sent it. Auto-approval for short codes with a seed-map match is a P2 option, to be considered only after a month with zero reverts.
 
 ## Contact write rules
 
@@ -302,8 +302,10 @@ Nothing is written without approval in v1. An approval is a decision about the e
 - Store handles as digits only for numeric senders; store non-numeric handles verbatim.
 - Do not use the card's Notes field. Reading and writing notes requires a special entitlement, and it is my space.
 - Before the first write ever, export all contacts to a dated `.vcf` backup.
-- Journal every write with the card's prior state, including the prior image, so that `sendermark undo <run>` and `sendermark undo <change>` can reverse it. Undo reverts the fields Sendermark changed and leaves every later edit alone; where one of those fields has been edited since, it reports the conflict instead of overwriting. It does not promise the whole card back byte for byte: whether Contacts returns an image exactly as written is still being tested.
-- Contacts and the journal cannot commit as one transaction. Each write is journaled as prepared before the save and as applied only after the card is read back. At every start, before any write, rows left prepared by a crash are resolved by reading the card; one that matches neither state is reported and left alone.
+- Journal every write with the prior state of the fields it changes, including the prior image and nothing more of the card, so that `sendermark undo <run>` and `sendermark undo <change>` can reverse it. Undo reverts the fields Sendermark changed and leaves every later edit alone; where one of those fields has been edited since, it reports the conflict instead of overwriting. It does not promise the whole card back byte for byte: whether Contacts returns an image exactly as written is still being tested.
+- Contacts and the journal cannot commit as one transaction. Each write is journaled as prepared before the save and as applied only after the card is read back. At every start, before any write, rows left prepared by a crash are resolved by reading the card; one that matches neither state is reported and left alone, and its before-image is kept. A photo counts as written when it decodes to the same picture, since Contacts may recompress it.
+- One writer at a time. The CLI, the app, and a scheduled run share one lock; a process that does not hold it neither writes, reconciles, nor cleans up, so none can disturb another's work in progress.
+- Undoing a card Sendermark created deletes the card only if nothing on it has changed. If I have added anything since, the card stays and only Sendermark's own fields are reverted.
 - Batch writes—no more than 15 cards per minute—to stay clear of iCloud throttling.
 
 ## Interface
@@ -343,17 +345,17 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
 - **Secrets.** The Logo.dev secret and publishable keys and, when enabled, the Twilio credentials live in the Keychain, never in the repository or the state file.
 - **State.** `~/Library/Application Support/Sendermark/`: `state.sqlite`, `logo-cache/`, `backups/`. Contact identifiers are local to this Mac, which is acceptable because the Mac is the only writer.
 - **Network.** Logo.dev, and Twilio Lookup when I turn it on. No analytics, no telemetry.
-- **Privacy lifecycle.** Sendermark's directory is private to my account (mode 0700, files 0600). A Messages snapshot lives only for the run that made it, and leftovers from an interrupted run are deleted at the next start. The state file keeps no message text beyond the redacted samples that review shows, and drops those when the proposal is decided. Backups and journal images have a stated retention, and nothing is deleted while a change that depends on it can still be undone. Logs carry no message text, no contact name, and no full handle.
+- **Privacy lifecycle.** Sendermark's directory is private to my account (mode 0700, files 0600). A Messages snapshot lives only for the run that made it, and leftovers from an interrupted run are deleted at the next start. The state file keeps no message text beyond the redacted samples that review shows, and drops those when the proposal is decided. Undo has no expiry: each change's before-image is kept until I delete it. I accept that indefinite retention because each record holds only what its undo needs and stays on this Mac, protected like the rest. The full Contacts backup taken before the first write is a separate safety net with its own, shorter retention, and deleting it does not affect undo. I can delete history for a run, before a date, or entirely; doing so ends undo for those changes, and Sendermark says so before it deletes. Logs carry no message text, no contact name, and no full handle.
 
 ## Data model
 
 | Table | Key fields |
 |---|---|
 | `company` | contact identifier, organization name, domain, resolution source, confirmed at |
-| `logo` | contact identifier, brand id, etag, written hash, written at, last checked, status (current, missing, manual, needs a look, pending) |
-| `sender` | handle, type (short code, toll-free, long code, other), first seen, last seen, message count, status (confirmed, proposed, rejected, shared, suspicious, unattributed) |
-| `proposal` | handle, proposed domain, signals as JSON, confidence, decision, decided at |
-| `journal` | run ID, change ID, contact identifier, operation, before-state vCard, after-state hash, timestamp |
+| `logo` | contact identifier, brand id, etag, pending image hash, displayed at, approved hash, approved at, written hash, written at, last checked, status (current, missing, manual, needs a look, pending, awaiting review) |
+| `sender` | canonical handle, raw handle, region, service, type (short code, toll-free, long code, other), first seen, last seen, message count, status (confirmed, proposed, rejected, shared, suspicious, unattributed, ambiguous) |
+| `proposal` | canonical handle, proposed domain, signals as JSON, confidence, decision, decided at, and the approval binding: destination contact identifier, destination name and domain as approved, evidence hash |
+| `journal` | run ID, change ID, contact identifier, operation, state (prepared, applied, failed, not applied, needs attention), before-state of the changed fields including the prior image, intended after-state hash, readback hash, timestamp |
 
 ## Requirements
 
@@ -401,7 +403,7 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
 - A "Sendermark" contact list containing every managed card.
 - LLM attribution for unattributed senders, off by default and not built until the outgoing-data policy is decided, with the model's reasoning shown as evidence.
 - Reassignment detection for senders whose signals change company.
-- Duplicate-company report with a guided merge.
+- Duplicate-company report. Sendermark does not merge cards: a merge must keep every field, Notes included, and Sendermark may not read or write Notes. I merge in Contacts, and Sendermark then rebinds its records to the surviving card.
 - Dark-mode-aware logo choice where Logo.dev offers a variant.
 
 ### P2—could have
@@ -445,7 +447,7 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
 - [ ] **Platform.** Does writing `imageData` through `Contacts.framework` preserve the image as written, or does Contacts re-crop or recompress it?
 - [ ] **Platform.** Which number does a reply go to in a merged conversation when the most recent sender is not the one with the most history?
 - [ ] **Platform.** Which container is my default, which identifier does a linked contact report, and does an identifier survive an edit, a sync, a merge, or a delete and re-create?
-- [ ] **Product.** When an approved logo changes at the source, is the new one applied and listed, or held for review? Is the answer the same for an unattended run?
+- [ ] **Product.** When an approved logo changes at the source, is the new one applied and listed, or held for review? Is the answer the same for an unattended run? Held for review until decided.
 - [ ] **Product.** What is the outgoing-data policy for the LLM pass: what is removed, what is sent at all, and which providers are acceptable?
 - [ ] **Product.** Should the label be `text alerts` for every sender, or should Sendermark label by purpose (verification, fraud, marketing)? Purpose labels are nicer and add a classification problem.
 - [ ] **Product.** Should shared verification senders get a generic "Verification codes" card, or stay bare?
@@ -455,7 +457,7 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
 
 ## Build plan
 
-**Phase 0—prove the platform (one to two days).** No product code. Answer the two blocking questions (the merge check and one call to the Logo.dev API), write one normalized logo to one card through `Contacts.framework` and check it on the Mac and the iPhone, test which number a reply goes to when senders are mixed, test my real contact containers and identifiers, and dump the top 50 unattached business handles from `chat.db` with counts. If merging fails, cut the "one conversation" goal before building anything.
+**Phase 0—prove the platform (one to two days).** No product code, with one exception: the empty Swift package and its CI may be set up in parallel, as long as they ship no product behavior and touch no real contact or message before the Phase 0 checks pass. Answer the two blocking questions (the merge check and one call to the Logo.dev API), write one normalized logo to one card through `Contacts.framework` and check it on the Mac and the iPhone, test which number a reply goes to when senders are mixed, test my real contact containers and identifiers, and dump the top 50 unattached business handles from `chat.db` with counts. If merging fails, cut the "one conversation" goal before building anything.
 
 **Phase 1—CLI, logos (about a week).** `scan`, domain resolution, logo pipeline, backup, journal, undo. Ship when every company card has a correct logo.
 

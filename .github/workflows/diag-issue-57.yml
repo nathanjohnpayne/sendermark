@@ -1,7 +1,7 @@
 name: diag-issue-57
-# Throwaway diagnostic for #57: measure the hosted runner and the memory that
-# shellcheck uses in check_phase_4b_automation. Never merged; lives only on
-# the diag/issue-57-runner-memory branch.
+# Throwaway diagnostic for #57, round 2: measure a candidate fix (shellcheck
+# --extended-analysis=false) on the same hosted runner. Never merged; lives
+# only on the diag/issue-57-runner-memory branch.
 on:
   push:
     branches: ["diag/issue-57-runner-memory"]
@@ -16,34 +16,29 @@ jobs:
         with:
           persist-credentials: false
       - name: runner facts
-        run: |
-          nproc; free -m; swapon --show || true; df -h / | tail -1
-          shellcheck --version; command -v shellcheck
-          cat /sys/fs/cgroup/memory.max 2>/dev/null || true
-          ps -eo pid,rss,comm --sort=-rss | head -8
-      - name: per-file shellcheck peak RSS (small files)
+        run: nproc; free -m; shellcheck --version | sed -n 2p
+      - name: big test file without extended analysis
         continue-on-error: true
         run: |
-          for f in scripts/phase-4b-review.sh scripts/phase-4b/lib.sh scripts/lib/codex-failure-markers.sh \
-                   scripts/phase-4b/adapters/review-via-codex.sh scripts/phase-4b/adapters/review-via-claude.sh \
-                   scripts/phase-4b/collect-enablement-evidence.sh scripts/phase-4b/heartbeat.sh \
-                   scripts/phase-4b/immutable-input.sh tests/test_phase_4b_immutable_input.sh tests/test_phase_4b_heartbeat.sh; do
-            /usr/bin/time -f "$f: %e s, max RSS %M KB, exit %x" shellcheck --severity=warning "$f" >/dev/null || true
-          done
-      - name: big test file, capped at 6 GiB in its own cgroup
+          /usr/bin/time -f "test_phase_4b_automation.sh --extended-analysis=false: %e s, max RSS %M KB, exit %x" \
+            shellcheck --severity=warning --extended-analysis=false tests/test_phase_4b_automation.sh
+      - name: same 11-file invocation as check_phase_4b_automation, without extended analysis
         continue-on-error: true
         run: |
-          sudo systemd-run --quiet --scope -p MemoryMax=6G -p MemorySwapMax=0 \
-            /usr/bin/time -f "test_phase_4b_automation.sh: %e s, max RSS %M KB, exit %x" \
-            shellcheck --severity=warning tests/test_phase_4b_automation.sh >/dev/null; echo "rc=$?"
-          sudo dmesg | grep -iE 'oom|killed process' | tail -5 || true
-      - name: full check_phase_4b_automation --check with a memory sampler
+          /usr/bin/time -f "11 files --extended-analysis=false: %e s, max RSS %M KB, exit %x" \
+            shellcheck --severity=warning --extended-analysis=false \
+            scripts/phase-4b-review.sh scripts/phase-4b/lib.sh scripts/lib/codex-failure-markers.sh \
+            scripts/phase-4b/adapters/review-via-codex.sh scripts/phase-4b/adapters/review-via-claude.sh \
+            scripts/phase-4b/collect-enablement-evidence.sh tests/test_phase_4b_automation.sh \
+            scripts/phase-4b/heartbeat.sh scripts/phase-4b/immutable-input.sh \
+            tests/test_phase_4b_immutable_input.sh tests/test_phase_4b_heartbeat.sh
+      - name: 10 files with extended analysis (everything except the big test file)
         continue-on-error: true
         run: |
-          ( while :; do echo "SAMPLE $(date +%T) $(free -m | awk '/Mem:/{print "used="$3"MB avail="$7"MB"}') $(ps -eo rss,comm --sort=-rss | sed -n 2p)"; sleep 2; done ) &
-          sampler=$!
-          /usr/bin/time -f "check --check: %e s, max RSS of child %M KB, exit %x" ./scripts/ci/check_phase_4b_automation --check; echo "rc=$?"
-          kill $sampler || true
-      - name: oom evidence
-        if: always()
-        run: sudo dmesg | grep -iE 'oom|killed process|out of memory' | tail -20 || echo "no oom lines"
+          /usr/bin/time -f "10 files, extended analysis on: %e s, max RSS %M KB, exit %x" \
+            shellcheck --severity=warning \
+            scripts/phase-4b-review.sh scripts/phase-4b/lib.sh scripts/lib/codex-failure-markers.sh \
+            scripts/phase-4b/adapters/review-via-codex.sh scripts/phase-4b/adapters/review-via-claude.sh \
+            scripts/phase-4b/collect-enablement-evidence.sh \
+            scripts/phase-4b/heartbeat.sh scripts/phase-4b/immutable-input.sh \
+            tests/test_phase_4b_immutable_input.sh tests/test_phase_4b_heartbeat.sh

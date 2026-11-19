@@ -74,16 +74,33 @@ Production deployment is blocked until separately reviewed tooling ensures repos
 
 The `scripts/gcloud/gcloud` wrapper remains available for ordinary non-deployment `gcloud` commands. Routine replacement of a Firebase deploy key remains incomplete until separately reviewed, non-deploying validation proves the replacement usable; suspected-compromise containment is a separate owner-led incident decision. See [key rotation guidance](DEPLOYMENT.md#rotating-a-firebase-deploy-sa-key).
 
+## Swift Package
+
+Sendermark is a Swift package: the `SendermarkCore` library and the `sendermark` command-line tool, built from `Package.swift` at the repository root. It needs macOS and a current Swift toolchain (Xcode or the Command Line Tools) and has no third-party dependencies.
+
+```bash
+swift build                    # build SendermarkCore and sendermark
+swift test                     # run the Swift tests
+swift run sendermark --help    # the tool answers --help and --version only, for now
+```
+
+CI runs the same build and tests on every pull request (`.github/workflows/swift.yml`). None of it opens Contacts or reads the Messages database.
+
 ## Directory Structure
 
-| Directory | Purpose |
+| Path | Purpose |
 |---|---|
+| `Package.swift` | Swift package manifest: the `SendermarkCore` library, the `sendermark` executable and the `SendermarkTests` test target |
+| `src/SendermarkCore/` | The `SendermarkCore` library: one file per module in the PRD's Architecture section |
+| `src/sendermark/` | The `sendermark` command-line tool |
+| `tests/swift/` | Swift test targets (`SendermarkTests`) |
+| `tests/` | Automated validation: the Mergepath tooling suites, and the Swift tests under `tests/swift/` |
 | `rules/` | Binding repository constraints |
 | `specs/` | Intended system behavior |
 | `plans/` | Execution and migration plans |
-| `tests/` | Automated validation |
-| `src/` | Application code |
-| `functions/` | Backend handlers |
+| `functions/` | Template placeholder; Sendermark has no backend handlers |
 | `scripts/` | Build, CI, and automation tooling |
 | `docs/` | Architecture and design documentation |
-| `dist/` | Generated build artifacts (do not edit manually) |
+| `.build/` | SwiftPM build output (gitignored; regenerate with `swift build`) |
+
+Sources live under `src/` and tests under `tests/swift/`, not in SwiftPM's default `Sources/` and `Tests/`: on the default case-insensitive macOS filesystem `Tests/` would be the existing `tests/` directory. The rule is in [Code Modification Rules](docs/agents/code-modification-rules.md#swift-package-layout).

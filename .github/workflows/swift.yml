@@ -1,0 +1,44 @@
+name: Swift package
+
+# Builds and tests the Swift package (Package.swift: SendermarkCore, the
+# `sendermark` CLI and its tests) on every pull request (#14).
+#
+# Cost: this repository is private, so macOS runner minutes are billed at a
+# multiple of Linux minutes. The job is kept to one runner, no matrix and no
+# cache, with superseded runs cancelled. The tests are pure: no step opens
+# Contacts, reads the Messages database or asks for a privacy permission.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-package-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: swift build and test
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: swift --version
+
+      - name: swift build
+        run: swift build
+
+      - name: swift test
+        run: swift test
+
+      - name: sendermark --help and --version
+        run: |
+          set -euo pipefail
+          bin="$(swift build --show-bin-path)/sendermark"
+          "$bin" --help
+          "$bin" --version

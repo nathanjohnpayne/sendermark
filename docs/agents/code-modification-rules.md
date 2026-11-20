@@ -5,7 +5,16 @@
 - Do not introduce new top-level directories without documented justification in `AGENTS.md` or a `plans/` entry.
 - Place canonical instructions only in root files or the appropriate supporting directory---never in `.cursor/`, `.claude/`, or `.vscode/`.
 
-Replace this section with project-specific language, pattern, and boundary constraints.
+## Swift package layout
+
+Sendermark is native Swift (PRD § Decisions 1 and 6), built as one Swift package from `Package.swift` at the repository root (#14).
+
+- `src/SendermarkCore/` holds the `SendermarkCore` library. Each module in the PRD's Architecture section is a namespace with its own file there (`ContactsStore`, `MessagesReader`, `LogoClient`, `LogoNormalizer`, `Attribution`, `State`); add a module's behaviour in its file or a folder of the same name, not in a new target. `PhoneLookup` is P1 and is added with #52.
+- `src/sendermark/` holds the `sendermark` executable. Help is rendered from the options the tool handles, so add a command and its help entry together; help must never list a command that is not implemented.
+- `tests/swift/` holds the Swift test targets.
+- Sources and tests do not use SwiftPM's default `Sources/` and `Tests/`. The repository already has the template's `tests/` directory, and on the default case-insensitive macOS filesystem `Tests/` is that same directory. `src/` and `tests/` are both in the standard layout that `scripts/ci/check_no_forbidden_top_level_dirs` allows, so the package adds no new top-level directory. Each target names its `path:` in `Package.swift`.
+- Use only the Swift standard library and Apple's system frameworks. A pull request that adds a third-party package names it and says why those do not suffice.
+- No automated test or CI step touches the real Contacts store or the Messages database, or triggers a Contacts or Full Disk Access prompt (#14). An issue that needs otherwise says so and changes this rule.
 
 ## ESLint flat-config policy
 

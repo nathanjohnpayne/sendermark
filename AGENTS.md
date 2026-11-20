@@ -22,6 +22,8 @@ Agent instructions are organized into focused sub-files under `docs/agents/`. Re
 16. **[Runbook: Unblocking Downstream Trackers](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/tracker-unblock-runbook.md)** --- Sequencing a multi-ticket session that unblocks consumer trackers through Mergepath work: live scope refresh, ordering and concurrency, owner-decision proposals, the pre-merge checklist, security evidence, and the run ledger (hub-only, so the link is absolute)
 17. **[Runbook: the `dependabot-reviewer` Environment](https://github.com/nathanjohnpayne/mergepath/blob/main/docs/agents/dependabot-reviewer-environment.md)** --- Owner-performed setup of the dedicated Dependabot approval PAT: its scopes and residual risk, the environment and secret in each repository, the read-only readback, and the pilot proof (hub-only, so the link is absolute)
 
+The Swift package (`Package.swift`, sources in `src/`, tests in `tests/swift/`) uses only standard-layout top-level directories; its layout and the reason it departs from SwiftPM's `Sources/` and `Tests/` defaults are in item 4, [Code Modification Rules § Swift package layout](docs/agents/code-modification-rules.md#swift-package-layout).
+
 Item 2 is the stable entrypoint for shared rules: it is one canonical file mirrored to every repo, so a new fleet-wide rule lands by editing it at the canonical source, not by editing every repo's index again.
 
 ## Code Review Policy

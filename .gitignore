@@ -11,6 +11,10 @@ build/
 *.pem
 *.key
 
+# Swift Package Manager build output and local state
+.build/
+.swiftpm/
+
 # Dependencies
 node_modules/
 __pycache__/

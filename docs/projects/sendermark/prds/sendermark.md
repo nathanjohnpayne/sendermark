@@ -10,7 +10,7 @@ generated_by: scripts/project-doc-sync.sh
 do_not_edit: true
 source_repo: nathanjohnpayne/docs
 source_path: projects/sendermark/prds/sendermark.md
-source_ref: 9efce13699f5dde4138743694668808380ca7e09
+source_ref: 00cea23406e85067f5636ce5b1880f50225462d5
 project: sendermark
 document_class: prd
 document_slug: sendermark
@@ -33,7 +33,7 @@ Favicon: s|
 
 **Name (2026-11-17):** renamed from the working title Callsign in v0.2. `callsign.app` has been registered since 2018, and Callsign Inc ships an authentication app under that name—too close to a tool that decides which senders to trust. I registered `sendermark.app` on November 17, 2026, and found no conflicting trademark or App Store listing for the name.
 
-**Interface:** wireframes for the Mac app, in light and dark appearance, are in [sendermark-wireframes.html](sendermark-wireframes.html), in this folder.
+**Interface:** wireframes for the Mac app, in light and dark appearance, are in `sendermark-wireframes.html`: beside this file in the docs vault, and at `plans/sendermark-wireframes.html` in the Sendermark repository.
 
 **Safety review (v0.4, 2026-11-17):** the write, snapshot, first-logo, sender-identity and privacy contracts were tightened after a review of this document and its tickets. Messages is read from a consistent snapshot; every first logo is approved against the exact image saved; senders are matched on canonical handles; approvals are rechecked when applied; undo reverts Sendermark's changes without overwriting later edits, survives a crash, and has no expiry; one writer runs at a time; reply routing is treated as unproven; and local files have a stated privacy lifecycle.
 
@@ -256,7 +256,7 @@ Revised in v0.3 after the Logo.dev test, and in v0.4 so that every first logo is
    - Add padding when any part of the mark falls outside the circular safe area—the circle inscribed in the canvas, which is what Contacts shows, less a margin. Touching the edge is not the test: a mark near a corner is clipped without touching either edge. A square survives a circle crop at 1/√2 (about 70.7 percent) of the diameter.
    - Re-encode until the file is under 200 KB, leaving margin below iCloud's 224 KB limit.
 5. **Compare.** Store the `etag`. On later checks, an unchanged `etag` means no download and no write.
-6. **Respect manual photos.** If the card's current photo does not match the hash Sendermark last wrote, I changed it. Skip the card, flag it once, and offer `--take-over` for that card.
+6. **Respect manual photos.** If the card's current photo is not the picture Sendermark last wrote, I changed it. The comparison uses the same rule as the write check in the [contact write rules](#contact-write-rules): the photo read back from Contacts is decoded and compared with the decoded picture that was written, not with the bytes sent, since Contacts may recompress a photo. Skip the card, flag it once, and offer `--take-over` for that card.
 7. **Review every first logo.** No card receives its first Sendermark logo without my approval, whether it already has a photo, has none, or was just created. A before-and-after contact sheet shows the exact normalized image that will be saved, fetched through the API, and I approve in bulk or per card. A logo can be approved only after its exact image has been displayed; bulk approval covers the displayed logos and no others, and the sheet counts how many have been shown and how many remain. Display is an auditable record that the image was on screen, not proof that I looked at it. Each approval is bound to that image's hash; if the image changes afterward, its displayed state and its approval are both cleared, nothing is written, and the card returns to the sheet. This is the one moment every logo is seen by a person, which is the only defence against a right domain returning the wrong company's mark.
 8. **Report a bad logo.** A wrong or poor logo can be flagged to Logo.dev through its free flag endpoint.
 
@@ -303,7 +303,7 @@ Nothing is written without approval in v1. An approval is a decision about the e
 - Do not use the card's Notes field. Reading and writing notes requires a special entitlement, and it is my space.
 - Before the first write ever, export all contacts to a dated `.vcf` backup.
 - Journal every write with the prior state of the fields it changes, including the prior image and nothing more of the card, so that `sendermark undo <run>` and `sendermark undo <change>` can reverse it. Undo reverts the fields Sendermark changed and leaves every later edit alone; where one of those fields has been edited since, it reports the conflict instead of overwriting. It does not promise the whole card back byte for byte: whether Contacts returns an image exactly as written is still being tested.
-- Contacts and the journal cannot commit as one transaction. Each write is journaled as prepared before the save and as applied only after the card is read back. At every start, before any write, rows left prepared by a crash are resolved by reading the card; one that matches neither state is reported and left alone, and its before-image is kept. A photo counts as written when it decodes to the same picture, since Contacts may recompress it.
+- Contacts and the journal cannot commit as one transaction. Each write is journaled as prepared before the save and as applied only after the card is read back. At every start, before any write, rows left prepared by a crash are resolved by reading the card. The comparison covers only the fields Sendermark changed in that row, as undo does, so a later edit to another field does not leave a row unresolved. A row whose fields match neither the before-image nor the intended value is reported as a conflict on those fields and left alone, and its before-image is kept. A photo counts as written when it decodes to the same picture, since Contacts may recompress it.
 - One writer at a time. The CLI, the app, and a scheduled run share one lock; a process that does not hold it neither writes, reconciles, nor cleans up, so none can disturb another's work in progress.
 - Undoing a card Sendermark created deletes the card only if nothing on it has changed. If I have added anything since, the card stays and only Sendermark's own fields are reverted.
 - Batch writes—no more than 15 cards per minute—to stay clear of iCloud throttling.
@@ -372,7 +372,7 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
   - [ ] Every written image is square, opaque, and under 200 KB.
   - [ ] No monogram or 404 result is ever written.
   - [ ] Every image written to a card was downloaded through the secret-key API; no CDN image is ever saved.
-  - [ ] A full logo check makes at most one lookup per company and stops with a clear message when credit runs out.
+  - [ ] A full logo check makes at most one lookup per company and stops with a clear message when credit runs out. The repeats of a pending lookup (a 202 response, retried after 30 seconds for at most five minutes) count as the same lookup.
   - [ ] A logo whose source is below the quality threshold is held as "Needs a look" and not written.
   - [ ] A transparent logo is flattened; an opaque tile is written as delivered.
   - [ ] No mark is clipped by the circular list avatar or the rounded-square Messages avatar on Mac and iPhone.
@@ -386,7 +386,7 @@ Sendermark.app ─┘     ├─ ContactsStore    Contacts.framework, read and w
   - [ ] Each short-code proposal links to the official Short Code Registry lookup; Sendermark makes no request to it.
 - **Apply with approval.**
   - [ ] No phone number is written to any card without an explicit approval recorded in `proposal`.
-  - [ ] Approving a sender for a company with no card creates an organization card with name, URL, logo, and number.
+  - [ ] Approving a sender for a company with no card creates an organization card with name, URL, and number. The card gets a logo only through the first-logo review. When no logo can be written—the lookup returns none, or the source is held as "Needs a look"—the card is still created without a photo, its logo status is missing or needs a look, and the run reports the sender as applied with no logo.
 - **Backup, journal, undo.**
   - [ ] The first applying run refuses to proceed until a `.vcf` backup exists.
   - [ ] `sendermark undo <run>` reverts every change the run made, including the previous image, and overwrites no later edit.

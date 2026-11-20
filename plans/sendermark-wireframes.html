@@ -638,7 +638,7 @@ function company(state) {
        <div class="row" style="gap:12px">${lg('apc', 's56')}${lg('apc', 's56 ci')}<div class="sm dim">Logo from Logo.dev, fitted so neither crop clips it.</div></div>
        <div class="row" style="margin-top:14px">${btn('Let Sendermark manage this photo')}</div>`
     : `<div class="h2">Logo${an(1)}</div><div class="crops"><figure>${lg(k, 's112')}<figcaption>Messages</figcaption></figure><figure>${lg(k, 's112 ci')}<figcaption>Contacts list</figcaption></figure></div>
-       <div class="row" style="gap:14px;align-items:flex-start"><span class="canvas">${lg(k, 's112 flat')}</span><div class="sm dim" style="flex:1">The circle is the tightest crop Contacts uses; whatever sits in the square inside it always survives. Logo.dev’s tiles usually keep the mark inside the circle already, so Sendermark adds padding only when a mark touches the edge.${an(2)}</div></div>
+       <div class="row" style="gap:14px;align-items:flex-start"><span class="canvas">${lg(k, 's112 flat')}</span><div class="sm dim" style="flex:1">The circle is the tightest crop Contacts uses; whatever sits in the square inside it always survives. Logo.dev’s tiles usually keep the mark inside the circle already, so Sendermark adds padding only when part of a mark falls outside the circle, less a small margin. A mark near a corner can be clipped without touching an edge.${an(2)}</div></div>
        <dl class="kv" style="margin-top:16px"><dt>Source</dt><dd>Logo.dev</dd><dt>Last checked</dt><dd>Sunday, November 1</dd><dt>Last changed</dt><dd>Not since it was added</dd><dt>File</dt><dd class="num">800 × 800 · 84 KB</dd></dl>
        <div class="row" style="margin-top:14px">${btn('Check now')}${btn('Use my own photo…', 'quiet')}</div>`;
   const senders = state === 'manual'
@@ -785,7 +785,7 @@ const GROUPS = [
         { id: 'shared', label: 'shared sender', kind: 'state', cap: 'A number whose texts name three companies. The detail lists them with counts instead of proposing one. The primary action marks it shared; Messages keeps showing the bare number.' },
         { id: 'suspicious', label: 'held back', kind: 'state', dark: 'The warning stays red on a deep red ground; conflict bars use the lighter red so they read against the dark table.', cap: 'A ten-digit number that names Chase but links elsewhere. The evidence table lists conflicts in red. The primary action is to keep it off every card; nothing here deletes or blocks the message.' },
         { id: 'empty', label: 'nothing to review', kind: 'state', cap: 'The queue is empty and the sidebar badge is gone. The screen says when the last scan ran and offers a scan and the full sender list.' }] }] },
-  { id: 'companies', title: 'Companies—every company card and its logo', sub: 'Logos apply without review, so this is where you check on them rather than approve them. The list answers “which cards are not handled, and why”; the company page shows the logo in both crops Contacts and Messages use.', screens: [
+  { id: 'companies', title: 'Companies—every company card and its logo', sub: 'A card’s first logo is approved here, on the contact sheet, and for now so is any later change to an approved logo; this is also where you check on the logos already saved. The list answers “which cards are not handled, and why”; the company page shows the logo in both crops Contacts and Messages use.', screens: [
     { id: 'companies', canvas: 'win', title: 'Companies', fn: companies, legend: [
       `<b>Filters partition the list</b> (49 + 5 + 1 + 4 + 3 = 62). The four that are not “Current” are the only ones that need attention. ${prd('Success metrics')}`,
       `<b>Your photo</b>: a card whose photo you set yourself. Sendermark leaves it alone; the row shows your photo, not the logo. ${prd('Logo pipeline')}`,
@@ -797,7 +797,7 @@ const GROUPS = [
         { id: 'adopt', label: 'first logos · approve', kind: 'state', dark: 'The sheet is lighter than the window behind it and carries a hairline edge, since a shadow alone disappears on a dark window.', cap: 'The sheet shown after the first scan, and again whenever a card is about to get its first logo. Eight of the 54 cards, each as before → after: seven that already have a photo and one, Partiful, that has none. A.P.C. is unchecked and keeps its photo. The footer counts 8 shown and 46 still to view, a scroll bar and a “46 more below” row mark the rest, and the button approves only the 7 shown and checked.' }] },
     { id: 'company', canvas: 'win', title: 'Company page', fn: company, legend: [
       `<b>Both crops, always together</b>: the rounded square Messages uses for a company and the circle the Contacts list uses. A logo is right only when it reads in both.`,
-      `<b>The canvas</b> shows the crop guides on the square image as stored: the circle Contacts cuts, and the square inside it that no crop can touch. Logo.dev’s logos arrive as finished square tiles, most with their own margin, so Sendermark leaves them alone unless the mark touches the edge. ${prd('Logo pipeline')}`,
+      `<b>The canvas</b> shows the crop guides on the square image as stored: the circle Contacts cuts, and the square inside it that no crop can touch. Logo.dev’s logos arrive as finished square tiles, most with their own margin, so Sendermark leaves them alone unless part of the mark falls outside the circle, less a small margin. ${prd('Logo pipeline')}`,
       `<b>Website</b> is the key that identifies the company. It is stored on the card itself, so it shows who confirmed it and when. ${prd('Company resolution')}`,
       `<b>Numbers you added are marked “Yours”</b> and have no Remove button. Only numbers Sendermark added can be removed here. ${prd('Contact write rules')}`,
       `<b>A photo you chose is left alone</b>, and the page says since when. Handing it over is one button, with a preview of what replaces it. ${prd('Logo pipeline')}`,
@@ -837,7 +837,7 @@ const GROUPS = [
   { id: 'menubar', title: 'Menu bar—quiet unless something is waiting', sub: 'Sendermark runs weekly without a window. The menu-bar item is how it tells you, and the dot on the icon is the only notification it needs.', screens: [
     { id: 'popover', canvas: 'pop', title: 'Menu-bar popover', fn: popover, legend: [
       `<b>One sentence, one button.</b> The headline is the count; the marks show which companies. “Review” opens the window on the Review screen.`,
-      `<b>The scan line</b> reports what the last scan found. Logo updates need no approval and are checked monthly; they appear in Activity.`],
+      `<b>The scan line</b> reports what the last scan found. Logos are checked monthly. A card’s first logo, and for now any later change to an approved logo, waits for review before it is saved; what was saved appears in Activity.`],
       states: [
         { id: 'default', label: 'senders waiting', kind: 'proposed', dark: 'A dark menu bar and popover. The menu-bar icon is drawn in the text colour, so it follows the appearance.', cap: 'The icon carries a dot. The popover leads with the count and a Review button, then the last and next scan, then the menu.' },
         { id: 'scanning', label: 'scanning', kind: 'state', cap: 'A scan in progress: a bar, the current step, and Stop.' },
@@ -856,7 +856,7 @@ const DEC = [
   ['D-04', 'Review', 'Risk changes the controls, not only the colour: short codes can be batched, toll-free and ten-digit numbers cannot, suspicious senders have no add button.', 'A warning you can click through with the same key is decoration. Removing the shortcut is what slows the hand.', 'Trust model'],
   ['D-05', 'Company page', 'A logo is always shown in both crops, with the crop guides drawn on the stored square.', 'One of the hand-made cards has a wordmark that runs past the edge of its crop. Showing both crops is the check.', 'Logo pipeline'],
   ['D-06', 'Activity', 'There is no separate “undo” mode. Every recorded change carries its own Undo, and so does every run.', 'The journal already holds the before-state. One list serves as history and as the way back.', 'Contact write rules'],
-  ['D-07', 'Menu bar', 'No notifications. A dot on the menu-bar icon is the only signal, and only when senders are waiting.', 'A weekly utility that interrupts is one you turn off. Logos update silently and are reported after the fact.', 'Product goals'],
+  ['D-07', 'Menu bar', 'No notifications. A dot on the menu-bar icon is the only signal, and only when senders are waiting.', 'A weekly utility that interrupts is one you turn off. A logo that needs review waits on the Companies screen without a notification; saved logos are reported in Activity.', 'Product goals'],
   ['D-08', 'Review', 'Every review action has a single-key shortcut, shown on the button, except approving a toll-free or ten-digit number (D-04).', 'The goal is five minutes a week. Four proposals should take four keystrokes when the evidence is clean.', 'Product goals'],
   ['D-09', 'Companies', 'A logo whose source image is too small is held as “Needs a look” instead of being applied.', 'The Logo.dev test returned one enlarged fragment in 19 domains. Automatic is right for good logos and wrong for that one.', 'Logo pipeline'],
   ['D-10', 'Settings, Activity', 'Senders are scanned weekly; logos are checked monthly.', 'Logos saved to a card must come from Logo.dev’s paid API, about 2¢ a company a check. Monthly keeps 62 companies inside the free credit; scanning Messages costs nothing.', 'Logo pipeline'],
@@ -867,7 +867,7 @@ const OPEN = [
   ['Q-02', 'Does the app need a main window at all, or can Review live entirely in the popover?', 'A popover-only app is smaller to build. The evidence table and both logo crops do not fit in 360 points.'],
   ['Q-03', 'Should numbers be labeled by purpose (codes, fraud alerts, marketing) instead of one “text alerts” label?', 'Adds a label picker to every proposal and a classification step the PRD does not have.'],
   ['Q-04', 'What does the “joins an existing conversation” line say if the Phase 0 merge check fails on iOS but passes on the Mac?', 'The preview would have to show two devices, or drop the claim.'],
-  ['Q-05', 'How is a logo change announced when the new logo is plainly worse than the old one?', 'Today it is silent with an Undo. A “hold new logos for a week” setting is the alternative.'],
+  ['Q-05', 'How is a logo change announced when the new logo is plainly worse than the old one?', 'For now a changed logo is held for the same review as a first logo, and these frames do not yet draw that state. Whether later changes apply without review is an open decision.'],
   ['Q-06', 'What does “Needs a look” offer when the logo really is bad?', 'Keep the card without a photo, use my own, or report the logo to Logo.dev. The company page needs a state for it.'],
   ['Q-07', 'Should a logo that Logo.dev returns for the right domain but the wrong brand be catchable?', 'In the test one domain returned what looks like another company’s mark. Only a person can see that; the first-logo sheet is the one place it gets looked at.'],
 ];
@@ -972,7 +972,7 @@ function applyLogos(pk) {
   document.getElementById('pkstate').textContent = pk ? `Key set: loading logos for ${n} tiles from Logo.dev.` : 'No key: showing initials.';
 }
 document.getElementById('pkload').addEventListener('click', () => { const v = document.getElementById('pk').value.trim(); if (!v) return; try { localStorage.setItem(PK_STORE, v); } catch (e) {} document.getElementById('pk').value = ''; applyLogos(v); });
-document.getElementById('pkclear').addEventListener('click', () => { try { localStorage.removeItem(PK_STORE); } catch (e) {} applyLogos(''); });
+document.getElementById('pkclear').addEventListener('click', () => { try { localStorage.removeItem(PK_STORE); } catch (e) {} try { const u = new URL(location.href); if (u.searchParams.has('token')) { u.searchParams.delete('token'); history.replaceState(null, '', u); } } catch (e) {} applyLogos(''); });
 applyLogos(readPk());
 
 // zoom: scales the canvases; layout inside is computed at the real size

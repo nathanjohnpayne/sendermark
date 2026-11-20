@@ -4,6 +4,15 @@
 
 The goal is to allow multiple AI coding agents and development tools to operate consistently without configuration drift. See [`BRAND.md`](BRAND.md) for this repo's brand vocabulary (a bootstrap stub until replaced).
 
+## Product
+
+Sendermark keeps company contact cards current on the Mac: logos from Logo.dev and the numbers each company texts from.
+
+- [Product requirements document](docs/projects/sendermark/prds/sendermark.md): a generated mirror of the canonical PRD in the docs vault. Do not edit it here.
+- [Wireframes for the Mac app](plans/sendermark-wireframes.html): every screen and state, in light and dark appearance.
+
+Open the wireframes from a local checkout, because GitHub shows HTML as source.
+
 ## For AI Agents
 
 Read these files in order before taking any action:
